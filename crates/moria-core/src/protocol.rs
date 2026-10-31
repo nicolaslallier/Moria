@@ -37,6 +37,8 @@ pub enum ClientMsg {
         a: TilePos,
         b: TilePos,
     },
+    /// Hero builds a wall on the floor tile toward `Dir`, for 1 stone.
+    Build(Dir),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

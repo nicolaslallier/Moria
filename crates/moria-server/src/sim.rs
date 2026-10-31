@@ -19,6 +19,7 @@ const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
 pub enum Command {
     Move(Dir),
     Dig(Dir),
+    Build(Dir),
     Designate {
         a: TilePos,
         b: TilePos,
@@ -35,6 +36,7 @@ impl Command {
         Some(match m {
             ClientMsg::Move(d) => Command::Move(d),
             ClientMsg::Dig(d) => Command::Dig(d),
+            ClientMsg::Build(d) => Command::Build(d),
             ClientMsg::Designate { a, b, kind } => Command::Designate { a, b, kind },
             ClientMsg::CancelDesignation { a, b } => Command::Cancel { a, b },
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
@@ -85,8 +87,17 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         Command::Move(d) if h.move_cooldown > 0 => h.pending_move = Some(d),
         Command::Move(d) => hero_move(h, mt, d),
         // Behind a buffered move, the dig waits for it (the cooldown still applies).
-        Command::Dig(d) if h.pending_move.is_some() => h.pending_dig = Some(d),
-        Command::Dig(d) => start_dig(h, mt, d),
+        Command::Dig(d) | Command::Build(d) => {
+            let kind = match c {
+                Command::Build(_) => DesignationKind::Wall,
+                _ => DesignationKind::Dig,
+            };
+            if h.pending_move.is_some() {
+                h.pending_dig = Some((d, kind));
+            } else if kind == DesignationKind::Dig || f.resources.stone > 0 {
+                start_dig(h, mt, d, kind);
+            }
+        }
         Command::Designate { a, b, kind } => {
             let rect = mt.rect(a, b);
             let before: Vec<_> = rect
@@ -111,15 +122,20 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
     ch
 }
 
-fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir) {
+/// Starts digging (`Dig`) or building (`Wall`) the tile toward `d`.
+fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
     if matches!(d, Dir::Up | Dir::Down) {
         return;
     }
     let t = h.pos.step(d);
-    if mt.get(t).is_some_and(Tile::is_solid) && h.dig.as_ref().is_none_or(|j| j.target != t) {
+    if mt.diggable(t, kind)
+        && h.dig
+            .as_ref()
+            .is_none_or(|j| j.target != t || j.kind != kind)
+    {
         h.dig = Some(DigJob {
             target: t,
-            kind: DesignationKind::Dig,
+            kind,
             progress: 0,
         });
     }
@@ -256,23 +272,41 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 && let Some(d) = h.pending_move
             {
                 hero_move(h, m, d);
-                if let Some(dd) = h.pending_dig.take() {
-                    start_dig(h, m, dd);
+                if let Some((dd, kind)) = h.pending_dig.take()
+                    && (kind == DesignationKind::Dig || f.resources.stone > 0)
+                {
+                    start_dig(h, m, dd, kind);
                 }
             }
             if let Some(j) = h.dig.as_mut() {
-                match m.get(j.target).filter(|t| t.is_solid()) {
+                let wall = j.kind == DesignationKind::Wall;
+                // A dwarf standing on the target, or no stone left, cancels a build.
+                let blocked =
+                    wall && (f.resources.stone == 0 || f.dwarves.iter().any(|d| d.pos == j.target));
+                match m
+                    .get(j.target)
+                    .filter(|_| m.diggable(j.target, j.kind) && !blocked)
+                {
                     None => h.dig = None,
                     Some(t) => {
                         j.progress = j.progress.saturating_add(1);
-                        if j.progress >= hero_dig_ticks(t.dig_ticks(), &h.abilities) {
+                        let base = if wall {
+                            WALL_BUILD_TICKS
+                        } else {
+                            t.dig_ticks()
+                        };
+                        if j.progress >= hero_dig_ticks(base, &h.abilities) {
                             let (target, kind) = (j.target, j.kind);
                             h.dig = None;
                             let was = m.designations.get(&target).copied();
                             if let Some(r) = dig_at(m, target, kind, &mut tiles, &mut ch) {
                                 f.resources.add(r);
+                                if wall {
+                                    f.resources.stone -= 1;
+                                }
                                 // Digging a Stairs-designated tile keeps the stairs intent.
-                                if was == Some(DesignationKind::Stairs)
+                                if !wall
+                                    && was == Some(DesignationKind::Stairs)
                                     && m.designate(target, target, DesignationKind::Stairs) == 1
                                 {
                                     ch.0.insert(target, Some(DesignationKind::Stairs));
@@ -661,6 +695,38 @@ mod tests {
             step(&mut w);
         }
         assert_eq!(tile(&w, t), Tile::Stair);
+    }
+
+    #[test]
+    fn hero_builds_wall_with_stone() {
+        let mut w = setup();
+        let t = p(3, 23, 0);
+        // No stone: nothing starts.
+        apply_command(&mut w, M, Command::Build(Dir::E));
+        assert!(hero(&w).dig.is_none());
+        w.fortresses.get_mut(&M).unwrap().resources.stone = 1;
+        apply_command(&mut w, M, Command::Build(Dir::E));
+        assert_eq!(
+            hero(&w).dig.as_ref().map(|j| j.kind),
+            Some(DesignationKind::Wall)
+        );
+        let mut built = None;
+        for _ in 0..30 {
+            if step(&mut w)[&M].tiles.contains(&(t, Tile::Wall)) {
+                built = Some(());
+            }
+        }
+        assert!(built.is_some(), "delta reports the new wall");
+        assert_eq!(tile(&w, t), Tile::Wall);
+        assert_eq!(w.fortresses[&M].resources.stone, 0);
+        // A wall is solid: Build on it does nothing, Dig takes it back.
+        apply_command(&mut w, M, Command::Build(Dir::E));
+        assert!(hero(&w).dig.is_none());
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert_eq!(
+            hero(&w).dig.as_ref().map(|j| j.kind),
+            Some(DesignationKind::Dig)
+        );
     }
 
     #[test]
