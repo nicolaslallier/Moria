@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 pub const SUBJECT_VIEW: &str = "moria.ai.view";
 pub const SUBJECT_ASSIGN: &str = "moria.ai.assign";
+/// Most dwarves in one view, hence most assignments in one reply.
+pub const MAX_DWARVES_PER_VIEW: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DwarfView {

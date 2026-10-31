@@ -2,19 +2,16 @@
 
 use futures::StreamExt;
 use moria_core::MountainId;
-use moria_core::ai::{AiView, Assignments, SUBJECT_ASSIGN, SUBJECT_VIEW};
+use moria_core::ai::{AiView, Assignments, MAX_DWARVES_PER_VIEW, SUBJECT_ASSIGN, SUBJECT_VIEW};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Same cap as `moria_dwarf_ai::assign::MAX_DWARVES` (dwarves per view).
-pub const MAX_ASSIGNMENTS: usize = 64;
-
 /// Untrusted input from NATS: drop forged/oversized assignments before they cost tick time.
 pub fn accept(a: &Assignments, known: &BTreeSet<MountainId>) -> bool {
-    if a.list.len() > MAX_ASSIGNMENTS {
+    if a.list.len() > MAX_DWARVES_PER_VIEW {
         tracing::warn!(
-            "assignations ignorees: {} entrees (max {MAX_ASSIGNMENTS})",
+            "assignations ignorees: {} entrees (max {MAX_DWARVES_PER_VIEW})",
             a.list.len()
         );
         return false;
@@ -91,15 +88,14 @@ mod tests {
 
     #[test]
     fn filter_drops_oversized_and_unknown() {
-        assert_eq!(MAX_ASSIGNMENTS, moria_dwarf_ai::assign::MAX_DWARVES);
         let known = BTreeSet::from([MountainId(0)]);
         let a = |m, n| Assignments {
             mountain: MountainId(m),
             tick: 0,
             list: vec![(DwarfId(0), TilePos::new(0, 0, 0)); n],
         };
-        assert!(accept(&a(0, MAX_ASSIGNMENTS), &known));
-        assert!(!accept(&a(0, MAX_ASSIGNMENTS + 1), &known));
+        assert!(accept(&a(0, MAX_DWARVES_PER_VIEW), &known));
+        assert!(!accept(&a(0, MAX_DWARVES_PER_VIEW + 1), &known));
         assert!(!accept(&a(1, 1), &known));
     }
 }

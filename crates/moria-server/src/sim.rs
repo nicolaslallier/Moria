@@ -133,14 +133,9 @@ fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
     }
 }
 
-/// Whether the target of a task can still be dug as `kind`.
+/// Whether the target of a task is still designated as `kind` and diggable as such.
 fn target_valid(m: &Mountain, t: TilePos, kind: DesignationKind) -> bool {
-    m.designations.get(&t) == Some(&kind)
-        && match (m.get(t), kind) {
-            (Some(x), DesignationKind::Dig) => x.is_solid(),
-            (Some(x), DesignationKind::Stairs) => x.is_solid() || x == Tile::Floor,
-            (None, _) => false,
-        }
+    m.designations.get(&t) == Some(&kind) && m.diggable(t, kind)
 }
 
 /// The hero and all dwarves.

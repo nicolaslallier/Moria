@@ -78,7 +78,7 @@ impl Mountain {
     }
 
     /// Whether `kind` can be applied at `p` right now.
-    fn diggable(&self, p: TilePos, kind: DesignationKind) -> bool {
+    pub fn diggable(&self, p: TilePos, kind: DesignationKind) -> bool {
         match (self.get(p), kind) {
             (Some(t), DesignationKind::Dig) => t.is_solid(),
             (Some(t), DesignationKind::Stairs) => {
