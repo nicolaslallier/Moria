@@ -1,0 +1,10 @@
+[package]
+name = "moria-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moria-core = { path = "../moria-core" }
+
+[dev-dependencies]
+moria-dwarf-ai = { path = "../moria-dwarf-ai" }

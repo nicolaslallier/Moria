@@ -690,6 +690,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "moria-server"
+version = "0.1.0"
+dependencies = [
+ "moria-core",
+ "moria-dwarf-ai",
+]
+
+[[package]]
 name = "moria-worldgen"
 version = "0.1.0"
 dependencies = [

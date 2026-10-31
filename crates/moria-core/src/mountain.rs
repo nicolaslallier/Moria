@@ -88,25 +88,40 @@ impl Mountain {
         }
     }
 
-    /// Designates the rectangle `a..=b` on level `a.z`; returns how many tiles were added.
-    pub fn designate(&mut self, a: TilePos, b: TilePos, kind: DesignationKind) -> usize {
+    /// Tiles of the rectangle `a..=b` on level `a.z`, clamped to the mountain (the rectangle
+    /// comes from the client). Empty when `a.z` is out of range.
+    pub fn rect(&self, a: TilePos, b: TilePos) -> Vec<TilePos> {
         if a.z >= self.d {
-            return 0;
+            return vec![];
         }
-        // Clamp to the mountain: the rectangle comes from the client.
         let (x0, x1) = (a.x.min(b.x).max(0), a.x.max(b.x).min(self.w - 1));
         let (y0, y1) = (a.y.min(b.y).max(0), a.y.max(b.y).min(self.h - 1));
+        (y0..=y1)
+            .flat_map(|y| (x0..=x1).map(move |x| TilePos::new(x, y, a.z)))
+            .collect()
+    }
+
+    /// Designates the rectangle `a..=b` on level `a.z`; returns how many tiles were added.
+    pub fn designate(&mut self, a: TilePos, b: TilePos, kind: DesignationKind) -> usize {
         let mut n = 0;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let p = TilePos::new(x, y, a.z);
-                if self.diggable(p, kind) {
-                    self.designations.insert(p, kind);
-                    n += 1;
-                }
+        for p in self.rect(a, b) {
+            if self.diggable(p, kind) {
+                self.designations.insert(p, kind);
+                n += 1;
             }
         }
         n
+    }
+
+    /// Removes the designations in the (clamped) rectangle; returns the removed positions.
+    pub fn cancel_designations(&mut self, a: TilePos, b: TilePos) -> Vec<TilePos> {
+        let mut removed = vec![];
+        for p in self.rect(a, b) {
+            if self.designations.remove(&p).is_some() {
+                removed.push(p);
+            }
+        }
+        removed
     }
 
     pub fn dig(&mut self, p: TilePos, kind: DesignationKind) -> Option<Resources> {
@@ -253,5 +268,16 @@ mod tests {
         assert_eq!(m.designations.len(), 1);
         m.dig(p(1, 1, 0), DesignationKind::Dig);
         assert!(m.designations.is_empty());
+    }
+
+    #[test]
+    fn cancel_designations_clamped_and_reported() {
+        let mut m = rock();
+        m.designate(p(0, 0, 0), p(2, 0, 0), DesignationKind::Dig);
+        m.designate(p(0, 1, 1), p(0, 1, 1), DesignationKind::Dig);
+        let r = m.cancel_designations(p(-100, -100, 0), p(100, 0, 0));
+        assert_eq!(r, vec![p(0, 0, 0), p(1, 0, 0), p(2, 0, 0)]);
+        assert_eq!(m.designations.len(), 1);
+        assert!(m.cancel_designations(p(0, 0, 9), p(4, 4, 9)).is_empty());
     }
 }

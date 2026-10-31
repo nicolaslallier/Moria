@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Brainstorming companion
 .superpowers/
+
+# macOS
+.DS_Store
