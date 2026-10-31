@@ -44,13 +44,13 @@ pub enum Reject {
     VersionMismatch {
         server: u32,
     },
+    /// Wrong password, or a login (not creation) with an unknown name: the two are
+    /// indistinguishable so names cannot be enumerated.
     BadPassword,
     ServerFull,
     NoFreeMountain,
     InvalidName,
     BadInvite,
-    /// Login (not creation) with a name the server does not know.
-    UnknownAccount,
     /// Password under 8 characters at account creation.
     WeakPassword,
 }

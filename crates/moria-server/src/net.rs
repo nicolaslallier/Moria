@@ -63,6 +63,23 @@ async fn ask<T>(h: &Handles, make: impl FnOnce(oneshot::Sender<T>) -> Request) -
 /// At most this many argon2 runs at once, whatever the number of handshakes.
 static ARGON: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
+/// Verified against for unknown names, so they cost the same argon2 work as a wrong
+/// password. Hashed lazily, inside the first `blocking` call that needs it.
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    Argon2::default()
+        .hash_password(b"moria-dummy-password")
+        .expect("argon2 dummy hash")
+        .to_string()
+});
+
+fn verify(stored: &str, password: &str) -> bool {
+    PasswordHash::new(stored).is_ok_and(|p| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &p)
+            .is_ok()
+    })
+}
+
 /// Runs argon2 off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     blocking_on(ARGON.clone(), f).await
@@ -181,7 +198,9 @@ async fn handshake(
         None => return Ok(None), // server shutting down
         Some(Lookup::Full) => return reject(wr, Reject::ServerFull).await.map(|()| None),
         Some(Lookup::New) if !create => {
-            return reject(wr, Reject::UnknownAccount).await.map(|()| None);
+            // Same work and same reply as a wrong password: no account enumeration.
+            blocking(move || verify(&DUMMY_HASH, &password)).await;
+            return reject(wr, Reject::BadPassword).await.map(|()| None);
         }
         Some(Lookup::New) => {
             if let Some(want) = &h.invite
@@ -204,14 +223,7 @@ async fn handshake(
             }
         }
         Some(Lookup::Existing(stored)) => {
-            let ok = blocking(move || {
-                PasswordHash::new(&stored).is_ok_and(|p| {
-                    Argon2::default()
-                        .verify_password(password.as_bytes(), &p)
-                        .is_ok()
-                })
-            })
-            .await;
+            let ok = blocking(move || verify(&stored, &password)).await;
             if ok != Some(true) {
                 return reject(wr, Reject::BadPassword).await.map(|()| None);
             }
