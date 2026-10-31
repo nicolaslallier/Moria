@@ -28,6 +28,7 @@ services:
     environment:
       NATS_URL: nats://nats:4222
       MORIA_INVITE: ${MORIA_INVITE:-}
+      MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-4}
     restart: unless-stopped
     depends_on:
       nats: { condition: service_started }

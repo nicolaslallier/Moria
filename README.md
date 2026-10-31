@@ -26,6 +26,8 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 
 `MORIA_INVITE` est une variable de stack Portainer : ne jamais la commiter. Si elle est définie, il faut ce code pour créer un compte ; les comptes existants se connectent sans. Vide ou absente : inscription libre. Partagez le code uniquement avec vos amis.
 
+`MORIA_MAX_PER_IP` (optionnelle, défaut 4) : connexions simultanées max par adresse IP ; à augmenter si plusieurs amis partagent la même IP (NAT). 0 est refusé.
+
 ## Accès depuis Internet
 
 Sur le routeur, rediriger le port **7777/TCP** vers `192.168.2.10:7777`. Aucun autre port ne doit être ouvert.

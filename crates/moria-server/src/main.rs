@@ -1,4 +1,4 @@
-use moria_server::{Config, run};
+use moria_server::{Config, MAX_CONNECTIONS_PER_IP, run};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,12 +8,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+    let max_per_ip: usize = env("MORIA_MAX_PER_IP", &MAX_CONNECTIONS_PER_IP.to_string())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("MORIA_MAX_PER_IP invalide : {e}"))?;
+    anyhow::ensure!(max_per_ip > 0, "MORIA_MAX_PER_IP doit être au moins 1");
     let cfg = Config {
         data: env("MORIA_DATA", "/data/world.bin").into(),
         bind: env("MORIA_BIND", "0.0.0.0:7777").parse()?,
         nats_url: Some(env("NATS_URL", "nats://nats:4222")),
         invite: std::env::var("MORIA_INVITE").ok().filter(|s| !s.is_empty()),
-        max_per_ip: moria_server::MAX_CONNECTIONS_PER_IP,
+        max_per_ip,
     };
     run(cfg, shutdown_signal()).await
 }

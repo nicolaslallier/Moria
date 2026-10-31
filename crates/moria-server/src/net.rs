@@ -9,6 +9,7 @@ use moria_core::PlayerId;
 use moria_core::protocol::{
     ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, encode, read_frame_async,
 };
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -57,12 +58,26 @@ async fn ask<T>(h: &Handles, make: impl FnOnce(oneshot::Sender<T>) -> Request) -
 }
 
 /// At most this many argon2 runs at once, whatever the number of handshakes.
-static ARGON: Semaphore = Semaphore::const_new(2);
+static ARGON: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
 /// Runs argon2 off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let _permit = ARGON.acquire().await.ok()?;
-    tokio::task::spawn_blocking(f).await.ok()
+    blocking_on(ARGON.clone(), f).await
+}
+
+/// The permit moves into the blocking closure: a cancelled caller (handshake timeout)
+/// cannot free it while the computation still runs.
+async fn blocking_on<T: Send + 'static>(
+    sem: Arc<Semaphore>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let permit = sem.acquire_owned().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .ok()
 }
 
 pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
@@ -197,6 +212,29 @@ async fn handshake(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn argon_permit_held_until_blocking_work_finishes() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release, wait) = mpsc::channel::<()>();
+        let job = super::blocking_on(sem.clone(), move || {
+            let _ = wait.recv();
+        });
+        // Cancelled like a handshake timeout, while the blocking job runs.
+        let r = tokio::time::timeout(Duration::from_millis(200), job).await;
+        assert!(r.is_err());
+        assert_eq!(sem.available_permits(), 0, "permit freed on cancel");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sem.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("permit released once the job ends");
+    }
+
     #[test]
     fn ct_eq_cases() {
         use super::ct_eq;
