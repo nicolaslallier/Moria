@@ -27,7 +27,7 @@ pub async fn run(nats_url: String, shutdown: impl Future<Output = ()>) -> anyhow
     loop {
         let msg = tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            m = sub.next() => match m { Some(m) => m, None => return Ok(()) },
+            m = sub.next() => match m { Some(m) => m, None => anyhow::bail!("abonnement NATS termine") },
         };
         let view: AiView = match postcard::from_bytes(&msg.payload) {
             Ok(v) => v,
@@ -36,13 +36,24 @@ pub async fn run(nats_url: String, shutdown: impl Future<Output = ()>) -> anyhow
                 continue;
             }
         };
-        let list = assign::assign(&view);
+        if let Err(e) = assign::validate(&view) {
+            tracing::warn!("vue invalide ignoree: {e}");
+            continue;
+        }
+        let (mountain, tick) = (view.mountain.id, view.tick);
+        let list = match tokio::task::spawn_blocking(move || assign::assign(&view)).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("assignation echouee: {e}");
+                continue;
+            }
+        };
         if list.is_empty() {
             continue;
         }
         let out = Assignments {
-            mountain: view.mountain.id,
-            tick: view.tick,
+            mountain,
+            tick,
             list,
         };
         match postcard::to_allocvec(&out) {

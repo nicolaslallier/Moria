@@ -32,6 +32,15 @@ impl Mountain {
         (self.w, self.h, self.d)
     }
 
+    /// False when the tile vec doesn't match the dimensions (possible after untrusted
+    /// deserialization, which bypasses `new`).
+    pub fn is_consistent(&self) -> bool {
+        self.w > 0
+            && self.h > 0
+            && self.d > 0
+            && self.tiles.len() == self.w as usize * self.h as usize * self.d as usize
+    }
+
     pub fn in_bounds(&self, p: TilePos) -> bool {
         (0..self.w).contains(&p.x) && (0..self.h).contains(&p.y) && p.z < self.d
     }

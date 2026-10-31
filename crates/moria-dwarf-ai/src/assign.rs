@@ -1,7 +1,40 @@
 use moria_core::ai::AiView;
 use moria_core::path::distances_from;
 use moria_core::{Dir, DwarfId, TilePos};
+use moria_core::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
 use std::collections::HashSet;
+
+pub const MAX_DWARVES: usize = 64;
+
+/// A deserialized view is untrusted: postcard bypasses `Mountain`'s invariants.
+pub fn validate(view: &AiView) -> Result<(), &'static str> {
+    let m = &view.mountain;
+    let (w, h, d) = m.size();
+    if w <= 0 || h <= 0 || d == 0 || w > MOUNTAIN_W || h > MOUNTAIN_H || d > MOUNTAIN_D {
+        return Err("dimensions invalides");
+    }
+    if !m.is_consistent() {
+        return Err("tuiles incoherentes");
+    }
+    if view.dwarves.len() > MAX_DWARVES {
+        return Err("trop de nains");
+    }
+    if m.designations.len() > w as usize * h as usize * d as usize {
+        return Err("trop de designations");
+    }
+    let ok = view.dwarves.iter().all(|d| m.in_bounds(d.pos))
+        && m.designations.keys().all(|&p| m.in_bounds(p))
+        && view
+            .claimed
+            .iter()
+            .chain(&view.occupied)
+            .all(|&p| m.in_bounds(p));
+    if ok {
+        Ok(())
+    } else {
+        Err("position hors limites")
+    }
+}
 
 /// Which idle dwarf digs which open designation.
 pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
@@ -21,6 +54,8 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
         return vec![];
     }
     // Dwarves don't block each other: empty `blocked`.
+    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x 18k tiles); if that gets
+    // too slow, run a single multi-source BFS from the tasks' work spots instead.
     let no_block = HashSet::new();
     let dist: Vec<Vec<Option<u32>>> = dwarves
         .iter()
@@ -92,6 +127,23 @@ fn solve(dist: &[Vec<Option<u32>>]) -> Vec<Option<usize>> {
                     got[i] = Some(t);
                     improved = true;
                     break;
+                }
+            }
+        }
+        // Augment: an unassigned dwarf takes a held task if its holder can move to a free one.
+        // The assigned count grows each time, so this terminates.
+        'aug: for u in (0..nd).filter(|&u| got[u].is_none()) {
+            for k in 0..nd {
+                let Some(t) = got[k] else { continue };
+                if cost(u, t).is_none() {
+                    continue;
+                }
+                if let Some(f) = (0..nt).find(|&f| !taken[f] && cost(k, f).is_some()) {
+                    got[u] = Some(t);
+                    got[k] = Some(f);
+                    taken[f] = true;
+                    improved = true;
+                    break 'aug;
                 }
             }
         }
@@ -197,6 +249,52 @@ mod tests {
     fn dwarf_that_reaches_nothing_gets_nothing() {
         let dist = vec![vec![Some(5), Some(2)], vec![None, None]];
         assert_eq!(solve(&dist), vec![Some(1), None]);
+    }
+
+    #[test]
+    fn unassigned_dwarf_gets_work_via_reassignment() {
+        let dist = vec![vec![Some(1), Some(5)], vec![Some(9), None]];
+        assert_eq!(solve(&dist), vec![Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn invalid_view_rejected() {
+        let mut m = corridor(10);
+        task(&mut m, 5);
+        let ok = view(m.clone(), vec![dw(1, 1, true)], vec![], vec![]);
+        assert!(validate(&ok).is_ok());
+        // out-of-bounds dwarf
+        let mut bad = ok.clone();
+        bad.dwarves[0].pos = TilePos::new(500, 1, 0);
+        assert!(validate(&bad).is_err());
+        // truncated tiles vec, via a serialized round trip with the tiles cut short
+        // truncated tiles vec: build the raw wire form with too few tiles
+        #[derive(serde::Serialize)]
+        struct Raw(
+            MountainId,
+            i16,
+            i16,
+            u8,
+            Vec<Tile>,
+            std::collections::BTreeMap<TilePos, DesignationKind>,
+        );
+        let raw = Raw(
+            MountainId(0),
+            40,
+            8,
+            1,
+            vec![Tile::Rock; 10],
+            Default::default(),
+        );
+        let trunc: Mountain = postcard::from_bytes(&postcard::to_allocvec(&raw).unwrap()).unwrap();
+        assert!(validate(&view(trunc, vec![], vec![], vec![])).is_err());
+    }
+
+    #[test]
+    fn too_many_dwarves_rejected() {
+        let m = corridor(10);
+        let ds = (0..65).map(|i| dw(i, 1, true)).collect();
+        assert!(validate(&view(m, ds, vec![], vec![])).is_err());
     }
 
     #[test]

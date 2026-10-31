@@ -8,6 +8,7 @@ moria-core = { path = "../moria-core" }
 async-nats.workspace = true
 tokio.workspace = true
 postcard.workspace = true
+serde = { workspace = true }
 anyhow.workspace = true
 futures.workspace = true
 tracing.workspace = true
