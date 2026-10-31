@@ -1,0 +1,43 @@
+# Stack Moria. Variable de stack Portainer : MORIA_INVITE (code d'invitation).
+x-build: &build
+  context: .
+  dockerfile: docker/Dockerfile
+
+services:
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+
+  server:
+    build:
+      <<: *build
+      args: { BIN: moria-server }
+    ports: ["7777:7777"]
+    volumes: ["moria-data:/data"]
+    environment:
+      NATS_URL: nats://nats:4222
+      MORIA_INVITE: ${MORIA_INVITE:-}
+    restart: unless-stopped
+    depends_on: [nats]
+
+  dwarf-ai:
+    build:
+      <<: *build
+      args: { BIN: moria-dwarf-ai }
+    environment:
+      NATS_URL: nats://nats:4222
+    restart: unless-stopped
+    depends_on: [nats]
+    deploy:
+      replicas: 1
+
+  worldgen:
+    build:
+      <<: *build
+      args: { BIN: moria-worldgen }
+    profiles: ["tools"]
+    volumes: ["moria-data:/data"]
+    command: ["--out", "/data/world.bin"]
+
+volumes:
+  moria-data:
