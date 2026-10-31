@@ -49,10 +49,37 @@ pub struct Changes {
 }
 
 impl Changes {
-    /// Appends to `d`. Clients apply `designations_added` before `designations_removed`.
+    /// Folds a `later` command's changes into `self`; the last write on a tile wins.
+    pub fn then(&mut self, later: Changes) {
+        for (p, k) in later.added {
+            self.removed.retain(|&q| q != p);
+            self.added.retain(|&(q, _)| q != p);
+            self.added.push((p, k));
+        }
+        for p in later.removed {
+            self.added.retain(|&(q, _)| q != p);
+            self.removed.retain(|&q| q != p);
+            self.removed.push(p);
+        }
+    }
+
+    /// Merges into the tick delta. These changes happened before `step`, so whatever `d`
+    /// already says about a tile wins; the result never lists a tile in both lists.
     pub fn merge_into(self, d: &mut TickDelta) {
-        d.designations_added.extend(self.added);
-        d.designations_removed.extend(self.removed);
+        for (p, k) in self.added {
+            if !d.designations_removed.contains(&p)
+                && !d.designations_added.iter().any(|a| a.0 == p)
+            {
+                d.designations_added.push((p, k));
+            }
+        }
+        for p in self.removed {
+            if !d.designations_added.iter().any(|a| a.0 == p)
+                && !d.designations_removed.contains(&p)
+            {
+                d.designations_removed.push(p);
+            }
+        }
     }
 }
 
@@ -147,7 +174,8 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
         return;
     };
     let no_block = HashSet::new();
-    for &(id, target) in a.list.iter().take(f.dwarves.len()) {
+    let (mut searches, cap) = (0, f.dwarves.len());
+    for &(id, target) in &a.list {
         let Some(kind) = mt.designations.get(&target).copied() else {
             continue;
         };
@@ -171,6 +199,11 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
         else {
             continue;
         };
+        // Only valid entries count against the pathfinding budget.
+        if searches >= cap {
+            break;
+        }
+        searches += 1;
         if let Some(path) = find_path(mt, d.pos, work_spot_goal(mt, target), &no_block) {
             d.task = Some(DwarfTask {
                 target,
@@ -216,7 +249,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         let Some(m) = w.mountains.get_mut(&id) else {
             continue;
         };
-        let (mut tiles, mut removed) = (vec![], vec![]);
+        let (mut tiles, mut removed, mut added) = (vec![], vec![], vec![]);
 
         if let Some(h) = f.hero.as_mut() {
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
@@ -224,12 +257,20 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 match m.get(j.target).filter(|t| t.is_solid()) {
                     None => h.dig = None,
                     Some(t) => {
-                        j.progress += 1;
+                        j.progress = j.progress.saturating_add(1);
                         if j.progress >= hero_dig_ticks(t.dig_ticks(), &h.abilities) {
                             let (target, kind) = (j.target, j.kind);
                             h.dig = None;
+                            let was = m.designations.get(&target).copied();
                             if let Some(r) = dig_at(m, target, kind, &mut tiles, &mut removed) {
                                 f.resources.add(r);
+                                // Digging a Stairs-designated tile keeps the stairs intent.
+                                if was == Some(DesignationKind::Stairs)
+                                    && m.designate(target, target, DesignationKind::Stairs) == 1
+                                {
+                                    removed.retain(|&q| q != target);
+                                    added.push((target, DesignationKind::Stairs));
+                                }
                             }
                         }
                     }
@@ -265,23 +306,24 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             } else if !Dir::HORIZONTAL.iter().any(|&d| pos.step(d) == task.target) {
                 continue; // not at a work spot
             } else {
-                task.progress += 1;
+                task.progress = task.progress.saturating_add(1);
                 let base = m.get(task.target).map_or(0, Tile::dig_ticks);
                 let needed = match task.kind {
                     DesignationKind::Dig => base,
-                    DesignationKind::Stairs => base + STAIRS_EXTRA_TICKS,
+                    DesignationKind::Stairs => base.saturating_add(STAIRS_EXTRA_TICKS),
                 };
                 if task.progress >= needed {
                     let blocked = task.kind == DesignationKind::Stairs
                         && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
                             || f.dwarves.iter().any(|d| d.pos == task.target));
-                    if !blocked {
-                        if let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut removed)
-                        {
-                            f.resources.add(r);
-                        }
-                        continue; // done: task stays None
+                    // Done, or blocked by an occupant: either way the task ends. When blocked
+                    // the designation stays and the AI reassigns it once the tile is free.
+                    if !blocked
+                        && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut removed)
+                    {
+                        f.resources.add(r);
                     }
+                    continue;
                 }
             }
             f.dwarves[i].task = Some(task);
@@ -295,7 +337,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     hero_pos: h.pos,
                     dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
                     tiles,
-                    designations_added: vec![],
+                    designations_added: added,
                     designations_removed: removed,
                     resources: f.resources,
                 },
@@ -477,7 +519,7 @@ mod tests {
             },
         );
         assert!(w.fortresses[&M].dwarves[0].task.is_none());
-        // Occupant arrives mid-task: the dig waits instead of completing.
+        // Occupant arrives mid-task: the task is dropped and the designation stays.
         let t = p(3, 24, 0);
         designate(&mut w, t, DesignationKind::Stairs);
         apply_assignments(
@@ -494,11 +536,116 @@ mod tests {
             step(&mut w);
         }
         assert_eq!(tile(&w, t), Tile::Floor);
+        assert!(w.fortresses[&M].dwarves[0].task.is_none());
+        assert_eq!(
+            w.mountains[&M].designations.get(&t),
+            Some(&DesignationKind::Stairs)
+        );
+        // Once free, it can be reassigned and dug.
         w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(2, 23, 0);
-        for _ in 0..3 {
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(id, t)],
+            },
+        );
+        for _ in 0..40 {
             step(&mut w);
         }
         assert_eq!(tile(&w, t), Tile::Stair);
+    }
+
+    #[test]
+    fn designate_after_cancel_same_tick_stays_designated() {
+        let mut w = setup();
+        let t = p(6, 23, 0);
+        let mut ch = Changes::default();
+        ch.then(apply_command(
+            &mut w,
+            M,
+            Command::Designate {
+                a: t,
+                b: t,
+                kind: DesignationKind::Dig,
+            },
+        ));
+        ch.then(apply_command(&mut w, M, Command::Cancel { a: t, b: t }));
+        ch.then(apply_command(
+            &mut w,
+            M,
+            Command::Designate {
+                a: t,
+                b: t,
+                kind: DesignationKind::Dig,
+            },
+        ));
+        assert_eq!(ch.added, vec![(t, DesignationKind::Dig)]);
+        assert!(ch.removed.is_empty());
+        let mut d = step(&mut w).remove(&M).unwrap();
+        ch.merge_into(&mut d);
+        assert_eq!(d.designations_added, vec![(t, DesignationKind::Dig)]);
+        assert!(d.designations_removed.is_empty());
+        // Reverse: designate then cancel ends removed only.
+        let mut ch = Changes::default();
+        ch.then(apply_command(&mut w, M, Command::Cancel { a: t, b: t }));
+        ch.then(apply_command(
+            &mut w,
+            M,
+            Command::Designate {
+                a: t,
+                b: t,
+                kind: DesignationKind::Dig,
+            },
+        ));
+        ch.then(apply_command(&mut w, M, Command::Cancel { a: t, b: t }));
+        assert!(ch.added.is_empty());
+        assert_eq!(ch.removed, vec![t]);
+    }
+
+    #[test]
+    fn hero_dig_of_stairs_designation_keeps_stairs_intent() {
+        let mut w = setup();
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        set_str(&mut w, 30);
+        let t = p(6, 23, 0);
+        designate(&mut w, t, DesignationKind::Stairs);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        let mut last = None;
+        for _ in 0..12 {
+            let d = step(&mut w).remove(&M).unwrap();
+            if d.tiles.contains(&(t, Tile::Floor)) {
+                last = Some(d);
+            }
+        }
+        let d = last.expect("tile dug");
+        assert_eq!(tile(&w, t), Tile::Floor);
+        assert_eq!(
+            w.mountains[&M].designations.get(&t),
+            Some(&DesignationKind::Stairs)
+        );
+        assert_eq!(d.designations_added, vec![(t, DesignationKind::Stairs)]);
+        assert!(!d.designations_removed.contains(&t));
+    }
+
+    #[test]
+    fn invalid_head_entries_do_not_starve_valid_ones() {
+        let mut w = setup();
+        let t = p(6, 23, 0);
+        designate(&mut w, t, DesignationKind::Dig);
+        let ids: Vec<_> = w.fortresses[&M].dwarves.iter().map(|d| d.id).collect();
+        let mut list = vec![(ids[0], p(40, 40, 0)); 5];
+        list.push((ids[0], t));
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list,
+            },
+        );
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
     }
 
     #[test]
@@ -664,8 +811,11 @@ mod tests {
                     },
                 );
             }
+            // Plenty more rock to keep every dwarf busy for the whole run.
+            m.designate(p(10, 22, 0), p(47, 47, 0), DesignationKind::Dig);
         }
         let mut total = std::time::Duration::ZERO;
+        let mut busy = 0usize;
         for n in 0..1000u64 {
             if n % 10 == 0 {
                 let ids: Vec<_> = w.fortresses.keys().copied().collect();
@@ -686,6 +836,7 @@ mod tests {
                         occupied: occupied(&w, id),
                     };
                     let list = moria_dwarf_ai::assign::assign(&view);
+                    let t0 = Instant::now();
                     apply_assignments(
                         &mut w,
                         &Assignments {
@@ -694,20 +845,25 @@ mod tests {
                             list,
                         },
                     );
+                    total += t0.elapsed();
                 }
             }
             let t0 = Instant::now();
             step(&mut w);
             total += t0.elapsed();
+            busy += w
+                .fortresses
+                .values()
+                .flat_map(|f| &f.dwarves)
+                .filter(|d| d.task.is_some())
+                .count();
         }
         let mean = total / 1000;
+        let left: usize = w.mountains.values().map(|m| m.designations.len()).sum();
         println!(
-            "mean step: {mean:?}; designations left: {}",
-            w.mountains
-                .values()
-                .map(|m| m.designations.len())
-                .sum::<usize>()
+            "mean step+assign: {mean:?}; busy dwarf-ticks {busy}/30000; designations left: {left}"
         );
+        assert!(left > 500 && busy > 10_000, "workload ran dry");
         assert!(mean.as_millis() < 10, "{mean:?}");
     }
 }
