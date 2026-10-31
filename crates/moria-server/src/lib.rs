@@ -14,10 +14,10 @@ use moria_core::{MountainId, PlayerId, TilePos};
 use sim::{Changes, Command};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -31,6 +31,8 @@ const SAVE_EVERY: u64 = 300;
 pub const MAX_SESSIONS: usize = 10;
 /// Open TCP connections, authenticated or not; extra connections are closed on accept.
 pub const MAX_CONNECTIONS: usize = 32;
+/// Default per-IP cap, so one host cannot take every global slot.
+pub const MAX_CONNECTIONS_PER_IP: usize = 4;
 const MAX_CMDS_PER_TICK: usize = 1024;
 const MAX_REQS_PER_TICK: usize = 64;
 const MAX_ASSIGN_PER_TICK: usize = 16;
@@ -42,6 +44,8 @@ pub struct Config {
     pub nats_url: Option<String>,
     /// Invite code required to create a new account; `None` means open registration.
     pub invite: Option<String>,
+    /// Concurrent connections allowed per source IP.
+    pub max_per_ip: usize,
 }
 
 pub enum Lookup {
@@ -68,6 +72,42 @@ pub enum Request {
         race: Race,
         class: Class,
     },
+}
+
+/// One live connection of an IP; Drop gives the slot back and removes the entry at 0.
+struct IpGuard {
+    map: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl IpGuard {
+    fn acquire(map: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr, max: usize) -> Option<Self> {
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip).or_insert(0);
+        if *n >= max {
+            if *n == 0 {
+                m.remove(&ip);
+            }
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            map: map.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
 }
 
 /// Binds `cfg.bind` and serves until `shutdown` resolves.
@@ -106,16 +146,20 @@ pub async fn run_with_listener(
     });
     drop(assign_tx);
 
-    match &cfg.invite {
+    // An empty (or blank) code means open registration, whatever the caller passed.
+    let invite = cfg.invite.clone().filter(|s| !s.trim().is_empty());
+    match &invite {
         None => tracing::warn!("MORIA_INVITE absent : inscription ouverte à tous"),
         Some(_) => tracing::info!("inscription sur code d'invitation"),
     }
     let handles = net::Handles {
         req: req_tx,
         cmd: cmd_tx,
-        invite: cfg.invite.clone(),
+        invite: invite.clone(),
     };
     let conns = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
+    let max_per_ip = cfg.max_per_ip;
     tracing::info!("serveur prêt sur {}", listener.local_addr()?);
     let accept = tokio::spawn(async move {
         loop {
@@ -125,9 +169,13 @@ pub async fn run_with_listener(
                     let Ok(permit) = conns.clone().try_acquire_owned() else {
                         continue;
                     };
+                    let Some(ip_guard) = IpGuard::acquire(&per_ip, peer.ip(), max_per_ip) else {
+                        continue; // this IP is over its cap: drop the stream
+                    };
                     let h = handles.clone();
                     tokio::spawn(async move {
                         let _permit = permit; // held for the whole connection
+                        let _ip = ip_guard;
                         if let Err(e) = net::session(stream, h).await {
                             tracing::debug!("session {peer} terminee : {e}");
                         }

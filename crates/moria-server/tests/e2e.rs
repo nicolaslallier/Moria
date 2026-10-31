@@ -57,6 +57,7 @@ async fn start_server(data: &Path) -> (Task, SocketAddr) {
         bind: addr,
         nats_url: Some(nats_url()),
         invite: None,
+        max_per_ip: 1000,
     };
     let done = tokio::spawn(run_with_listener(cfg, listener, async {
         let _ = rx.await;

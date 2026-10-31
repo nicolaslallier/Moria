@@ -12,12 +12,14 @@ use moria_core::protocol::{
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 pub const SESSION_QUEUE: usize = 64;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// One deadline over the whole pre-login handshake (Hello, argon2 wait + compute, invite
+/// check, up to the Welcome/Reject). CreateHero comes later and is not covered.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// A client that does not drain its socket for this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -26,6 +28,15 @@ pub struct Handles {
     pub req: mpsc::Sender<Request>,
     pub cmd: mpsc::Sender<(PlayerId, Command)>,
     pub invite: Option<String>,
+}
+
+/// Constant-time equality on the compared prefix; the length difference is folded in.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut d = a.len() ^ b.len();
+    for (x, y) in a.iter().zip(b) {
+        d |= usize::from(x ^ y);
+    }
+    d == 0
 }
 
 pub fn valid_name(n: &str) -> bool {
@@ -56,77 +67,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
-    let ClientMsg::Hello {
-        version,
-        name,
-        password,
-        invite,
-    } = timeout(HELLO_TIMEOUT, read_frame_async(&mut rd)).await??
-    else {
+    let hs = timeout(HANDSHAKE_TIMEOUT, handshake(&mut rd, &mut wr, &h)).await??;
+    let Some((player, mut rx)) = hs else {
         return Ok(());
-    };
-    if version != PROTOCOL_VERSION {
-        return reject(
-            &mut wr,
-            Reject::VersionMismatch {
-                server: PROTOCOL_VERSION,
-            },
-        )
-        .await;
-    }
-    if !valid_name(&name) {
-        return reject(&mut wr, Reject::InvalidName).await;
-    }
-    let lookup = ask(&h, |reply| Request::Lookup {
-        name: name.clone(),
-        reply,
-    })
-    .await;
-    let new_hash = match lookup {
-        None => return Ok(()), // server shutting down
-        Some(Lookup::Full) => return reject(&mut wr, Reject::ServerFull).await,
-        Some(Lookup::New) => {
-            if h.invite.is_some() && invite != h.invite {
-                return reject(&mut wr, Reject::BadInvite).await;
-            }
-            let hash = blocking(move || {
-                Argon2::default()
-                    .hash_password(password.as_bytes())
-                    .map(|p| p.to_string())
-            })
-            .await;
-            match hash {
-                Some(Ok(hash)) => Some(hash),
-                _ => anyhow::bail!("hachage du mot de passe impossible"),
-            }
-        }
-        Some(Lookup::Existing(stored)) => {
-            let ok = blocking(move || {
-                PasswordHash::new(&stored).is_ok_and(|p| {
-                    Argon2::default()
-                        .verify_password(password.as_bytes(), &p)
-                        .is_ok()
-                })
-            })
-            .await;
-            if ok != Some(true) {
-                return reject(&mut wr, Reject::BadPassword).await;
-            }
-            None
-        }
-    };
-    let (tx, mut rx) = mpsc::channel(SESSION_QUEUE);
-    let login = ask(&h, |reply| Request::Login {
-        name,
-        new_hash,
-        tx,
-        reply,
-    })
-    .await;
-    let player = match login {
-        None => return Ok(()),
-        Some(Err(r)) => return reject(&mut wr, r).await,
-        Some(Ok(p)) => p,
     };
     // The world task queued Welcome (and Snapshot if the hero exists) on `tx`. When the
     // world drops `tx` (kicked, slow, shutdown) the writer ends and so does the session.
@@ -167,8 +110,104 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
     }
 }
 
+type Handshake = Option<(PlayerId, mpsc::Receiver<ServerMsg>)>;
+
+/// Hello to login. `None` means the session ends quietly (a Reject was sent, or shutdown).
+async fn handshake(
+    rd: &mut OwnedReadHalf,
+    wr: &mut OwnedWriteHalf,
+    h: &Handles,
+) -> anyhow::Result<Handshake> {
+    let ClientMsg::Hello {
+        version,
+        name,
+        password,
+        invite,
+    } = read_frame_async(rd).await?
+    else {
+        return Ok(None);
+    };
+    if version != PROTOCOL_VERSION {
+        return reject(
+            wr,
+            Reject::VersionMismatch {
+                server: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .map(|()| None);
+    }
+    if !valid_name(&name) {
+        return reject(wr, Reject::InvalidName).await.map(|()| None);
+    }
+    let lookup = ask(h, |reply| Request::Lookup {
+        name: name.clone(),
+        reply,
+    })
+    .await;
+    let new_hash = match lookup {
+        None => return Ok(None), // server shutting down
+        Some(Lookup::Full) => return reject(wr, Reject::ServerFull).await.map(|()| None),
+        Some(Lookup::New) => {
+            if let Some(want) = &h.invite
+                && !invite.is_some_and(|got| ct_eq(got.as_bytes(), want.as_bytes()))
+            {
+                return reject(wr, Reject::BadInvite).await.map(|()| None);
+            }
+            let hash = blocking(move || {
+                Argon2::default()
+                    .hash_password(password.as_bytes())
+                    .map(|p| p.to_string())
+            })
+            .await;
+            match hash {
+                Some(Ok(hash)) => Some(hash),
+                _ => anyhow::bail!("hachage du mot de passe impossible"),
+            }
+        }
+        Some(Lookup::Existing(stored)) => {
+            let ok = blocking(move || {
+                PasswordHash::new(&stored).is_ok_and(|p| {
+                    Argon2::default()
+                        .verify_password(password.as_bytes(), &p)
+                        .is_ok()
+                })
+            })
+            .await;
+            if ok != Some(true) {
+                return reject(wr, Reject::BadPassword).await.map(|()| None);
+            }
+            None
+        }
+    };
+    let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+    let login = ask(h, |reply| Request::Login {
+        name,
+        new_hash,
+        tx,
+        reply,
+    })
+    .await;
+    match login {
+        None => Ok(None),
+        Some(Err(r)) => reject(wr, r).await.map(|()| None),
+        Some(Ok(p)) => Ok(Some((p, rx))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ct_eq_cases() {
+        use super::ct_eq;
+        assert!(ct_eq(b"mellon", b"mellon"));
+        assert!(!ct_eq(b"mellon", b"mellor"));
+        assert!(!ct_eq(b"mellon", b"mello"));
+        assert!(!ct_eq(b"mello", b"mellon"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"", b"x"));
+    }
+
     #[test]
     fn names() {
         use super::valid_name;

@@ -26,6 +26,10 @@ impl Server {
     }
 
     async fn start_with(name: &str, invite: Option<&str>) -> Server {
+        Server::start_cap(name, invite, 1000).await
+    }
+
+    async fn start_cap(name: &str, invite: Option<&str>, max_per_ip: usize) -> Server {
         let dir = std::env::temp_dir().join(format!("moria-net-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let data = dir.join("world.bin");
@@ -38,6 +42,7 @@ impl Server {
             bind: addr,
             nats_url: None,
             invite: invite.map(Into::into),
+            max_per_ip,
         };
         let done = tokio::spawn(run_with_listener(cfg, listener, async {
             let _ = rx.await;
@@ -298,6 +303,7 @@ async fn missing_world_file_is_an_error() {
         bind: listener.local_addr().unwrap(),
         nats_url: None,
         invite: None,
+        max_per_ip: 4,
     };
     let e = run_with_listener(cfg, listener, async {})
         .await
@@ -311,7 +317,7 @@ async fn missing_world_file_is_an_error() {
 #[tokio::test]
 async fn connections_beyond_cap_are_dropped() {
     use tokio::io::AsyncReadExt;
-    let s = Server::start("conncap").await;
+    let s = Server::start("conncap").await; // per-IP cap set high: proves the global cap
     let mut idle = vec![];
     for _ in 0..32 {
         idle.push(TcpStream::connect(s.addr).await.unwrap());
@@ -353,6 +359,50 @@ async fn existing_account_needs_no_invite() {
         ServerMsg::Welcome { .. }
     ));
     drop(c);
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.hello("gimli", "pw").await,
+        ServerMsg::Welcome { .. }
+    ));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn per_ip_cap_drops_fifth_connection() {
+    use tokio::io::AsyncReadExt;
+    let s = Server::start_cap("ipcap", None, 4).await;
+    let mut idle = vec![];
+    for _ in 0..4 {
+        idle.push(TcpStream::connect(s.addr).await.unwrap());
+    }
+    let mut extra = TcpStream::connect(s.addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let r = timeout(Duration::from_secs(2), extra.read(&mut buf))
+        .await
+        .expect("5th connection must be closed promptly");
+    assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
+    // The first four are still open (no data, no EOF).
+    for c in &mut idle {
+        assert!(
+            timeout(Duration::from_millis(200), c.read(&mut buf))
+                .await
+                .is_err()
+        );
+    }
+    // A slot frees up once one of them closes.
+    idle.pop();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut again = Client::connect(&s).await;
+    assert!(matches!(
+        again.hello("gimli", "pw").await,
+        ServerMsg::Welcome { .. }
+    ));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn empty_invite_means_open_registration() {
+    let s = Server::start_with("invite-empty", Some("")).await;
     let mut c = Client::connect(&s).await;
     assert!(matches!(
         c.hello("gimli", "pw").await,
