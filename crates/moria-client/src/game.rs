@@ -22,6 +22,7 @@ fn valid_view(v: &FortressView) -> bool {
         && (1..=64).contains(&d)
         && v.mountain.in_bounds(v.hero.pos)
         && v.dwarves.len() <= 1024
+        && v.dwarves.iter().all(|(_, p)| v.mountain.in_bounds(*p))
 }
 
 #[derive(States, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -107,11 +108,16 @@ impl Game {
         for &(p, t) in &d.tiles {
             self.mountain.set(p, t);
         }
+        // Out-of-bounds entries are ignored so a hostile server cannot grow the map.
         for p in &d.designations_removed {
-            self.mountain.designations.remove(p);
+            if self.mountain.in_bounds(*p) {
+                self.mountain.designations.remove(p);
+            }
         }
         for &(p, k) in &d.designations_added {
-            self.mountain.designations.insert(p, k);
+            if self.mountain.in_bounds(p) {
+                self.mountain.designations.insert(p, k);
+            }
         }
         self.dwarves.clear();
         let m = &self.mountain;
@@ -123,14 +129,19 @@ impl Game {
         if !self.mountain.in_bounds(s) {
             return;
         }
-        if let Some(i) = self.pending.iter().position(|&(p, _)| p == s) {
-            self.pending.drain(..=i);
-        } else if s != self.confirmed
-            || self
+        if s == self.confirmed {
+            // Stale: the server has not applied our moves yet. Checked first so pacing
+            // A→B→A is not mistaken for an ack of the final A.
+            if self
                 .pending
                 .front()
                 .is_some_and(|&(_, t)| self.ticks - t > PENDING_TICKS)
-        {
+            {
+                self.pending.clear();
+            }
+        } else if let Some(i) = self.pending.iter().position(|&(p, _)| p == s) {
+            self.pending.drain(..=i);
+        } else {
             self.pending.clear();
         }
         self.confirmed = s;
@@ -346,6 +357,20 @@ mod tests {
     }
 
     #[test]
+    fn pacing_back_and_forth_does_not_rubber_band() {
+        let mut g = game();
+        let a = p(2, 1, 0);
+        g.try_move(Dir::E, 10.0).unwrap();
+        g.try_move(Dir::W, 11.0).unwrap();
+        assert_eq!(g.hero.pos, a);
+        for s in [a, p(3, 1, 0), a] {
+            g.apply_tick(&tick(s));
+            assert_eq!(g.hero.pos, a, "after tick at {s:?}");
+        }
+        assert!(g.pending.is_empty());
+    }
+
+    #[test]
     fn divergent_tick_snaps_and_clears() {
         let mut g = game();
         g.try_move(Dir::E, 10.0).unwrap();
@@ -373,9 +398,17 @@ mod tests {
         let mut g = game();
         let mut d = tick(p(99, 1, 0));
         d.dwarves = vec![(DwarfId(1), p(3, 1, 0)), (DwarfId(2), p(-1, 0, 0))];
+        d.designations_added = vec![(p(-5, 0, 0), DesignationKind::Dig)];
+        g.mountain
+            .designations
+            .insert(p(100, 0, 0), DesignationKind::Dig);
+        d.designations_removed = vec![p(100, 0, 0)];
         g.apply_tick(&d);
         assert_eq!(g.hero.pos, p(2, 1, 0));
         assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0))]);
+        assert!(!g.mountain.designations.contains_key(&p(-5, 0, 0)));
+        // Removes are ignored too: nothing out of bounds is touched.
+        assert!(g.mountain.designations.contains_key(&p(100, 0, 0)));
     }
 
     #[test]
@@ -421,6 +454,10 @@ mod tests {
             unreachable!()
         };
         v.dwarves = vec![(DwarfId(0), p(2, 1, 0)); 1025];
+        assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v.clone()))));
+        assert_eq!(s.screen, Screen::Disconnected);
+        let mut s = Session::default();
+        v.dwarves = vec![(DwarfId(0), p(6, 1, 0))];
         assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v))));
         assert_eq!(s.screen, Screen::Disconnected);
     }
