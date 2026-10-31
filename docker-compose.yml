@@ -1,4 +1,4 @@
-# Stack Moria. Variable de stack Portainer : MORIA_INVITE (code d'invitation).
+# Stack Moria. Variable de stack Portainer OBLIGATOIRE : MORIA_INVITE (code d'invitation).
 x-build: &build
   context: .
   dockerfile: docker/Dockerfile
@@ -27,7 +27,7 @@ services:
     volumes: ["moria-data:/data"]
     environment:
       NATS_URL: nats://nats:4222
-      MORIA_INVITE: ${MORIA_INVITE:-}
+      MORIA_INVITE: ${MORIA_INVITE:?définir MORIA_INVITE dans les variables de la stack Portainer}
       MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-4}
     restart: unless-stopped
     depends_on:

@@ -1,4 +1,9 @@
 //! Load check: `cargo run --release -p moria-server --example bots -- <addr> [n=10] [secs=120]`.
+//!
+//! TEST SERVER ONLY, never the friends' server: each bot creates an account
+//! (`bot01`..) that permanently claims one of the 10 mountains. Run the target server with
+//! `MORIA_MAX_PER_IP=16` (all bots share one IP) and without `MORIA_INVITE` (bots send no
+//! invite code), e.g. `MORIA_MAX_PER_IP=16 MORIA_DATA=/tmp/w.bin cargo run -p moria-server`.
 //! Exits non-zero if any bot's tick p99 >= 150 ms, it saw fewer than secs*5 intervals,
 //! or dug 0 tiles. Needs a freshly generated world (fresh volume): on a re-run the
 //! designated tiles are already floor, so dug = 0 and the run fails.
@@ -96,7 +101,10 @@ fn main() -> anyhow::Result<()> {
     let arg = |i: usize, d: u64, what: &str| -> u64 {
         a.get(i).map_or(d, |s| {
             s.parse().unwrap_or_else(|_| {
-                eprintln!("invalid {what} {s:?}; usage: bots <addr> [n=10] [secs=120]");
+                eprintln!(
+                    "invalid {what} {s:?}; usage: bots <addr> [n=10] [secs=120] \
+                     (test server only: MORIA_MAX_PER_IP=16, no MORIA_INVITE)"
+                );
                 std::process::exit(2)
             })
         })

@@ -7,9 +7,12 @@ Architecture : `server` (TCP 7777, simulation 10 Hz), `dwarf-ai` (IA des nains v
 ## Premier démarrage
 
 ```sh
+export MORIA_INVITE='un-code-secret'   # obligatoire, voir « Code d'invitation »
 docker compose up -d
 docker compose logs server    # attendre « serveur prêt sur 0.0.0.0:7777 »
 ```
+
+Toutes les commandes `docker compose` exigent `MORIA_INVITE` (variable exportée ou fichier `.env` non commité) : sans elle, Compose refuse de démarrer.
 
 Le monde est généré automatiquement au premier démarrage (service `worldgen`, qui s'arrête ensuite). Aux démarrages suivants il détecte le monde existant (« monde déjà présent, rien à faire ») et ne l'écrase jamais.
 
@@ -19,18 +22,36 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 
 1. Portainer > Stacks > Add stack > **Repository**.
 2. Repository URL : `https://github.com/nicolaslallier/Moria`, branche `main`, Compose path : `docker-compose.yml`. Si le dépôt est privé, activer « Authentication » et fournir un jeton GitHub (token) à Portainer.
-3. Dans « Environment variables », ajouter `MORIA_INVITE` (voir ci-dessous).
+3. Dans « Environment variables », ajouter `MORIA_INVITE` (**obligatoire**, voir ci-dessous) : sans elle, le déploiement échoue.
 4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Seul ce port est publié ; NATS reste sur le réseau interne.
 
 ## Code d'invitation
 
-`MORIA_INVITE` est une variable de stack Portainer : ne jamais la commiter. Si elle est définie, il faut ce code pour créer un compte ; les comptes existants se connectent sans. Vide ou absente : inscription libre. Partagez le code uniquement avec vos amis.
+`MORIA_INVITE` est une variable de stack Portainer **obligatoire** : `docker-compose.yml` refuse de démarrer si elle est absente ou vide (sinon n'importe qui sur Internet pourrait créer un compte et occuper une des 10 montagnes). Ne jamais la commiter. Le code n'est demandé qu'à la création d'un compte ; les comptes existants se connectent sans. Partagez-le uniquement avec vos amis.
 
 `MORIA_MAX_PER_IP` (optionnelle, défaut 4) : connexions simultanées max par adresse IP ; à augmenter si plusieurs amis partagent la même IP (NAT). 0 est refusé.
 
 ## Accès depuis Internet
 
 Sur le routeur, rediriger le port **7777/TCP** vers `192.168.2.10:7777`. Aucun autre port ne doit être ouvert.
+
+## Pour les amis
+
+1. **Télécharger le client** : page *Releases* du dépôt GitHub (`https://github.com/nicolaslallier/Moria/releases`), dernière version `v…`. Prendre le fichier de votre système :
+   - Windows : `moria-client-windows.exe`
+   - Linux : `moria-client-linux`
+   - macOS : `moria-client-macos` (Mac Apple Silicon M1/M2/M3… uniquement : build arm64)
+2. **Linux et macOS** : rendre le fichier exécutable, dans un terminal :
+   ```sh
+   chmod +x moria-client-linux     # ou moria-client-macos
+   ```
+3. **macOS** : le client n'est pas signé, macOS le bloque au premier lancement. Clic droit sur le fichier → **Ouvrir**, puis confirmer « Ouvrir ». Ou, dans un terminal :
+   ```sh
+   xattr -d com.apple.quarantine moria-client-macos
+   ```
+4. **Se connecter** : dans le champ « Serveur », taper l'adresse IP publique de Nicolas (ou son nom DDNS) suivie de `:7777`, par exemple `exemple.duckdns.org:7777`. Nicolas vous donne l'adresse exacte.
+5. **Premier lancement** : choisir un nom et un mot de passe (8 caractères minimum), saisir le **code d'invitation** donné par Nicolas, puis cliquer **« Créer un compte »**. Le code ne sert qu'à cette étape.
+6. **Les fois suivantes** : même nom et mot de passe, bouton **« Se connecter »** ; le code d'invitation n'est plus nécessaire. Le nom ne tient pas compte des majuscules.
 
 ## Plusieurs services d'IA
 
