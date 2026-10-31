@@ -193,7 +193,11 @@ pub async fn run_with_listener(
                         }
                     });
                 }
-                Err(e) => tracing::warn!("accept : {e}"),
+                Err(e) => {
+                    // Persistent errors (EMFILE...) would otherwise spin this loop.
+                    tracing::warn!("accept : {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     });

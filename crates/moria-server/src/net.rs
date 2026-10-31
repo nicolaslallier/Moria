@@ -7,7 +7,7 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use moria_core::PlayerId;
 use moria_core::protocol::{
-    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, decode_body, encode, read_frame_async,
+    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, decode, encode, read_frame_async,
     read_frame_bytes_async,
 };
 use std::sync::{Arc, LazyLock};
@@ -180,7 +180,7 @@ async fn handshake(
         invite,
         create,
         ..
-    } = decode_body(&buf)?
+    } = decode(&buf)?
     else {
         return Ok(None);
     };

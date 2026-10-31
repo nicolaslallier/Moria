@@ -109,13 +109,9 @@ fn check_len(len: u32) -> io::Result<usize> {
     Ok(len as usize)
 }
 
-fn decode<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+/// Decodes a frame body (e.g. one read with `read_frame_bytes_async`).
+pub fn decode<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
     postcard::from_bytes(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// Decodes a frame body read with `read_frame_bytes_async`.
-pub fn decode_body<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
-    decode(buf)
 }
 
 pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
