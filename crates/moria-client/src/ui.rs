@@ -1,11 +1,12 @@
 //! egui screens: login, hero creation, HUD, disconnection.
 
 use crate::Client;
+use crate::art::Art;
 use crate::game::{Screen, Session};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
-use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
+use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
 use moria_core::DesignationKind;
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
@@ -114,13 +115,37 @@ fn centered(title: &str) -> egui::Window<'_> {
         .resizable(false)
 }
 
+/// Paints `image` behind every window, cropped to fill the screen without stretching.
+fn backdrop(ctx: &mut EguiContexts, image: &Handle<Image>, aspect: f32) -> Result {
+    let id = ctx.add_image(EguiTextureHandle::Weak(image.id()));
+    let c = ctx.ctx_mut()?;
+    let screen = c.content_rect();
+    let (sw, sh) = (screen.width(), screen.height().max(1.0));
+    // Fraction of the image kept on each axis.
+    let (u, v) = if sw / sh > aspect {
+        (1.0, aspect * sh / sw)
+    } else {
+        (sw / sh / aspect, 1.0)
+    };
+    let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(u, v));
+    c.layer_painter(egui::LayerId::background())
+        .image(id, screen, uv, egui::Color32::WHITE);
+    Ok(())
+}
+
 fn error_label(ui: &mut egui::Ui, s: &Session) {
     if let Some(e) = &s.error {
         ui.colored_label(egui::Color32::LIGHT_RED, e);
     }
 }
 
-fn login(mut ctx: EguiContexts, mut form: ResMut<LoginForm>, mut client: ResMut<Client>) -> Result {
+fn login(
+    mut ctx: EguiContexts,
+    art: Res<Art>,
+    mut form: ResMut<LoginForm>,
+    mut client: ResMut<Client>,
+) -> Result {
+    backdrop(&mut ctx, &art.castle, 1280.0 / 711.0)?;
     let connecting = client.net.is_some();
     centered("Moria — Connexion").show(ctx.ctx_mut()?, |ui| {
         egui::Grid::new("login").num_columns(2).show(ui, |ui| {
@@ -173,9 +198,12 @@ fn login(mut ctx: EguiContexts, mut form: ResMut<LoginForm>, mut client: ResMut<
 
 fn create_hero(
     mut ctx: EguiContexts,
+    art: Res<Art>,
     mut form: ResMut<HeroForm>,
     mut client: ResMut<Client>,
 ) -> Result {
+    backdrop(&mut ctx, &art.castle, 1280.0 / 711.0)?;
+    let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(form.race).id()));
     centered("Création du héros").show(ctx.ctx_mut()?, |ui| {
         egui::ComboBox::from_label("Race")
             .selected_text(form.race.label_fr())
@@ -191,6 +219,7 @@ fn create_hero(
                     ui.selectable_value(&mut form.class, c, c.label_fr());
                 }
             });
+        ui.image(egui::load::SizedTexture::new(portrait, [192.0, 192.0]));
         let a = roll_abilities(form.race, form.class);
         ui.label(format!(
             "FOR {}  DEX {}  CON {}  INT {}  SAG {}  CHA {}",

@@ -1,21 +1,22 @@
-//! Colored squares for the current level, hero/dwarf glyphs, designation outlines.
+//! Textured tiles for the current level, hero/dwarf heads, designation outlines.
 
 use crate::Client;
+use crate::art::Art;
 use crate::game::Screen;
 use crate::input::Drag;
 use bevy::prelude::*;
 use moria_core::{DesignationKind, Tile, TilePos};
 
-pub const TILE: f32 = 16.0;
+pub const TILE: f32 = 48.0;
 
-/// The single color source, so tiles can later become images.
-pub fn tile_color(t: Tile) -> Color {
+/// Image and tint per tile: ore veins are the rock texture tinted (no ore art yet).
+fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
     match t {
-        Tile::Rock => Color::srgb_u8(0x6b, 0x6b, 0x6b),
-        Tile::Floor => Color::srgb_u8(0x3a, 0x2a, 0x1e),
-        Tile::Gold => Color::srgb_u8(0xc9, 0xa2, 0x27),
-        Tile::Mithril => Color::srgb_u8(0x4f, 0xa3, 0xd1),
-        Tile::Stair => Color::srgb_u8(0x8b, 0x5a, 0x2b),
+        Tile::Rock => (art.rock.clone(), Color::WHITE),
+        Tile::Floor => (art.floor.clone(), Color::srgb(0.55, 0.45, 0.35)),
+        Tile::Gold => (art.rock.clone(), Color::srgb_u8(0xff, 0xc8, 0x30)),
+        Tile::Mithril => (art.rock.clone(), Color::srgb_u8(0x60, 0xc0, 0xff)),
+        Tile::Stair => (art.stair.clone(), Color::WHITE),
     }
 }
 
@@ -56,11 +57,13 @@ pub fn plugin(app: &mut App) {
         );
 }
 
-fn glyph(c: &str, color: Color) -> impl Bundle {
+fn head(image: Handle<Image>) -> impl Bundle {
     (
-        Text2d::new(c),
-        TextFont::from_font_size(14.0),
-        TextColor(color),
+        Sprite {
+            image,
+            custom_size: Some(Vec2::splat(TILE)),
+            ..default()
+        },
         DespawnOnExit(Screen::Playing),
         MapPart,
     )
@@ -78,6 +81,7 @@ struct Built(u32);
 fn spawn_map(
     mut commands: Commands,
     client: Res<Client>,
+    art: Res<Art>,
     mut built: ResMut<Built>,
     old: Query<Entity, With<MapPart>>,
 ) {
@@ -103,10 +107,10 @@ fn spawn_map(
             ));
         }
     }
-    commands.spawn((glyph("@", Color::srgb(1.0, 0.15, 0.15)), Mark::Hero));
+    commands.spawn((head(art.head(g.hero.race)), Mark::Hero));
 }
 
-fn sync_tiles(client: Res<Client>, mut q: Query<(&mut TileSprite, &mut Sprite)>) {
+fn sync_tiles(client: Res<Client>, art: Res<Art>, mut q: Query<(&mut TileSprite, &mut Sprite)>) {
     let Some(g) = &client.session.game else {
         return;
     };
@@ -115,7 +119,10 @@ fn sync_tiles(client: Res<Client>, mut q: Query<(&mut TileSprite, &mut Sprite)>)
         let tile = g.mountain.get(TilePos::new(t.x, t.y, z));
         if tile != t.shown {
             t.shown = tile;
-            s.color = tile.map_or(Color::BLACK, tile_color);
+            (s.image, s.color) = match tile {
+                Some(t) => tile_look(t, &art),
+                None => (Handle::default(), Color::BLACK),
+            };
         }
     }
 }
@@ -132,6 +139,7 @@ fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8) {
 fn sync_marks(
     mut commands: Commands,
     client: Res<Client>,
+    art: Res<Art>,
     mut marks: Query<(Entity, &Mark, &mut Transform, &mut Visibility)>,
 ) {
     let Some(g) = &client.session.game else {
@@ -153,7 +161,7 @@ fn sync_marks(
         let mut t = Transform::default();
         let mut v = Visibility::default();
         place(&mut t, &mut v, p, z);
-        commands.spawn((glyph("n", Color::WHITE), Mark::Dwarf, t, v));
+        commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
     }
 }
 
@@ -173,6 +181,10 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
         return;
     };
     let z = g.current_z();
+    if g.hero.pos.z == z {
+        let at = to_world(g.hero.pos.x, g.hero.pos.y);
+        gizmos.rect_2d(at, Vec2::splat(TILE), Color::srgb(1.0, 0.15, 0.15));
+    }
     // TilePos orders by x first, so a z-range is not contiguous; the map is small.
     for (p, k) in g.mountain.designations.iter().filter(|(p, _)| p.z == z) {
         let color = match k {
