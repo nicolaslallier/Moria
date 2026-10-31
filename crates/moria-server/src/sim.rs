@@ -97,7 +97,10 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         Command::Move(d) if h.move_cooldown > 0 => h.pending_move = Some(d),
         Command::Move(d) => hero_move(h, mt, d),
         Command::Dig(d) => {
-            h.pending_move = None;
+            // The player saw the buffered move before asking to dig: honour it first.
+            if let Some(pm) = h.pending_move {
+                hero_move(h, mt, pm);
+            }
             if matches!(d, Dir::Up | Dir::Down) {
                 return ch;
             }
@@ -452,14 +455,35 @@ mod tests {
         step(&mut w);
         step(&mut w);
         assert_eq!(hero(&w).pos, p(4, 23, 0)); // applied once only
-        // A Dig clears the buffered move.
+        // A Dig applies the buffered move first, then nothing is left pending.
         apply_command(&mut w, M, Command::Move(Dir::W));
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::W));
         apply_command(&mut w, M, Command::Dig(Dir::N));
+        assert_eq!(hero(&w).pending_move, None);
         step(&mut w);
         step(&mut w);
-        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        assert_eq!(hero(&w).pos, p(2, 23, 0));
+    }
+
+    #[test]
+    fn dig_after_buffered_move_digs_from_new_position() {
+        let mut w = setup();
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(3, 23, 0);
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        apply_command(&mut w, M, Command::Move(Dir::E)); // buffered (cooldown)
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert_eq!(hero(&w).pos, p(5, 23, 0));
+        assert_eq!(hero(&w).pending_move, None);
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
+        // A buffered move into rock is still refused; the dig starts from where the hero is.
+        let mut w = setup();
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(4, 23, 0);
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert_eq!(hero(&w).pos, p(5, 23, 0));
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
     }
 
     #[test]
