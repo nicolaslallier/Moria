@@ -12,7 +12,7 @@ use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, Hero, World};
 use moria_core::{MountainId, PlayerId, TilePos};
 use sim::{Changes, Command};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Bound;
@@ -26,14 +26,18 @@ use tokio::time::MissedTickBehavior;
 
 const TICK: Duration = Duration::from_millis(100);
 const SAVE_EVERY: u64 = 300;
-/// Most commands applied per tick; the rest wait in the channel (sessions get backpressure).
 /// Connected players (ServerFull beyond this).
 pub const MAX_SESSIONS: usize = 10;
 /// Open TCP connections, authenticated or not; extra connections are closed on accept.
 pub const MAX_CONNECTIONS: usize = 32;
 /// Default per-IP cap, so one host cannot take every global slot.
 pub const MAX_CONNECTIONS_PER_IP: usize = 4;
-const MAX_CMDS_PER_TICK: usize = 1024;
+/// Most commands taken off the shared channel per tick (its capacity).
+const MAX_CMDS_PER_TICK: usize = 4096;
+/// Most commands applied per player per tick; the surplus waits in that player's queue.
+const MAX_CMDS_PER_PLAYER: usize = 32;
+/// A player's queue beyond this is a flood: further commands are dropped.
+const MAX_QUEUED_PER_PLAYER: usize = 256;
 const MAX_REQS_PER_TICK: usize = 64;
 const MAX_ASSIGN_PER_TICK: usize = 16;
 
@@ -196,6 +200,7 @@ pub async fn run_with_listener(
         view_tx,
         last_view: None,
         saving: None,
+        pending: HashMap::new(),
     };
     let r = state.run(shutdown).await;
     accept.abort();
@@ -215,6 +220,8 @@ struct State {
     view_tx: Option<mpsc::Sender<AiView>>,
     last_view: Option<MountainId>,
     saving: Option<JoinHandle<()>>,
+    /// Commands received but not yet applied (per-player cap), oldest first.
+    pending: HashMap<PlayerId, VecDeque<Command>>,
 }
 
 impl State {
@@ -251,16 +258,7 @@ impl State {
             };
             sim::apply_assignments(&mut self.w, &a);
         }
-        let mut changes: BTreeMap<MountainId, Changes> = BTreeMap::new();
-        for _ in 0..MAX_CMDS_PER_TICK {
-            let Ok((player, c)) = self.cmd_rx.try_recv() else {
-                break;
-            };
-            if let Some(m) = self.mountain_of(player) {
-                let ch = sim::apply_command(&mut self.w, m, c);
-                changes.entry(m).or_default().then(ch);
-            }
-        }
+        let mut changes = self.commands();
         let deltas = sim::step(&mut self.w);
         for (m, mut d) in deltas {
             if let Some(ch) = changes.remove(&m) {
@@ -281,6 +279,37 @@ impl State {
                 }
             }));
         }
+    }
+
+    /// Applies this tick's commands; returns the designation changes per mountain.
+    fn commands(&mut self) -> BTreeMap<MountainId, Changes> {
+        // Draining the shared channel into per-player queues means a flood cannot sit in
+        // front of another player's commands.
+        for _ in 0..MAX_CMDS_PER_TICK {
+            let Ok((player, c)) = self.cmd_rx.try_recv() else {
+                break;
+            };
+            let q = self.pending.entry(player).or_default();
+            if q.len() < MAX_QUEUED_PER_PLAYER {
+                q.push_back(c);
+            }
+        }
+        let mut changes: BTreeMap<MountainId, Changes> = BTreeMap::new();
+        let mut pending = std::mem::take(&mut self.pending);
+        for (&player, q) in &mut pending {
+            let n = q.len().min(MAX_CMDS_PER_PLAYER);
+            let Some(m) = self.mountain_of(player) else {
+                q.clear();
+                continue;
+            };
+            for c in q.drain(..n) {
+                let ch = sim::apply_command(&mut self.w, m, c);
+                changes.entry(m).or_default().then(ch);
+            }
+        }
+        pending.retain(|_, q| !q.is_empty());
+        self.pending = pending;
+        changes
     }
 
     fn mountain_of(&self, player: PlayerId) -> Option<MountainId> {
@@ -462,4 +491,71 @@ fn entrance(w: &World, m: MountainId) -> Option<TilePos> {
     (0..ht)
         .flat_map(|y| (0..wd).map(move |x| TilePos::new(x, y, 0)))
         .find(|&p| mt.walkable(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moria_core::DesignationKind;
+
+    fn state() -> (State, mpsc::Sender<(PlayerId, Command)>) {
+        let mut w = world::generate(1);
+        for i in 0..2 {
+            let m = world::claim_mountain(&mut w, PlayerId(i)).unwrap();
+            let pos = entrance(&w, m).unwrap();
+            w.fortresses.get_mut(&m).unwrap().hero = Some(Hero {
+                name: format!("h{i}"),
+                race: Race::Dwarf,
+                class: Class::Fighter,
+                abilities: roll_abilities(Race::Dwarf, Class::Fighter),
+                pos,
+                dig: None,
+                move_cooldown: 0,
+                pending_move: None,
+                pending_dig: None,
+            });
+        }
+        let (_req_tx, req_rx) = mpsc::channel(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4096);
+        let (_assign_tx, assign_rx) = mpsc::channel(1);
+        let s = State {
+            w,
+            data: PathBuf::new(),
+            sessions: HashMap::new(),
+            req_rx,
+            cmd_rx,
+            assign_rx,
+            view_tx: None,
+            last_view: None,
+            saving: None,
+            pending: HashMap::new(),
+        };
+        (s, cmd_tx)
+    }
+
+    fn designate(x: i16, y: i16) -> Command {
+        let t = TilePos::new(x, y, 0);
+        Command::Designate {
+            a: t,
+            b: t,
+            kind: DesignationKind::Dig,
+        }
+    }
+
+    #[test]
+    fn one_player_cannot_starve_others() {
+        let (mut s, tx) = state();
+        // Player 0 floods (distinct rock tiles), then player 1 sends one command.
+        for i in 0..2000 {
+            tx.try_send((PlayerId(0), designate(6 + i % 40, i / 40 % 20)))
+                .unwrap();
+        }
+        tx.try_send((PlayerId(1), designate(6, 23))).unwrap();
+        let ch = s.commands();
+        assert_eq!(ch[&MountainId(1)].0.len(), 1, "player 1 served this tick");
+        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+        // The flood's surplus is applied on later ticks, still capped.
+        let ch = s.commands();
+        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+    }
 }
