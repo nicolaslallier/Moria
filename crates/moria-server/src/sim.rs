@@ -289,6 +289,19 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             }
         }
 
+        // An idle dwarf on a designated tile would block it forever (stairs are never dug
+        // under an occupant): step it aside onto the first free-of-designation neighbour.
+        for d in f.dwarves.iter_mut().filter(|d| d.task.is_none()) {
+            if m.designations.contains_key(&d.pos)
+                && let Some(to) = Dir::HORIZONTAL
+                    .iter()
+                    .map(|&dir| d.pos.step(dir))
+                    .find(|&q| m.walkable(q) && !m.designations.contains_key(&q))
+            {
+                d.pos = to;
+            }
+        }
+
         for i in 0..f.dwarves.len() {
             let Some(mut task) = f.dwarves[i].task.take() else {
                 continue;
@@ -591,6 +604,31 @@ mod tests {
                 list: vec![(id, t)],
             },
         );
+        for _ in 0..40 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, t), Tile::Stair);
+    }
+
+    #[test]
+    fn idle_dwarf_steps_off_designated_tile() {
+        let mut w = setup();
+        let t = p(1, 22, 0);
+        assert_eq!(w.fortresses[&M].dwarves[1].pos, t);
+        designate(&mut w, t, DesignationKind::Stairs);
+        step(&mut w);
+        // N of t is rock: first walkable, undesignated HORIZONTAL neighbour is S.
+        assert_eq!(w.fortresses[&M].dwarves[1].pos, p(1, 23, 0));
+        let id = w.fortresses[&M].dwarves[0].id;
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(id, t)],
+            },
+        );
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
         for _ in 0..40 {
             step(&mut w);
         }
