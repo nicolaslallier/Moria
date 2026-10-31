@@ -10,26 +10,31 @@ help: ## Affiche cette aide
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 # --- Docker -----------------------------------------------------------------
-up: ## Construit et démarre la stack (nats, worldgen, server, dwarf-ai)
+# Créé une seule fois si absent (ignoré par git). Pour changer le code : éditer .env.
+.env:
+	@echo "MORIA_INVITE=$$(openssl rand -hex 8)" > $@
+	@echo "Créé .env avec un code d'invitation aléatoire : $$(cut -d= -f2 $@)"
+
+up: .env ## Construit et démarre la stack (nats, worldgen, server, dwarf-ai)
 	docker compose up -d --build
 	@echo "Attendre « serveur prêt » : make logs"
 
-down: ## Arrête la stack (le monde est conservé)
+down: .env ## Arrête la stack (le monde est conservé)
 	docker compose down
 
-build: ## Reconstruit les images sans démarrer
+build: .env ## Reconstruit les images sans démarrer
 	docker compose build
 
-restart: ## Redémarre le serveur
+restart: .env ## Redémarre le serveur
 	docker compose restart server
 
-logs: ## Suit les logs du serveur
+logs: .env ## Suit les logs du serveur
 	docker compose logs -f server
 
-ps: ## État des conteneurs
+ps: .env ## État des conteneurs
 	docker compose ps
 
-scale-ai: ## Nombre d'instances d'IA : make scale-ai AI=3
+scale-ai: .env ## Nombre d'instances d'IA : make scale-ai AI=3
 	docker compose up -d --scale dwarf-ai=$(AI)
 
 reset-world: ## DÉTRUIT le monde et toutes les forteresses (confirmation demandée)
