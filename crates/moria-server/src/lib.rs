@@ -7,7 +7,7 @@ pub mod net;
 pub mod sim;
 
 use moria_core::ai::{AiView, Assignments, DwarfView};
-use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg};
+use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, Hero, World};
 use moria_core::{MountainId, PlayerId, TilePos};
@@ -73,6 +73,8 @@ pub enum Request {
     },
     CreateHero {
         player: PlayerId,
+        /// Display name, as the player typed it at login.
+        name: String,
         race: Race,
         class: Class,
     },
@@ -169,12 +171,18 @@ pub async fn run_with_listener(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    // Over the cap: drop the stream right away (closes the socket).
+                    // Over a cap: best-effort ServerFull (never blocks the accept loop),
+                    // then drop the stream, which closes the socket.
+                    let full = |s: &tokio::net::TcpStream| {
+                        let _ = s.try_write(&encode(&ServerMsg::Reject(Reject::ServerFull)));
+                    };
                     let Ok(permit) = conns.clone().try_acquire_owned() else {
+                        full(&stream);
                         continue;
                     };
                     let Some(ip_guard) = IpGuard::acquire(&per_ip, peer.ip(), max_per_ip) else {
-                        continue; // this IP is over its cap: drop the stream
+                        full(&stream);
+                        continue;
                     };
                     let h = handles.clone();
                     tokio::spawn(async move {
@@ -362,14 +370,11 @@ impl State {
             }
             Request::CreateHero {
                 player,
+                name,
                 race,
                 class,
             } => {
                 let Some(m) = self.mountain_of(player) else {
-                    return;
-                };
-                let name = self.w.accounts.iter().find(|(_, a)| a.player == player);
-                let Some(name) = name.map(|(n, _)| n.clone()) else {
                     return;
                 };
                 let Some(pos) = entrance(&self.w, m) else {

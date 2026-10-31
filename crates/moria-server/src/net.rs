@@ -7,7 +7,8 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use moria_core::PlayerId;
 use moria_core::protocol::{
-    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, encode, read_frame_async,
+    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, decode_body, encode, read_frame_async,
+    read_frame_bytes_async,
 };
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -18,6 +19,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 pub const SESSION_QUEUE: usize = 64;
+/// Shortest password accepted at account creation, in characters.
+const MIN_PASSWORD: usize = 8;
 /// One deadline over the whole pre-login handshake (Hello, argon2 wait + compute, invite
 /// check, up to the Welcome/Reject). CreateHero comes later and is not covered.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -83,7 +86,7 @@ async fn blocking_on<T: Send + 'static>(
 pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let hs = timeout(HANDSHAKE_TIMEOUT, handshake(&mut rd, &mut wr, &h)).await??;
-    let Some((player, mut rx)) = hs else {
+    let Some((player, display, mut rx)) = hs else {
         return Ok(());
     };
     // The world task queued Welcome (and Snapshot if the hero exists) on `tx`. When the
@@ -100,6 +103,7 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
                 ClientMsg::CreateHero { race, class } => {
                     let r = Request::CreateHero {
                         player,
+                        name: display.clone(),
                         race,
                         class,
                     };
@@ -125,7 +129,8 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
     }
 }
 
-type Handshake = Option<(PlayerId, mpsc::Receiver<ServerMsg>)>;
+/// Player, display name as typed, and the queue the world task writes to.
+type Handshake = Option<(PlayerId, String, mpsc::Receiver<ServerMsg>)>;
 
 /// Hello to login. `None` means the session ends quietly (a Reject was sent, or shutdown).
 async fn handshake(
@@ -133,16 +138,11 @@ async fn handshake(
     wr: &mut OwnedWriteHalf,
     h: &Handles,
 ) -> anyhow::Result<Handshake> {
-    let ClientMsg::Hello {
-        version,
-        name,
-        password,
-        invite,
-    } = read_frame_async(rd).await?
-    else {
-        return Ok(None);
-    };
-    if version != PROTOCOL_VERSION {
+    let buf = read_frame_bytes_async(rd).await?;
+    // Version first, from the frozen prefix: a future Hello may not decode as today's.
+    if let Ok(((0, version), _)) = postcard::take_from_bytes::<(u32, u32)>(&buf)
+        && version != PROTOCOL_VERSION
+    {
         return reject(
             wr,
             Reject::VersionMismatch {
@@ -152,22 +152,40 @@ async fn handshake(
         .await
         .map(|()| None);
     }
+    let ClientMsg::Hello {
+        name,
+        password,
+        invite,
+        create,
+        ..
+    } = decode_body(&buf)?
+    else {
+        return Ok(None);
+    };
     if !valid_name(&name) {
         return reject(wr, Reject::InvalidName).await.map(|()| None);
     }
+    // Accounts are keyed by the lowercased name; the hero keeps the typed spelling.
+    let key = name.to_lowercase();
     let lookup = ask(h, |reply| Request::Lookup {
-        name: name.clone(),
+        name: key.clone(),
         reply,
     })
     .await;
     let new_hash = match lookup {
         None => return Ok(None), // server shutting down
         Some(Lookup::Full) => return reject(wr, Reject::ServerFull).await.map(|()| None),
+        Some(Lookup::New) if !create => {
+            return reject(wr, Reject::UnknownAccount).await.map(|()| None);
+        }
         Some(Lookup::New) => {
             if let Some(want) = &h.invite
                 && !invite.is_some_and(|got| ct_eq(got.as_bytes(), want.as_bytes()))
             {
                 return reject(wr, Reject::BadInvite).await.map(|()| None);
+            }
+            if password.chars().count() < MIN_PASSWORD {
+                return reject(wr, Reject::WeakPassword).await.map(|()| None);
             }
             let hash = blocking(move || {
                 Argon2::default()
@@ -197,7 +215,7 @@ async fn handshake(
     };
     let (tx, rx) = mpsc::channel(SESSION_QUEUE);
     let login = ask(h, |reply| Request::Login {
-        name,
+        name: key,
         new_hash,
         tx,
         reply,
@@ -206,7 +224,7 @@ async fn handshake(
     match login {
         None => Ok(None),
         Some(Err(r)) => reject(wr, r).await.map(|()| None),
-        Some(Ok(p)) => Ok(Some((p, rx))),
+        Some(Ok(p)) => Ok(Some((p, name, rx))),
     }
 }
 

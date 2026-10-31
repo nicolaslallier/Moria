@@ -7,6 +7,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
+/// Silence tolerated once in game (ticks are every 100 ms).
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub enum NetEvent {
     Msg(ServerMsg),
     /// Connection failed or ended; the reason is in French.
@@ -50,8 +53,18 @@ pub fn connect(addr: String) -> NetHandle {
         let mut rd = stream;
         loop {
             let ev = match read_frame::<ServerMsg>(&mut rd) {
-                Ok(m) => NetEvent::Msg(m),
+                Ok(m) => {
+                    // From the first Snapshot on, a Tick comes every 100 ms. Before it
+                    // (login, hero creation) the server can legitimately stay quiet.
+                    if matches!(m, ServerMsg::Snapshot(_)) {
+                        let _ = rd.set_read_timeout(Some(READ_TIMEOUT));
+                    }
+                    NetEvent::Msg(m)
+                }
                 Err(e) => NetEvent::Disconnected(match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        "Le serveur ne répond plus".into()
+                    }
                     ErrorKind::UnexpectedEof => "Le serveur a fermé la connexion".into(),
                     ErrorKind::InvalidData => "Données invalides reçues du serveur".into(),
                     _ => format!("Connexion perdue : {e}"),
@@ -102,6 +115,42 @@ mod tests {
         drop(h);
         let mut buf = [0u8; 1];
         assert_eq!(s.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn silent_server_after_snapshot_times_out() {
+        use moria_core::protocol::{FortressView, HeroView};
+        use moria_core::srd::{Class, Race, roll_abilities};
+        use moria_core::{Mountain, MountainId, Resources, Tile, TilePos};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let h = connect(l.local_addr().unwrap().to_string());
+        let (mut s, _) = l.accept().unwrap();
+        let v = FortressView {
+            mountain: Mountain::new(MountainId(0), 2, 2, 1, Tile::Floor),
+            hero: HeroView {
+                name: "Gimli".into(),
+                race: Race::Dwarf,
+                class: Class::Fighter,
+                abilities: roll_abilities(Race::Dwarf, Class::Fighter),
+                pos: TilePos::new(0, 0, 0),
+            },
+            dwarves: vec![],
+            resources: Resources::default(),
+        };
+        s.write_all(&encode(&ServerMsg::Snapshot(Box::new(v))))
+            .unwrap();
+        let ev = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(ev, NetEvent::Msg(ServerMsg::Snapshot(_))));
+        // Then nothing: ticks should come every 100 ms.
+        let ev = h.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            matches!(&ev, NetEvent::Disconnected(r) if r == "Le serveur ne répond plus"),
+            "{}",
+            match ev {
+                NetEvent::Disconnected(r) => r,
+                _ => "message".into(),
+            }
+        );
     }
 
     #[test]
@@ -164,8 +213,9 @@ mod smoke {
         let hello = |invite: Option<&str>| ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             name: "Gimli".into(),
-            password: "hache".into(),
+            password: "hache-de-guerre".into(),
             invite: invite.map(Into::into),
+            create: true,
         };
 
         // Wrong invite: French reject on the login screen.

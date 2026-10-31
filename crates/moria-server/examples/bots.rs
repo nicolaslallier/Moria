@@ -35,6 +35,7 @@ fn bot(i: usize, addr: String, secs: u64, st: Arc<Mutex<Stats>>) -> anyhow::Resu
         name,
         password: "motdepasse-bot".into(),
         invite: None,
+        create: true,
     }))?;
     match read_frame::<ServerMsg>(&mut s)? {
         ServerMsg::Welcome { needs_hero, .. } => {

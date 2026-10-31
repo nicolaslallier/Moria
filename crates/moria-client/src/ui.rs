@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
 
-/// The password lives only in memory; address, name and invite go to `prefs_path`.
+/// Password and invite live only in memory; address and name go to `prefs_path`.
 #[derive(Resource)]
 struct LoginForm {
     addr: String,
@@ -83,13 +83,17 @@ fn load_prefs() -> LoginForm {
             .unwrap_or_else(|| "127.0.0.1:7777".into()),
         name: l.next().unwrap_or_default(),
         password: String::new(),
-        invite: l.next().unwrap_or_default(),
+        invite: String::new(), // an older prefs file's 3rd line (the invite) is ignored
     }
 }
 
-/// Never contains the password.
+/// Never contains the password or the invite code.
+fn prefs_text(f: &LoginForm) -> String {
+    format!("{}\n{}\n", f.addr, f.name)
+}
+
 fn save_prefs(f: &LoginForm) {
-    let text = format!("{}\n{}\n{}\n", f.addr, f.name, f.invite);
+    let text = prefs_text(f);
     if prefs_path().is_some_and(|p| std::fs::write(p, &text).is_ok()) {
         return;
     }
@@ -130,13 +134,27 @@ fn login(mut ctx: EguiContexts, mut form: ResMut<LoginForm>, mut client: ResMut<
             ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
             ui.end_row();
             ui.label("Code d'invitation");
-            ui.add(egui::TextEdit::singleline(&mut form.invite).hint_text("facultatif"));
+            ui.add(
+                egui::TextEdit::singleline(&mut form.invite)
+                    .hint_text("seulement pour créer un compte"),
+            );
             ui.end_row();
         });
         error_label(ui, &client.session);
         if connecting {
             ui.label("Connexion en cours…");
-        } else if ui.button("Se connecter").clicked() {
+            return;
+        }
+        let create = ui.horizontal(|ui| {
+            if ui.button("Se connecter").clicked() {
+                Some(false)
+            } else if ui.button("Créer un compte").clicked() {
+                Some(true)
+            } else {
+                None
+            }
+        });
+        if let Some(create) = create.inner {
             save_prefs(&form);
             let invite = form.invite.trim();
             client.session.error = None;
@@ -145,7 +163,8 @@ fn login(mut ctx: EguiContexts, mut form: ResMut<LoginForm>, mut client: ResMut<
                 version: PROTOCOL_VERSION,
                 name: form.name.trim().to_owned(),
                 password: form.password.clone(),
-                invite: (!invite.is_empty()).then(|| invite.to_owned()),
+                invite: (create && !invite.is_empty()).then(|| invite.to_owned()),
+                create,
             });
         }
     });
@@ -240,4 +259,21 @@ fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefs_never_store_secrets() {
+        let f = LoginForm {
+            addr: "1.2.3.4:7777".into(),
+            name: "Gimli".into(),
+            password: "motdepasse".into(),
+            invite: "mellon".into(),
+        };
+        let t = prefs_text(&f);
+        assert_eq!(t, "1.2.3.4:7777\nGimli\n");
+    }
 }

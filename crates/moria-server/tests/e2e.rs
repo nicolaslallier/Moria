@@ -97,8 +97,9 @@ impl Client {
         s.write_all(&encode(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             name: name.into(),
-            password: "secret".into(),
+            password: "secret12".into(),
             invite: None,
+            create: true, // creates on first login, plain login afterwards
         }))
         .await
         .unwrap();

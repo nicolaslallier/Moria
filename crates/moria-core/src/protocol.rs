@@ -3,6 +3,11 @@ use crate::{DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read};
 
+/// Frozen across all protocol versions, so any server can answer any client with a
+/// readable version error: `ClientMsg::Hello` stays variant 0 with `version` as its first
+/// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
+/// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
+/// starts with the bytes of `(0u32, version)` whatever follows.
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -14,6 +19,8 @@ pub enum ClientMsg {
         password: String,
         /// Required to create a new account when the server has an invite code.
         invite: Option<String>,
+        /// Create the account if the name is unknown. For a known name it is a plain login.
+        create: bool,
     },
     CreateHero {
         race: Race,
@@ -34,12 +41,18 @@ pub enum ClientMsg {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Reject {
-    VersionMismatch { server: u32 },
+    VersionMismatch {
+        server: u32,
+    },
     BadPassword,
     ServerFull,
     NoFreeMountain,
     InvalidName,
     BadInvite,
+    /// Login (not creation) with a name the server does not know.
+    UnknownAccount,
+    /// Password under 8 characters at account creation.
+    WeakPassword,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -100,6 +113,11 @@ fn decode<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
     postcard::from_bytes(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Decodes a frame body read with `read_frame_bytes_async`.
+pub fn decode_body<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+    decode(buf)
+}
+
 pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
     let mut h = [0u8; 4];
     r.read_exact(&mut h)?;
@@ -108,16 +126,24 @@ pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
     decode(&buf)
 }
 
+/// The raw body of one frame, undecoded.
 #[cfg(feature = "tokio")]
-pub async fn read_frame_async<T: DeserializeOwned>(
+pub async fn read_frame_bytes_async(
     r: &mut (impl tokio::io::AsyncRead + Unpin),
-) -> io::Result<T> {
+) -> io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut h = [0u8; 4];
     r.read_exact(&mut h).await?;
     let mut buf = vec![0u8; check_len(u32::from_be_bytes(h))?];
     r.read_exact(&mut buf).await?;
-    decode(&buf)
+    Ok(buf)
+}
+
+#[cfg(feature = "tokio")]
+pub async fn read_frame_async<T: DeserializeOwned>(
+    r: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> io::Result<T> {
+    decode(&read_frame_bytes_async(r).await?)
 }
 
 #[cfg(test)]
@@ -130,6 +156,23 @@ mod tests {
         let b = encode(&ClientMsg::Move(Dir::N));
         let m: ClientMsg = read_frame(&mut Cursor::new(b)).unwrap();
         assert_eq!(m, ClientMsg::Move(Dir::N));
+    }
+    /// Guards the layout frozen in the `PROTOCOL_VERSION` doc comment.
+    #[test]
+    fn frozen_positions() {
+        let hello = ClientMsg::Hello {
+            version: 300,
+            name: "x".into(),
+            password: String::new(),
+            invite: None,
+            create: false,
+        };
+        let b = postcard::to_allocvec(&hello).unwrap();
+        let (peek, _) = postcard::take_from_bytes::<(u32, u32)>(&b).unwrap();
+        assert_eq!(peek, (0, 300));
+        let r = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch { server: 1 }))
+            .unwrap();
+        assert_eq!(r, [1, 0, 1]);
     }
     #[test]
     fn oversized_frame_rejected() {

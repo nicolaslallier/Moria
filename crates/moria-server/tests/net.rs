@@ -80,8 +80,13 @@ impl Client {
             .expect("reply in time")
             .expect("frame")
     }
+    /// "Créer un compte": creates the account, or logs in if the name exists.
     async fn hello(&mut self, name: &str, password: &str) -> ServerMsg {
-        self.hello_invite(name, password, None).await
+        self.hello_full(name, password, None, true).await
+    }
+    /// "Se connecter": never creates an account.
+    async fn login(&mut self, name: &str, password: &str) -> ServerMsg {
+        self.hello_full(name, password, None, false).await
     }
     async fn hello_invite(
         &mut self,
@@ -89,11 +94,21 @@ impl Client {
         password: &str,
         invite: Option<&str>,
     ) -> ServerMsg {
+        self.hello_full(name, password, invite, true).await
+    }
+    async fn hello_full(
+        &mut self,
+        name: &str,
+        password: &str,
+        invite: Option<&str>,
+        create: bool,
+    ) -> ServerMsg {
         self.send(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             name: name.into(),
             password: password.into(),
             invite: invite.map(Into::into),
+            create,
         })
         .await;
         self.recv().await
@@ -101,7 +116,7 @@ impl Client {
     /// Logs in a new player and creates the hero; returns the snapshot's hero position.
     async fn new_player(s: &Server, name: &str) -> (Client, TilePos) {
         let mut c = Client::connect(s).await;
-        let w = c.hello(name, "secret").await;
+        let w = c.hello(name, "secret12").await;
         assert!(
             matches!(
                 w,
@@ -146,6 +161,7 @@ async fn version_mismatch_rejected() {
         name: "gimli".into(),
         password: "x".into(),
         invite: None,
+        create: false,
     })
     .await;
     assert_eq!(
@@ -182,7 +198,7 @@ async fn returning_player_gets_snapshot_and_save_persists() {
     drop(c);
     let mut c = Client::connect(&s).await;
     assert!(matches!(
-        c.hello("gimli", "secret").await,
+        c.login("gimli", "secret12").await,
         ServerMsg::Welcome {
             needs_hero: false,
             ..
@@ -219,7 +235,7 @@ async fn second_login_kicks_older_session() {
     let (mut old, _) = Client::new_player(&s, "gimli").await;
     let mut new = Client::connect(&s).await;
     assert!(matches!(
-        new.hello("gimli", "secret").await,
+        new.hello("gimli", "secret12").await,
         ServerMsg::Welcome { .. }
     ));
     // The old session is closed: reads end with an error (EOF) after any queued frames.
@@ -239,20 +255,20 @@ async fn eleventh_connection_server_full() {
     for i in 0..10 {
         let mut c = Client::connect(&s).await;
         assert!(matches!(
-            c.hello(&format!("nain{i}"), "pw").await,
+            c.hello(&format!("nain{i}"), "password").await,
             ServerMsg::Welcome { .. }
         ));
         clients.push(c);
     }
     let mut c = Client::connect(&s).await;
     assert_eq!(
-        c.hello("nain10", "pw").await,
+        c.hello("nain10", "password").await,
         ServerMsg::Reject(Reject::ServerFull)
     );
     // A re-login of a connected name replaces its session and is not counted twice.
     let mut again = Client::connect(&s).await;
     assert!(matches!(
-        again.hello("nain0", "pw").await,
+        again.hello("nain0", "password").await,
         ServerMsg::Welcome { .. }
     ));
     s.stop().await;
@@ -314,20 +330,29 @@ async fn missing_world_file_is_an_error() {
     );
 }
 
+/// An over-cap connection gets a best-effort ServerFull, then is closed.
+async fn assert_full_then_closed(c: &mut TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let m = timeout(Duration::from_secs(5), read_frame_async::<ServerMsg>(c))
+        .await
+        .expect("over-cap connection must not hang");
+    assert_eq!(m.unwrap(), ServerMsg::Reject(Reject::ServerFull));
+    let mut buf = [0u8; 1];
+    let r = timeout(Duration::from_secs(5), c.read(&mut buf))
+        .await
+        .expect("over-cap connection must be closed");
+    assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
+}
+
 #[tokio::test]
 async fn connections_beyond_cap_are_dropped() {
-    use tokio::io::AsyncReadExt;
     let s = Server::start("conncap").await; // per-IP cap set high: proves the global cap
     let mut idle = vec![];
     for _ in 0..32 {
         idle.push(TcpStream::connect(s.addr).await.unwrap());
     }
     let mut extra = TcpStream::connect(s.addr).await.unwrap();
-    let mut buf = [0u8; 1];
-    let r = timeout(Duration::from_secs(5), extra.read(&mut buf))
-        .await
-        .expect("33rd connection must be closed, not hang");
-    assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
+    assert_full_then_closed(&mut extra).await;
     drop(idle);
     s.stop().await;
 }
@@ -338,13 +363,13 @@ async fn new_account_requires_invite_when_configured() {
     for bad in [None, Some("wrong")] {
         let mut c = Client::connect(&s).await;
         assert_eq!(
-            c.hello_invite("gimli", "pw", bad).await,
+            c.hello_invite("gimli", "password", bad).await,
             ServerMsg::Reject(Reject::BadInvite)
         );
     }
     let mut c = Client::connect(&s).await;
     assert!(matches!(
-        c.hello_invite("gimli", "pw", Some("mellon")).await,
+        c.hello_invite("gimli", "password", Some("mellon")).await,
         ServerMsg::Welcome { .. }
     ));
     s.stop().await;
@@ -355,13 +380,13 @@ async fn existing_account_needs_no_invite() {
     let s = Server::start_with("invite-existing", Some("mellon")).await;
     let mut c = Client::connect(&s).await;
     assert!(matches!(
-        c.hello_invite("gimli", "pw", Some("mellon")).await,
+        c.hello_invite("gimli", "password", Some("mellon")).await,
         ServerMsg::Welcome { .. }
     ));
     drop(c);
     let mut c = Client::connect(&s).await;
     assert!(matches!(
-        c.hello("gimli", "pw").await,
+        c.login("gimli", "password").await,
         ServerMsg::Welcome { .. }
     ));
     s.stop().await;
@@ -376,11 +401,8 @@ async fn per_ip_cap_drops_fifth_connection() {
         idle.push(TcpStream::connect(s.addr).await.unwrap());
     }
     let mut extra = TcpStream::connect(s.addr).await.unwrap();
+    assert_full_then_closed(&mut extra).await;
     let mut buf = [0u8; 1];
-    let r = timeout(Duration::from_secs(2), extra.read(&mut buf))
-        .await
-        .expect("5th connection must be closed promptly");
-    assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
     // The first four are still open (no data, no EOF).
     for c in &mut idle {
         assert!(
@@ -394,7 +416,7 @@ async fn per_ip_cap_drops_fifth_connection() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut again = Client::connect(&s).await;
     assert!(matches!(
-        again.hello("gimli", "pw").await,
+        again.hello("gimli", "password").await,
         ServerMsg::Welcome { .. }
     ));
     s.stop().await;
@@ -405,7 +427,86 @@ async fn empty_invite_means_open_registration() {
     let s = Server::start_with("invite-empty", Some("")).await;
     let mut c = Client::connect(&s).await;
     assert!(matches!(
-        c.hello("gimli", "pw").await,
+        c.hello("gimli", "password").await,
+        ServerMsg::Welcome { .. }
+    ));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn unknown_account_without_create_rejected() {
+    let s = Server::start("unknown").await;
+    for _ in 0..2 {
+        let mut c = Client::connect(&s).await;
+        assert_eq!(
+            c.login("gimli", "secret12").await,
+            ServerMsg::Reject(Reject::UnknownAccount)
+        );
+    }
+    let data = s.data.clone();
+    s.stop().await;
+    let w = moria_core::world::load(&data).unwrap();
+    assert!(w.accounts.is_empty() && w.fortresses.is_empty());
+}
+
+#[tokio::test]
+async fn names_are_case_insensitive() {
+    let s = Server::start("case").await;
+    let (c, _) = Client::new_player(&s, "Gimli").await;
+    drop(c);
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.login("gIMLI", "secret12").await,
+        ServerMsg::Welcome {
+            needs_hero: false,
+            ..
+        }
+    ));
+    match c.recv().await {
+        ServerMsg::Snapshot(v) => assert_eq!(v.hero.name, "Gimli"),
+        m => panic!("expected snapshot, got {m:?}"),
+    }
+    drop(c);
+    // "Créer un compte" on a taken name (any case) is a login: wrong password, no account.
+    let mut c = Client::connect(&s).await;
+    assert_eq!(
+        c.hello("GIMLI", "autre-mdp").await,
+        ServerMsg::Reject(Reject::BadPassword)
+    );
+    let data = s.data.clone();
+    s.stop().await;
+    let w = moria_core::world::load(&data).unwrap();
+    assert_eq!(w.accounts.keys().collect::<Vec<_>>(), ["gimli"]);
+    assert_eq!(w.fortresses.len(), 1);
+}
+
+#[tokio::test]
+async fn future_hello_gets_version_mismatch() {
+    let s = Server::start("future").await;
+    let mut c = Client::connect(&s).await;
+    // Hello (tag 0), version 2, then bytes today's Hello cannot decode.
+    let body = [0u8, 2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend(body);
+    c.0.write_all(&frame).await.unwrap();
+    assert_eq!(
+        c.recv().await,
+        ServerMsg::Reject(Reject::VersionMismatch { server: 1 })
+    );
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn weak_password_rejected_at_creation() {
+    let s = Server::start("weakpw").await;
+    let mut c = Client::connect(&s).await;
+    assert_eq!(
+        c.hello("gimli", "court").await,
+        ServerMsg::Reject(Reject::WeakPassword)
+    );
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.hello("gimli", "12345678").await,
         ServerMsg::Welcome { .. }
     ));
     s.stop().await;

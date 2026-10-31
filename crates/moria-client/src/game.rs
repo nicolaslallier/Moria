@@ -44,6 +44,8 @@ pub fn reject_fr(r: &Reject) -> String {
         Reject::NoFreeMountain => "Plus de montagne libre".into(),
         Reject::InvalidName => "Nom invalide (3–16 caractères : lettres, chiffres, _ ou -)".into(),
         Reject::BadInvite => "Code d'invitation invalide".into(),
+        Reject::UnknownAccount => "Compte inconnu — utilisez « Créer un compte »".into(),
+        Reject::WeakPassword => "Mot de passe trop court (8 caractères minimum)".into(),
     }
 }
 
@@ -314,6 +316,14 @@ mod tests {
                 "Nom invalide (3–16 caractères : lettres, chiffres, _ ou -)",
             ),
             (Reject::BadInvite, "Code d'invitation invalide"),
+            (
+                Reject::UnknownAccount,
+                "Compte inconnu — utilisez « Créer un compte »",
+            ),
+            (
+                Reject::WeakPassword,
+                "Mot de passe trop court (8 caractères minimum)",
+            ),
         ];
         for (r, want) in cases {
             assert_eq!(reject_fr(&r), want);
