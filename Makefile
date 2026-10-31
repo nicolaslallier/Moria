@@ -1,7 +1,7 @@
 # Moria — raccourcis. `make` seul affiche l'aide.
 # Docker : MORIA_INVITE doit être exportée ou dans .env (lu automatiquement par Compose).
 .DEFAULT_GOAL := help
-.PHONY: help up down build restart logs ps scale-ai reset-world client test lint e2e bots
+.PHONY: help up deploy down build restart logs ps scale-ai reset-world client test lint e2e bots
 
 AI ?= 1
 SERVER ?= 127.0.0.1:7777
@@ -30,6 +30,12 @@ restart: .env ## Redémarre le serveur
 
 logs: .env ## Suit les logs du serveur
 	docker compose logs -f server
+
+# Hôte de la pile Infra : son Alloy envoie les logs de tous ses conteneurs à Loki (Grafana).
+INFRA_DOCKER ?= ssh://this@192.168.2.10
+
+deploy: .env ## Déploie sur l'hôte infra (logs visibles dans Grafana, {compose_project="moria"})
+	DOCKER_HOST=$(INFRA_DOCKER) docker compose -p moria up -d --build
 
 ps: .env ## État des conteneurs
 	docker compose ps
