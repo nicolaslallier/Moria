@@ -4,6 +4,8 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // Pas de couleurs hors terminal : Docker → Alloy → Loki garde un texte lisible.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".into());
     moria_dwarf_ai::run(url, shutdown_signal()).await
