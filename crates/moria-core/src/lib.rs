@@ -9,3 +9,4 @@ pub mod ai;
 pub mod path;
 pub mod protocol;
 pub mod srd;
+pub mod world;
