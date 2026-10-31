@@ -40,6 +40,29 @@ pub fn find_path(
     None
 }
 
+/// BFS distance (in moves) from `from` to every reachable tile, `from` included at 0.
+/// Same neighbour rules as `find_path`.
+pub fn distances_from(
+    m: &Mountain,
+    from: TilePos,
+    blocked: &HashSet<TilePos>,
+) -> HashMap<TilePos, u32> {
+    let mut dist = HashMap::from([(from, 0)]);
+    let mut q = VecDeque::from([from]);
+    while let Some(p) = q.pop_front() {
+        let d0 = dist[&p];
+        for d in [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down] {
+            let n = p.step(d);
+            if dist.contains_key(&n) || blocked.contains(&n) || !m.can_move(p, d) {
+                continue;
+            }
+            dist.insert(n, d0 + 1);
+            q.push_back(n);
+        }
+    }
+    dist
+}
+
 /// True for a walkable tile horizontally adjacent to `target`, same z.
 pub fn work_spot_goal(m: &Mountain, target: TilePos) -> impl Fn(TilePos) -> bool + '_ {
     move |p| {
@@ -134,6 +157,16 @@ mod tests {
         let b = TilePos::new(2, 1, 0);
         assert_eq!(find_path(&m, a, |t| t == a, &HashSet::new()), Some(vec![]));
         assert!(find_path(&m, a, |t| t == b, &HashSet::from([b])).is_none());
+    }
+
+    #[test]
+    fn distances_match_find_path() {
+        let mut m = Mountain::new(MountainId(0), 8, 8, 1, Tile::Rock);
+        carve(&mut m, &[(1, 1, 0), (2, 1, 0), (3, 1, 0), (5, 5, 0)]);
+        let d = distances_from(&m, TilePos::new(1, 1, 0), &HashSet::new());
+        assert_eq!(d[&TilePos::new(1, 1, 0)], 0);
+        assert_eq!(d[&TilePos::new(3, 1, 0)], 2);
+        assert!(!d.contains_key(&TilePos::new(5, 5, 0)));
     }
 
     #[test]
