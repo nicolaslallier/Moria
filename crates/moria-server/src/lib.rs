@@ -359,6 +359,7 @@ impl State {
                     dig: None,
                     move_cooldown: 0,
                     pending_move: None,
+                    pending_dig: None,
                 });
                 self.send_snapshot(player, m);
             }

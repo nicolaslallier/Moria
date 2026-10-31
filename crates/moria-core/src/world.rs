@@ -44,6 +44,9 @@ pub struct Hero {
     /// Latest Move received during the cooldown, applied when it ends. Not saved.
     #[serde(skip)]
     pub pending_move: Option<Dir>,
+    /// Dig received while `pending_move` was set; started right after that move. Not saved.
+    #[serde(skip)]
+    pub pending_dig: Option<Dir>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

@@ -83,24 +83,9 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
     match c {
         Command::Move(d) if h.move_cooldown > 0 => h.pending_move = Some(d),
         Command::Move(d) => hero_move(h, mt, d),
-        Command::Dig(d) => {
-            // The player saw the buffered move before asking to dig: honour it first.
-            if let Some(pm) = h.pending_move {
-                hero_move(h, mt, pm);
-            }
-            if matches!(d, Dir::Up | Dir::Down) {
-                return ch;
-            }
-            let t = h.pos.step(d);
-            if mt.get(t).is_some_and(Tile::is_solid) && h.dig.as_ref().is_none_or(|j| j.target != t)
-            {
-                h.dig = Some(DigJob {
-                    target: t,
-                    kind: DesignationKind::Dig,
-                    progress: 0,
-                });
-            }
-        }
+        // Behind a buffered move, the dig waits for it (the cooldown still applies).
+        Command::Dig(d) if h.pending_move.is_some() => h.pending_dig = Some(d),
+        Command::Dig(d) => start_dig(h, mt, d),
         Command::Designate { a, b, kind } => {
             let rect = mt.rect(a, b);
             let before: Vec<_> = rect
@@ -123,6 +108,20 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         }
     }
     ch
+}
+
+fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir) {
+    if matches!(d, Dir::Up | Dir::Down) {
+        return;
+    }
+    let t = h.pos.step(d);
+    if mt.get(t).is_some_and(Tile::is_solid) && h.dig.as_ref().is_none_or(|j| j.target != t) {
+        h.dig = Some(DigJob {
+            target: t,
+            kind: DesignationKind::Dig,
+            progress: 0,
+        });
+    }
 }
 
 fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
@@ -259,6 +258,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 && let Some(d) = h.pending_move
             {
                 hero_move(h, m, d);
+                if let Some(dd) = h.pending_dig.take() {
+                    start_dig(h, m, dd);
+                }
             }
             if let Some(j) = h.dig.as_mut() {
                 match m.get(j.target).filter(|t| t.is_solid()) {
@@ -393,6 +395,7 @@ mod tests {
             dig: None,
             move_cooldown: 0,
             pending_move: None,
+            pending_dig: None,
         });
         w
     }
@@ -453,10 +456,11 @@ mod tests {
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::W));
         apply_command(&mut w, M, Command::Dig(Dir::N));
-        assert_eq!(hero(&w).pending_move, None);
+        assert_eq!(hero(&w).pos, p(3, 23, 0)); // no move before the cooldown ends
         step(&mut w);
         step(&mut w);
         assert_eq!(hero(&w).pos, p(2, 23, 0));
+        assert_eq!((hero(&w).pending_move, hero(&w).pending_dig), (None, None));
     }
 
     #[test]
@@ -465,18 +469,48 @@ mod tests {
         w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(3, 23, 0);
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Move(Dir::E)); // buffered (cooldown)
-        apply_command(&mut w, M, Command::Dig(Dir::E));
+        apply_command(&mut w, M, Command::Dig(Dir::E)); // buffered behind the move
+        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        assert!(hero(&w).dig.is_none());
+        step(&mut w);
+        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        step(&mut w); // cooldown over: move, then dig from the new position
         assert_eq!(hero(&w).pos, p(5, 23, 0));
-        assert_eq!(hero(&w).pending_move, None);
         assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
+        assert_eq!((hero(&w).pending_move, hero(&w).pending_dig), (None, None));
         // A buffered move into rock is still refused; the dig starts from where the hero is.
         let mut w = setup();
         w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(4, 23, 0);
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Dig(Dir::E));
+        step(&mut w);
+        step(&mut w);
         assert_eq!(hero(&w).pos, p(5, 23, 0));
         assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
+    }
+
+    #[test]
+    fn move_dig_spam_cannot_bypass_cooldown() {
+        let run = |with_dig: bool| {
+            let mut w = setup();
+            let m = w.mountains.get_mut(&M).unwrap();
+            for x in 0..40 {
+                m.set(p(x, 23, 0), Tile::Floor);
+            }
+            for _ in 0..20 {
+                apply_command(&mut w, M, Command::Move(Dir::E));
+                if with_dig {
+                    apply_command(&mut w, M, Command::Dig(Dir::E));
+                }
+                step(&mut w);
+            }
+            hero(&w).pos.x - 2
+        };
+        // One immediate move, then one per 2-tick cooldown: 1 + 20 / 2.
+        let moved = run(true);
+        assert!(moved <= 11, "moved {moved} tiles in 20 ticks");
+        assert_eq!(moved, run(false), "Dig must not speed moves up");
     }
 
     #[test]
@@ -891,6 +925,7 @@ mod tests {
                 dig: None,
                 move_cooldown: 0,
                 pending_move: None,
+                pending_dig: None,
             });
             let m = w.mountains.get_mut(&id).unwrap();
             for k in 0..50 {
