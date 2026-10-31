@@ -215,25 +215,25 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
     }
 }
 
-/// Digs `p`; records tile and designation changes. Returns the yield.
+/// Digs `p`; records tile and designation changes (stairs also clear the tile below).
+/// Returns the yield.
 fn dig_at(
     m: &mut Mountain,
     p: TilePos,
     kind: DesignationKind,
     tiles: &mut Vec<(TilePos, Tile)>,
-    removed: &mut Vec<TilePos>,
+    ch: &mut Changes,
 ) -> Option<Resources> {
     let below = p.step(Dir::Down);
-    let (old_p, old_below) = (m.get(p), m.get(below));
-    let had = m.designations.contains_key(&p);
+    let old = [p, below].map(|q| (q, m.get(q), m.designations.contains_key(&q)));
     let res = m.dig(p, kind)?;
-    for (q, old) in [(p, old_p), (below, old_below)] {
-        if let Some(now) = m.get(q).filter(|n| Some(*n) != old) {
+    for (q, old_tile, had) in old {
+        if let Some(now) = m.get(q).filter(|n| Some(*n) != old_tile) {
             tiles.push((q, now));
         }
-    }
-    if had {
-        removed.push(p);
+        if had && !m.designations.contains_key(&q) {
+            ch.0.insert(q, None);
+        }
     }
     Some(res)
 }
@@ -249,7 +249,8 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         let Some(m) = w.mountains.get_mut(&id) else {
             continue;
         };
-        let (mut tiles, mut removed, mut added) = (vec![], vec![], vec![]);
+        // Designation changes of this step; the last write on a tile wins.
+        let (mut tiles, mut ch) = (vec![], Changes::default());
 
         if let Some(h) = f.hero.as_mut() {
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
@@ -271,14 +272,13 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                             let (target, kind) = (j.target, j.kind);
                             h.dig = None;
                             let was = m.designations.get(&target).copied();
-                            if let Some(r) = dig_at(m, target, kind, &mut tiles, &mut removed) {
+                            if let Some(r) = dig_at(m, target, kind, &mut tiles, &mut ch) {
                                 f.resources.add(r);
                                 // Digging a Stairs-designated tile keeps the stairs intent.
                                 if was == Some(DesignationKind::Stairs)
                                     && m.designate(target, target, DesignationKind::Stairs) == 1
                                 {
-                                    removed.retain(|&q| q != target);
-                                    added.push((target, DesignationKind::Stairs));
+                                    ch.0.insert(target, Some(DesignationKind::Stairs));
                                 }
                             }
                         }
@@ -341,7 +341,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked
-                        && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut removed)
+                        && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
                     }
@@ -352,18 +352,17 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         }
 
         if let Some(h) = &f.hero {
-            out.insert(
-                id,
-                TickDelta {
-                    tick: w.tick,
-                    hero_pos: h.pos,
-                    dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
-                    tiles,
-                    designations_added: added,
-                    designations_removed: removed,
-                    resources: f.resources,
-                },
-            );
+            let mut d = TickDelta {
+                tick: w.tick,
+                hero_pos: h.pos,
+                dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
+                tiles,
+                designations_added: vec![],
+                designations_removed: vec![],
+                resources: f.resources,
+            };
+            ch.merge_into(&mut d);
+            out.insert(id, d);
         }
     }
     out
@@ -754,6 +753,29 @@ mod tests {
         );
         assert_eq!(d.designations_added, vec![(t, DesignationKind::Stairs)]);
         assert!(!d.designations_removed.contains(&t));
+    }
+
+    #[test]
+    fn stairs_dig_reports_removed_designation_below() {
+        let mut w = setup();
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        set_str(&mut w, 30);
+        let t = p(6, 23, 0);
+        let below = t.step(Dir::Down);
+        designate(&mut w, below, DesignationKind::Dig);
+        assert!(w.mountains[&M].designations.contains_key(&below));
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().dig = Some(DigJob {
+            target: t,
+            kind: DesignationKind::Stairs,
+            progress: 0,
+        });
+        let mut removed = false;
+        for _ in 0..12 {
+            removed |= step(&mut w)[&M].designations_removed.contains(&below);
+        }
+        assert_eq!(tile(&w, below), Tile::Stair);
+        assert!(!w.mountains[&M].designations.contains_key(&below));
+        assert!(removed, "delta never reported the removal below");
     }
 
     #[test]
