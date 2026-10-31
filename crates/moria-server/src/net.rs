@@ -270,6 +270,73 @@ mod tests {
         .expect("permit released once the job ends");
     }
 
+    /// Deterministic: the reader is sequential, so once the trailing Move reaches `cmd`,
+    /// every CreateHero before it has been handled.
+    #[tokio::test]
+    async fn repeated_create_hero_is_ignored() {
+        use super::{Handles, session};
+        use crate::{Lookup, Request};
+        use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION, encode};
+        use moria_core::srd::{Class, Race};
+        use moria_core::{Dir, PlayerId};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::mpsc::{self, error::TryRecvError};
+        use tokio::time::timeout;
+
+        let (req_tx, mut req_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let h = Handles {
+            req: req_tx,
+            cmd: cmd_tx,
+            invite: None,
+        };
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut c = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (srv, _) = l.accept().await.unwrap();
+        tokio::spawn(session(srv, h));
+        c.write_all(&encode(&ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+            name: "gimli".into(),
+            password: "secret12".into(),
+            invite: None,
+            create: true,
+        }))
+        .await
+        .unwrap();
+        // Fake world: answer the handshake, keep the session's queue open.
+        let wait = Duration::from_secs(30); // argon2 in debug builds
+        let Some(Request::Lookup { reply, .. }) = timeout(wait, req_rx.recv()).await.unwrap()
+        else {
+            panic!("expected Lookup")
+        };
+        reply.send(Lookup::New).ok().unwrap();
+        let Some(Request::Login { reply, tx, .. }) = timeout(wait, req_rx.recv()).await.unwrap()
+        else {
+            panic!("expected Login")
+        };
+        reply.send(Ok(PlayerId(0))).unwrap();
+
+        let hero = encode(&ClientMsg::CreateHero {
+            race: Race::Dwarf,
+            class: Class::Fighter,
+        });
+        let mut frames: Vec<u8> = hero.repeat(500);
+        frames.extend(encode(&ClientMsg::Move(Dir::S)));
+        c.write_all(&frames).await.unwrap();
+        let (p, cmd) = timeout(wait, cmd_rx.recv())
+            .await
+            .expect("Move after the flood")
+            .unwrap();
+        assert_eq!(p, PlayerId(0));
+        assert_eq!(cmd, crate::sim::Command::Move(Dir::S));
+        assert!(matches!(req_rx.try_recv(), Ok(Request::CreateHero { .. })));
+        assert!(matches!(req_rx.try_recv(), Err(TryRecvError::Empty)));
+        drop(tx);
+    }
+
     #[test]
     fn ct_eq_cases() {
         use super::ct_eq;
