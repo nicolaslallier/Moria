@@ -246,6 +246,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
                  · X, 1, 2 : mode · glisser clic gauche : désigner · clic droit : annuler",
             );
+            ui.small("Manette : stick/croix : marcher · A : creuser · LB/RB : monter/descendre · Y : mode");
         });
     Ok(())
 }

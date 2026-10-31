@@ -1,4 +1,4 @@
-//! Keyboard and mouse to protocol messages, through the `Game` rules.
+//! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
 use crate::game::{Screen, drag_msg};
@@ -22,7 +22,7 @@ pub struct Drag {
 pub fn plugin(app: &mut App) {
     app.init_resource::<Drag>().add_systems(
         Update,
-        (keyboard, mouse)
+        (keyboard, gamepad, mouse)
             .in_set(InputSet)
             .run_if(in_state(Screen::Playing)),
     );
@@ -80,6 +80,50 @@ fn keyboard(
     }
 }
 
+/// Stick or D-pad to a cardinal direction: dominant axis past the deadzone.
+fn stick_dir(v: Vec2) -> Option<Dir> {
+    const DEADZONE: f32 = 0.5;
+    if v.x.abs().max(v.y.abs()) < DEADZONE {
+        None
+    } else if v.y.abs() >= v.x.abs() {
+        Some(if v.y > 0.0 { Dir::N } else { Dir::S })
+    } else {
+        Some(if v.x > 0.0 { Dir::E } else { Dir::W })
+    }
+}
+
+/// Stick/D-pad walk, A dig, LB up, RB down, Y toggles dig/stairs.
+fn gamepad(pads: Query<&Gamepad>, time: Res<Time>, mut client: ResMut<Client>) {
+    let now = time.elapsed_secs_f64();
+    let Some(g) = &mut client.session.game else {
+        return;
+    };
+    let mut out = vec![];
+    for pad in &pads {
+        if let Some(d) = stick_dir(pad.left_stick() + pad.dpad()) {
+            out.extend(g.try_move(d, now));
+        }
+        if pad.just_pressed(GamepadButton::LeftTrigger) {
+            out.extend(g.vertical(Dir::Up, now));
+        }
+        if pad.just_pressed(GamepadButton::RightTrigger) {
+            out.extend(g.vertical(Dir::Down, now));
+        }
+        if pad.just_pressed(GamepadButton::South) {
+            out.extend(g.dig());
+        }
+        if pad.just_pressed(GamepadButton::North) {
+            g.mode = match g.mode {
+                DesignationKind::Dig => DesignationKind::Stairs,
+                DesignationKind::Stairs => DesignationKind::Dig,
+            };
+        }
+    }
+    for m in out {
+        client.send(m);
+    }
+}
+
 fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -116,5 +160,19 @@ fn mouse(
         .is_some_and(|(_, b)| !buttons.pressed(b) && !buttons.just_released(b))
     {
         drag.start = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stick_dir_picks_dominant_axis() {
+        assert_eq!(stick_dir(Vec2::new(0.2, 0.3)), None);
+        assert_eq!(stick_dir(Vec2::new(0.0, 1.0)), Some(Dir::N));
+        assert_eq!(stick_dir(Vec2::new(0.4, -0.9)), Some(Dir::S));
+        assert_eq!(stick_dir(Vec2::new(-0.8, 0.6)), Some(Dir::W));
+        assert_eq!(stick_dir(Vec2::new(0.7, 0.0)), Some(Dir::E));
     }
 }
