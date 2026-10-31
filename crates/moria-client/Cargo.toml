@@ -1,0 +1,13 @@
+[package]
+name = "moria-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moria-core = { path = "../moria-core" }
+bevy.workspace = true
+bevy_egui.workspace = true
+
+[dev-dependencies]
+moria-server = { path = "../moria-server" }
+tokio.workspace = true

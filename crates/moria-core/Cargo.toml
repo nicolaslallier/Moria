@@ -1,0 +1,17 @@
+[package]
+name = "moria-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tokio = ["dep:tokio"]
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }

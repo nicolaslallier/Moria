@@ -1,0 +1,51 @@
+# Stack Moria. Variable de stack Portainer OBLIGATOIRE : MORIA_INVITE (code d'invitation).
+x-build: &build
+  context: .
+  dockerfile: docker/Dockerfile
+
+services:
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+
+  # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
+  worldgen:
+    image: moria-worldgen:local
+    build:
+      <<: *build
+      args: { BIN: moria-worldgen }
+    volumes: ["moria-data:/data"]
+    command: ["--out", "/data/world.bin"]
+    restart: "no"
+
+  server:
+    image: moria-server:local
+    build:
+      <<: *build
+      args: { BIN: moria-server }
+    ports: ["7777:7777"]
+    volumes: ["moria-data:/data"]
+    environment:
+      NATS_URL: nats://nats:4222
+      MORIA_INVITE: ${MORIA_INVITE:?définir MORIA_INVITE dans les variables de la stack Portainer}
+      MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-4}
+    restart: unless-stopped
+    depends_on:
+      nats: { condition: service_started }
+      worldgen: { condition: service_completed_successfully }
+
+  dwarf-ai:
+    image: moria-dwarf-ai:local
+    build:
+      <<: *build
+      args: { BIN: moria-dwarf-ai }
+    environment:
+      NATS_URL: nats://nats:4222
+    restart: unless-stopped
+    depends_on: [nats]
+    deploy:
+      replicas: 1
+
+volumes:
+  moria-data:
+    name: moria-data

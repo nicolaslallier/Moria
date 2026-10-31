@@ -1,0 +1,7 @@
+[package]
+name = "moria-worldgen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moria-core = { path = "../moria-core" }
