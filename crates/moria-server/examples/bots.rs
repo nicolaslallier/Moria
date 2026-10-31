@@ -1,5 +1,7 @@
 //! Load check: `cargo run --release -p moria-server --example bots -- <addr> [n=10] [secs=120]`.
-//! Exits non-zero if any bot's tick p99 >= 150 ms or any bot dug 0 tiles.
+//! Exits non-zero if any bot's tick p99 >= 150 ms, it saw fewer than secs*5 intervals,
+//! or dug 0 tiles. Needs a freshly generated world (fresh volume): on a re-run the
+//! designated tiles are already floor, so dug = 0 and the run fails.
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, encode, read_frame};
 use moria_core::srd::{Class, Race};
 use moria_core::{DesignationKind, Dir, Tile, TilePos};
@@ -26,6 +28,8 @@ fn bot(i: usize, addr: String, secs: u64, st: Arc<Mutex<Stats>>) -> anyhow::Resu
     let name = format!("bot{:02}", i + 1);
     let mut s = TcpStream::connect(&addr)?;
     s.set_nodelay(true)?;
+    // A stalled server surfaces as a read error (counted as a failure).
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.write_all(&encode(&ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         name,
@@ -88,8 +92,16 @@ fn bot(i: usize, addr: String, secs: u64, st: Arc<Mutex<Stats>>) -> anyhow::Resu
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
     let addr = a.get(1).cloned().unwrap_or_else(|| "127.0.0.1:7777".into());
-    let n: usize = a.get(2).map_or(10, |s| s.parse().unwrap());
-    let secs: u64 = a.get(3).map_or(120, |s| s.parse().unwrap());
+    let arg = |i: usize, d: u64, what: &str| -> u64 {
+        a.get(i).map_or(d, |s| {
+            s.parse().unwrap_or_else(|_| {
+                eprintln!("invalid {what} {s:?}; usage: bots <addr> [n=10] [secs=120]");
+                std::process::exit(2)
+            })
+        })
+    };
+    let n = arg(2, 10, "bot count") as usize;
+    let secs = arg(3, 120, "duration");
     let stats: Vec<_> = (0..n)
         .map(|_| Arc::new(Mutex::new(Stats::default())))
         .collect();
@@ -124,15 +136,24 @@ fn main() -> anyhow::Result<()> {
     }
     let mut bad = false;
     for (i, h) in hs.into_iter().enumerate() {
-        if let Err(e) = h.join().unwrap() {
-            eprintln!("bot{:02} failed: {e}", i + 1);
-            bad = true;
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("bot{:02} failed: {e}", i + 1);
+                bad = true;
+            }
+            Err(_) => {
+                eprintln!("bot{:02} panicked", i + 1);
+                bad = true;
+            }
         }
     }
     report("final");
     for st in &stats {
         let g = st.lock().unwrap();
-        bad |= pct(&g.intervals_ms, 0.99) >= 150.0 || g.dug == 0;
+        bad |= pct(&g.intervals_ms, 0.99) >= 150.0
+            || g.dug == 0
+            || (g.intervals_ms.len() as u64) < secs * 5;
     }
     println!("{}", if bad { "FAIL" } else { "OK" });
     std::process::exit(bad as i32);
