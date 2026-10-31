@@ -28,3 +28,6 @@ rustc-ice-*.txt
 
 # macOS
 .DS_Store
+
+# Secrets (MORIA_INVITE)
+.env
