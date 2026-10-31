@@ -21,6 +21,12 @@ async fn main() -> anyhow::Result<()> {
         invite: std::env::var("MORIA_INVITE").ok().filter(|s| !s.is_empty()),
         max_per_ip,
     };
+    let metrics_bind: std::net::SocketAddr = env("MORIA_METRICS_BIND", "0.0.0.0:9464").parse()?;
+    tokio::spawn(async move {
+        if let Err(e) = moria_server::metrics::serve(metrics_bind).await {
+            tracing::error!("metriques indisponibles : {e}");
+        }
+    });
     run(cfg, shutdown_signal()).await
 }
 

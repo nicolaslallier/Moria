@@ -1,9 +1,11 @@
 //! NATS bridge: publishes AI views, forwards decoded assignments to the world task.
 
+use crate::metrics::{M, inc};
 use futures::StreamExt;
 use moria_core::MountainId;
 use moria_core::ai::{AiView, Assignments, MAX_DWARVES_PER_VIEW, SUBJECT_ASSIGN, SUBJECT_VIEW};
 use std::collections::BTreeSet;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -47,17 +49,21 @@ pub async fn run(
         }
     };
     tracing::info!("pont NATS connecte a {url}");
+    M.nats_connected.store(1, Relaxed);
     loop {
         tokio::select! {
             v = views.recv() => {
                 let Some(v) = v else { return };
-                if client.connection_state() != async_nats::connection::State::Connected {
+                let up = client.connection_state() == async_nats::connection::State::Connected;
+                M.nats_connected.store(up as i64, Relaxed);
+                if !up {
                     continue;
                 }
                 match postcard::to_allocvec(&v) {
                     Ok(b) => {
-                        if let Err(e) = client.publish(SUBJECT_VIEW, b.into()).await {
-                            tracing::warn!("publication de vue echouee: {e}");
+                        match client.publish(SUBJECT_VIEW, b.into()).await {
+                            Ok(()) => inc(&M.views_published),
+                            Err(e) => tracing::warn!("publication de vue echouee: {e}"),
                         }
                     }
                     Err(e) => tracing::error!("encodage de vue impossible: {e}"),
@@ -70,11 +76,15 @@ pub async fn run(
                 };
                 match postcard::from_bytes::<Assignments>(&m.payload) {
                     Ok(a) if accept(&a, &known) => {
+                        inc(&M.assignments_received);
                         // A full queue means the world task is behind: dropping is fine.
                         let _ = assign.try_send(a);
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("assignations illisibles ignorees: {e}"),
+                    Ok(_) => inc(&M.assignments_rejected),
+                    Err(e) => {
+                        inc(&M.assignments_rejected);
+                        tracing::warn!("assignations illisibles ignorees: {e}");
+                    }
                 }
             }
         }

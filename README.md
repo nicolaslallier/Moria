@@ -23,7 +23,7 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 1. Portainer > Stacks > Add stack > **Repository**.
 2. Repository URL : `https://github.com/nicolaslallier/Moria`, branche `main`, Compose path : `docker-compose.yml`. Si le dépôt est privé, activer « Authentication » et fournir un jeton GitHub (token) à Portainer.
 3. Dans « Environment variables », ajouter `MORIA_INVITE` (**obligatoire**, voir ci-dessous) : sans elle, le déploiement échoue.
-4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Seul ce port est publié ; NATS reste sur le réseau interne.
+4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Le port `9464` (métriques Prometheus, lues par la stack Infra) est aussi publié, pour le réseau local uniquement ; NATS reste sur le réseau interne.
 5. Logs : l'Alloy de la pile Infra collecte le stdout des conteneurs de cet hôte ; dans Grafana (https://grafana.infra.famillelallier.net), Explore > Loki, requête `{compose_project="moria"}` (filtrer par `compose_service`). Le nom de stack Portainer doit rester `moria`.
 
 ## Code d'invitation
@@ -34,7 +34,11 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 
 ## Accès depuis Internet
 
-Sur le routeur, rediriger le port **7777/TCP** vers `192.168.2.10:7777`. Aucun autre port ne doit être ouvert.
+Sur le routeur, rediriger le port **7777/TCP** vers `192.168.2.10:7777`. Aucun autre port ne doit être ouvert (surtout pas `9464`, les métriques).
+
+## Supervision
+
+`moria-server` expose ses métriques sur `:9464/metrics` (`MORIA_METRICS_BIND`, défaut `0.0.0.0:9464`) : joueurs et connexions, durée des ticks et dépassements des 100 ms, vues et assignations échangées avec `dwarf-ai`, état du pont NATS, échecs de sauvegarde. Prometheus (stack Infra, job `moria`) les lit ; tableau de bord Grafana **Moria**.
 
 ## Pour les amis
 

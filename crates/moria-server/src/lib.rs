@@ -3,9 +3,11 @@
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
 pub mod bridge;
+pub mod metrics;
 pub mod net;
 pub mod sim;
 
+use metrics::{M, inc};
 use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
@@ -17,12 +19,13 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Bound;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 
 const TICK: Duration = Duration::from_millis(100);
 const SAVE_EVERY: u64 = 300;
@@ -97,6 +100,7 @@ impl IpGuard {
             return None;
         }
         *n += 1;
+        M.connections.fetch_add(1, Relaxed);
         Some(Self {
             map: map.clone(),
             ip,
@@ -106,6 +110,7 @@ impl IpGuard {
 
 impl Drop for IpGuard {
     fn drop(&mut self) {
+        M.connections.fetch_sub(1, Relaxed);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = m.get_mut(&self.ip) {
             *n -= 1;
@@ -177,10 +182,12 @@ pub async fn run_with_listener(
                         let _ = s.try_write(&encode(&ServerMsg::Reject(Reject::ServerFull)));
                     };
                     let Ok(permit) = conns.clone().try_acquire_owned() else {
+                        inc(&M.rejected_full);
                         full(&stream);
                         continue;
                     };
                     let Some(ip_guard) = IpGuard::acquire(&per_ip, peer.ip(), max_per_ip) else {
+                        inc(&M.rejected_full);
                         full(&stream);
                         continue;
                     };
@@ -258,6 +265,20 @@ impl State {
     }
 
     fn tick(&mut self) {
+        let start = Instant::now();
+        self.step();
+        let took = start.elapsed();
+        inc(&M.ticks);
+        M.tick_nanos.fetch_add(took.as_nanos() as u64, Relaxed);
+        if took > TICK {
+            inc(&M.tick_overruns);
+        }
+        M.sessions.store(self.sessions.len() as i64, Relaxed);
+        M.accounts.store(self.w.accounts.len() as i64, Relaxed);
+        M.fortresses.store(self.w.fortresses.len() as i64, Relaxed);
+    }
+
+    fn step(&mut self) {
         self.sessions.retain(|_, tx| !tx.is_closed());
         // Bounded drains: senders on other threads cannot keep the tick looping.
         for _ in 0..MAX_REQS_PER_TICK {
@@ -287,6 +308,7 @@ impl State {
             let (w, path) = (self.w.clone(), self.data.clone());
             self.saving = Some(tokio::task::spawn_blocking(move || {
                 if let Err(e) = world::save(&w, &path) {
+                    inc(&M.save_failures);
                     tracing::error!("sauvegarde echouee : {e}");
                 }
             }));
