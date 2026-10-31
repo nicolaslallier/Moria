@@ -41,43 +41,30 @@ impl Command {
     }
 }
 
-/// Designation changes caused by a command; the caller folds them into that tick's delta.
+/// Designation changes caused by commands, folded into that tick's delta. Per tile:
+/// `Some(kind)` = designated, `None` = removed; the last write wins.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Changes {
-    pub added: Vec<(TilePos, DesignationKind)>,
-    pub removed: Vec<TilePos>,
-}
+pub struct Changes(pub BTreeMap<TilePos, Option<DesignationKind>>);
 
 impl Changes {
     /// Folds a `later` command's changes into `self`; the last write on a tile wins.
     pub fn then(&mut self, later: Changes) {
-        for (p, k) in later.added {
-            self.removed.retain(|&q| q != p);
-            self.added.retain(|&(q, _)| q != p);
-            self.added.push((p, k));
-        }
-        for p in later.removed {
-            self.added.retain(|&(q, _)| q != p);
-            self.removed.retain(|&q| q != p);
-            self.removed.push(p);
-        }
+        self.0.extend(later.0);
     }
 
     /// Merges into the tick delta. These changes happened before `step`, so whatever `d`
     /// already says about a tile wins; the result never lists a tile in both lists.
     pub fn merge_into(self, d: &mut TickDelta) {
-        for (p, k) in self.added {
-            if !d.designations_removed.contains(&p)
-                && !d.designations_added.iter().any(|a| a.0 == p)
-            {
-                d.designations_added.push((p, k));
-            }
-        }
-        for p in self.removed {
-            if !d.designations_added.iter().any(|a| a.0 == p)
-                && !d.designations_removed.contains(&p)
-            {
-                d.designations_removed.push(p);
+        let seen: HashSet<TilePos> = d
+            .designations_added
+            .iter()
+            .map(|a| a.0)
+            .chain(d.designations_removed.iter().copied())
+            .collect();
+        for (p, k) in self.0.into_iter().filter(|(p, _)| !seen.contains(p)) {
+            match k {
+                Some(k) => d.designations_added.push((p, k)),
+                None => d.designations_removed.push(p),
             }
         }
     }
@@ -123,11 +110,17 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
             mt.designate(a, b, kind);
             for (p, old) in rect.into_iter().zip(before) {
                 if old != Some(kind) && mt.designations.get(&p) == Some(&kind) {
-                    ch.added.push((p, kind));
+                    ch.0.insert(p, Some(kind));
                 }
             }
         }
-        Command::Cancel { a, b } => ch.removed = mt.cancel_designations(a, b),
+        Command::Cancel { a, b } => {
+            ch.0 = mt
+                .cancel_designations(a, b)
+                .into_iter()
+                .map(|p| (p, None))
+                .collect()
+        }
     }
     ch
 }
@@ -683,8 +676,7 @@ mod tests {
                 kind: DesignationKind::Dig,
             },
         ));
-        assert_eq!(ch.added, vec![(t, DesignationKind::Dig)]);
-        assert!(ch.removed.is_empty());
+        assert_eq!(ch.0, BTreeMap::from([(t, Some(DesignationKind::Dig))]));
         let mut d = step(&mut w).remove(&M).unwrap();
         ch.merge_into(&mut d);
         assert_eq!(d.designations_added, vec![(t, DesignationKind::Dig)]);
@@ -702,8 +694,7 @@ mod tests {
             },
         ));
         ch.then(apply_command(&mut w, M, Command::Cancel { a: t, b: t }));
-        assert!(ch.added.is_empty());
-        assert_eq!(ch.removed, vec![t]);
+        assert_eq!(ch.0, BTreeMap::from([(t, None)]));
     }
 
     #[test]
@@ -848,7 +839,7 @@ mod tests {
                 kind: DesignationKind::Dig,
             },
         );
-        assert!(!c.added.is_empty());
+        assert!(!c.0.is_empty() && c.0.values().all(Option::is_some));
         let n = w.mountains[&M].designations.len();
         assert!(w.mountains[&M].designations.contains_key(&t));
         let c = apply_command(
@@ -859,7 +850,7 @@ mod tests {
                 b: p(99, 99, 0),
             },
         );
-        assert_eq!(c.removed.len(), n);
+        assert!(c.0.len() == n && c.0.values().all(Option::is_none));
         assert!(w.mountains[&M].designations.is_empty());
         // Unknown mountain, and a mountain nobody owns: ignored.
         let before = w.clone();
