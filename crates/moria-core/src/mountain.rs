@@ -81,9 +81,15 @@ impl Mountain {
 
     /// Designates the rectangle `a..=b` on level `a.z`; returns how many tiles were added.
     pub fn designate(&mut self, a: TilePos, b: TilePos, kind: DesignationKind) -> usize {
+        if a.z >= self.d {
+            return 0;
+        }
+        // Clamp to the mountain: the rectangle comes from the client.
+        let (x0, x1) = (a.x.min(b.x).max(0), a.x.max(b.x).min(self.w - 1));
+        let (y0, y1) = (a.y.min(b.y).max(0), a.y.max(b.y).min(self.h - 1));
         let mut n = 0;
-        for y in a.y.min(b.y)..=a.y.max(b.y) {
-            for x in a.x.min(b.x)..=a.x.max(b.x) {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
                 let p = TilePos::new(x, y, a.z);
                 if self.diggable(p, kind) {
                     self.designations.insert(p, kind);
@@ -194,6 +200,15 @@ mod tests {
     fn stairs_not_designated_on_bottom_level() {
         let mut m = rock();
         assert_eq!(m.designate(p(0, 0, 2), p(2, 2, 2), DesignationKind::Stairs), 0);
+    }
+
+    #[test]
+    fn designate_huge_rect_is_clamped() {
+        let mut m = rock();
+        let n = m.designate(p(-32768, -32768, 0), p(32767, 32767, 0), DesignationKind::Dig);
+        assert_eq!(n, 25);
+        assert_eq!(m.designate(p(0, 0, 9), p(1, 1, 9), DesignationKind::Dig), 0);
+        assert_eq!(m.designate(p(-9, -9, 0), p(-3, -3, 0), DesignationKind::Dig), 0);
     }
 
     #[test]

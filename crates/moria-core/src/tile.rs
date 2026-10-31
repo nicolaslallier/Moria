@@ -18,9 +18,9 @@ pub struct Resources {
 
 impl Resources {
     pub fn add(&mut self, o: Resources) {
-        self.stone += o.stone;
-        self.gold += o.gold;
-        self.mithril += o.mithril;
+        self.stone = self.stone.saturating_add(o.stone);
+        self.gold = self.gold.saturating_add(o.gold);
+        self.mithril = self.mithril.saturating_add(o.mithril);
     }
 }
 
