@@ -1,5 +1,6 @@
 //! Moria client: log in, create a hero, dig the fortress (top-down, one Z-level at a time).
 
+mod art;
 mod game;
 mod input;
 mod net;
@@ -41,6 +42,7 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .init_state::<Screen>()
         .init_resource::<Client>()
+        .init_resource::<art::Art>()
         .add_systems(Startup, |mut c: Commands| {
             c.spawn(Camera2d);
         })
