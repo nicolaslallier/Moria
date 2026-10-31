@@ -92,7 +92,7 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         }
         Command::Dig(d) | Command::Build(d) => {
             let kind = hero_kind(&c);
-            if kind == DesignationKind::Dig || spare_stone(f) > 0 {
+            if kind == DesignationKind::Dig || hero_stone(f) > 0 {
                 start_dig(f.hero.as_mut().unwrap(), mt, d, kind);
             }
         }
@@ -127,19 +127,26 @@ fn hero_kind(c: &Command) -> DesignationKind {
     }
 }
 
+fn dwarf_walls(f: &Fortress) -> u32 {
+    let n = f.dwarves.iter().filter(|d| {
+        d.task
+            .as_ref()
+            .is_some_and(|t| t.kind == DesignationKind::Wall)
+    });
+    n.count() as u32
+}
+
 /// Stone not yet promised to a wall under construction (by dwarves or the hero).
 pub fn spare_stone(f: &Fortress) -> u32 {
-    let wall = |k: DesignationKind| k == DesignationKind::Wall;
-    let committed = f
-        .dwarves
-        .iter()
-        .filter(|d| d.task.as_ref().is_some_and(|t| wall(t.kind)))
-        .count()
-        + f.hero
-            .as_ref()
-            .and_then(|h| h.dig.as_ref())
-            .is_some_and(|j| wall(j.kind)) as usize;
-    f.resources.stone.saturating_sub(committed as u32)
+    let hero = f.hero.as_ref().and_then(|h| h.dig.as_ref());
+    let hero = hero.is_some_and(|j| j.kind == DesignationKind::Wall) as u32;
+    hero_stone(f).saturating_sub(hero)
+}
+
+/// Stone the hero may build with: its own current build doesn't count, since a new one
+/// replaces it.
+fn hero_stone(f: &Fortress) -> u32 {
+    f.resources.stone.saturating_sub(dwarf_walls(f))
 }
 
 /// Starts digging (`Dig`) or building (`Wall`) the tile toward `d`.
@@ -285,6 +292,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         // Designation changes of this step; the last write on a tile wins.
         let (mut tiles, mut ch) = (vec![], Changes::default());
 
+        let hero_stone = hero_stone(f);
         if let Some(h) = f.hero.as_mut() {
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
             // A Move that arrived during the cooldown (network jitter) is not lost.
@@ -292,7 +300,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 && let Some(d) = h.pending_move
             {
                 hero_move(h, m, d);
-                if let Some((dd, kind)) = h.pending_dig.take() {
+                if let Some((dd, kind)) = h.pending_dig.take()
+                    && (kind == DesignationKind::Dig || hero_stone > 0)
+                {
                     start_dig(h, m, dd, kind);
                 }
             }
@@ -334,14 +344,21 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             }
         }
 
-        // An idle dwarf on a designated tile would block it forever (stairs are never dug
-        // under an occupant): step it aside onto the first free-of-designation neighbour.
+        // An idle dwarf on a designated tile, or on the hero's build, would block it forever
+        // (nothing is built under an occupant): step it aside onto the first free neighbour.
+        let hero_build = f
+            .hero
+            .as_ref()
+            .and_then(|h| h.dig.as_ref())
+            .filter(|j| j.kind == DesignationKind::Wall)
+            .map(|j| j.target);
+        let busy = |q: TilePos| m.designations.contains_key(&q) || hero_build == Some(q);
         for d in f.dwarves.iter_mut().filter(|d| d.task.is_none()) {
-            if m.designations.contains_key(&d.pos)
+            if busy(d.pos)
                 && let Some(to) = Dir::HORIZONTAL
                     .iter()
                     .map(|&dir| d.pos.step(dir))
-                    .find(|&q| m.walkable(q) && !m.designations.contains_key(&q))
+                    .find(|&q| m.walkable(q) && !busy(q))
             {
                 d.pos = to;
             }
@@ -726,11 +743,16 @@ mod tests {
             hero(&w).dig.as_ref().map(|j| j.kind),
             Some(DesignationKind::Wall)
         );
-        // A dwarf crossing the tile pauses the build, it doesn't cancel it.
+        // With its one stone reserved, the hero may still switch to another tile.
+        apply_command(&mut w, M, Command::Build(Dir::S));
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(2, 24, 0)));
+        apply_command(&mut w, M, Command::Build(Dir::E));
+        // A dwarf crossing the tile pauses the build, it doesn't cancel it; an idle one
+        // standing there is stepped aside.
         w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = t;
         step(&mut w);
         assert_eq!(hero(&w).dig.as_ref().map(|j| j.progress), Some(0));
-        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = p(0, 22, 0);
+        assert_ne!(w.fortresses[&M].dwarves[0].pos, t);
         let mut built = None;
         for _ in 0..30 {
             if step(&mut w)[&M].tiles.contains(&(t, Tile::Wall)) {
@@ -748,6 +770,24 @@ mod tests {
             hero(&w).dig.as_ref().map(|j| j.kind),
             Some(DesignationKind::Dig)
         );
+    }
+
+    #[test]
+    fn buffered_build_respects_dwarf_reserved_stone() {
+        let mut w = setup();
+        let f = w.fortresses.get_mut(&M).unwrap();
+        f.resources.stone = 1;
+        f.dwarves[0].task = Some(DwarfTask {
+            target: p(5, 25, 0),
+            kind: DesignationKind::Wall,
+            path: vec![],
+            progress: 0,
+        });
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        apply_command(&mut w, M, Command::Build(Dir::E)); // buffered behind the move
+        step(&mut w);
+        step(&mut w);
+        assert!(hero(&w).dig.is_none(), "the dwarf's stone is not taken");
     }
 
     #[test]

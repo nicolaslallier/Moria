@@ -4,7 +4,7 @@
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::protocol::{ClientMsg, FortressView, HeroView, Reject, ServerMsg, TickDelta};
-use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, Tile, TilePos};
+use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, TilePos};
 use std::collections::VecDeque;
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
@@ -189,11 +189,13 @@ impl Game {
     /// Hero action toward the last move direction: dig a solid tile, or in Wall mode build
     /// on floor (with stone).
     pub fn dig(&self) -> Option<ClientMsg> {
-        let t = self.mountain.get(self.hero.pos.step(self.last_dir))?;
-        if t.is_solid() {
+        let target = self.hero.pos.step(self.last_dir);
+        if self.mountain.get(target)?.is_solid() {
             Some(ClientMsg::Dig(self.last_dir))
         } else {
-            (self.mode == DesignationKind::Wall && t == Tile::Floor && self.resources.stone > 0)
+            (self.mode == DesignationKind::Wall
+                && self.mountain.diggable(target, DesignationKind::Wall)
+                && self.resources.stone > 0)
                 .then_some(ClientMsg::Build(self.last_dir))
         }
     }
