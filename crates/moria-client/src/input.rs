@@ -22,7 +22,7 @@ pub struct Drag {
 pub fn plugin(app: &mut App) {
     app.init_resource::<Drag>().add_systems(
         Update,
-        (keyboard, gamepad, mouse)
+        (play, mouse)
             .in_set(InputSet)
             .run_if(in_state(Screen::Playing)),
     );
@@ -35,55 +35,66 @@ const MOVES: [(KeyCode, KeyCode, Dir); 4] = [
     (KeyCode::KeyD, KeyCode::ArrowRight, Dir::E),
 ];
 
-fn keyboard(
-    keys: Res<ButtonInput<KeyCode>>,
-    logical: Res<ButtonInput<Key>>,
-    time: Res<Time>,
-    mut client: ResMut<Client>,
-) {
-    let now = time.elapsed_secs_f64();
-    let Some(g) = &mut client.session.game else {
-        return;
-    };
-    let mut out = vec![];
-    // Held keys keep walking; the cooldown paces them.
-    if let Some(&(_, _, d)) = MOVES
-        .iter()
-        .find(|(a, b, _)| keys.pressed(*a) || keys.pressed(*b))
-    {
-        out.extend(g.try_move(d, now));
-    }
+/// What the player asked for this frame, merged from keyboard and every pad,
+/// so each action fires at most once whatever the number of devices.
+#[derive(Default)]
+struct Intent {
+    walk: Option<Dir>,
+    up: bool,
+    down: bool,
+    dig: bool,
+    toggle: bool,
+    mode: Option<DesignationKind>,
+}
+
+fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
     let ch = |s: &str| logical.just_pressed(Key::Character(s.into()));
-    if ch("<") || keys.just_pressed(KeyCode::KeyQ) {
-        out.extend(g.vertical(Dir::Up, now));
-    }
-    if ch(">") || keys.just_pressed(KeyCode::KeyE) {
-        out.extend(g.vertical(Dir::Down, now));
-    }
-    if keys.just_pressed(KeyCode::Space) {
-        out.extend(g.dig());
-    }
-    if keys.just_pressed(KeyCode::Digit1) {
-        g.mode = DesignationKind::Dig;
-    }
-    if keys.just_pressed(KeyCode::Digit2) {
-        g.mode = DesignationKind::Stairs;
-    }
-    if keys.just_pressed(KeyCode::KeyX) {
-        g.mode = match g.mode {
-            DesignationKind::Dig => DesignationKind::Stairs,
-            DesignationKind::Stairs => DesignationKind::Dig,
-        };
-    }
-    for m in out {
-        client.send(m);
+    Intent {
+        // Held keys keep walking; the cooldown paces them.
+        walk: MOVES
+            .iter()
+            .find(|(a, b, _)| keys.pressed(*a) || keys.pressed(*b))
+            .map(|&(_, _, d)| d),
+        up: ch("<") || keys.just_pressed(KeyCode::KeyQ),
+        down: ch(">") || keys.just_pressed(KeyCode::KeyE),
+        dig: keys.just_pressed(KeyCode::Space),
+        toggle: keys.just_pressed(KeyCode::KeyX),
+        mode: if keys.just_pressed(KeyCode::Digit1) {
+            Some(DesignationKind::Dig)
+        } else if keys.just_pressed(KeyCode::Digit2) {
+            Some(DesignationKind::Stairs)
+        } else {
+            None
+        },
     }
 }
 
-/// Stick or D-pad to a cardinal direction: dominant axis past the deadzone.
-fn stick_dir(v: Vec2) -> Option<Dir> {
-    const DEADZONE: f32 = 0.5;
-    if v.x.abs().max(v.y.abs()) < DEADZONE {
+/// Signed push along `d` and magnitude across it; `None` for Up/Down.
+fn along_across(d: Dir, v: Vec2) -> Option<(f32, f32)> {
+    match d {
+        Dir::N => Some((v.y, v.x.abs())),
+        Dir::S => Some((-v.y, v.x.abs())),
+        Dir::E => Some((v.x, v.y.abs())),
+        Dir::W => Some((-v.x, v.y.abs())),
+        Dir::Up | Dir::Down => None,
+    }
+}
+
+/// Stick to a cardinal direction: dominant axis past `PRESS`, ties go
+/// vertical. Hysteresis: the previous direction holds until the push drops
+/// under `RELEASE` or the other axis leads by `STICKY`, so a noisy diagonal
+/// does not zigzag.
+fn stick_dir(v: Vec2, prev: Option<Dir>) -> Option<Dir> {
+    const PRESS: f32 = 0.5;
+    const RELEASE: f32 = 0.3;
+    const STICKY: f32 = 0.2;
+    if let Some((along, across)) = prev.and_then(|p| along_across(p, v))
+        && along >= RELEASE
+        && across < along + STICKY
+    {
+        return prev;
+    }
+    if v.x.abs().max(v.y.abs()) < PRESS {
         None
     } else if v.y.abs() >= v.x.abs() {
         Some(if v.y > 0.0 { Dir::N } else { Dir::S })
@@ -92,32 +103,70 @@ fn stick_dir(v: Vec2) -> Option<Dir> {
     }
 }
 
-/// Stick/D-pad walk, A dig, LB up, RB down, Y toggles dig/stairs.
-fn gamepad(pads: Query<&Gamepad>, time: Res<Time>, mut client: ResMut<Client>) {
+/// The D-pad wins over the stick, so a resting stick never cancels it.
+fn pad_dir(dpad: Vec2, stick: Vec2, prev: Option<Dir>) -> Option<Dir> {
+    if dpad != Vec2::ZERO {
+        stick_dir(dpad, None)
+    } else {
+        stick_dir(stick, prev)
+    }
+}
+
+/// Buttons by position, not label: South = A/✕, North = Y/△, LB/RB = L1/R1.
+fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
+    let any = |b| pads.iter().any(|p| p.just_pressed(b));
+    let walk = pads
+        .iter()
+        .find_map(|p| pad_dir(p.dpad(), p.left_stick(), *prev));
+    *prev = walk;
+    Intent {
+        walk,
+        up: any(GamepadButton::LeftTrigger),
+        down: any(GamepadButton::RightTrigger),
+        dig: any(GamepadButton::South),
+        toggle: any(GamepadButton::North),
+        mode: None,
+    }
+}
+
+fn play(
+    keys: Res<ButtonInput<KeyCode>>,
+    logical: Res<ButtonInput<Key>>,
+    pads: Query<&Gamepad>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut stick: Local<Option<Dir>>,
+    time: Res<Time>,
+    mut client: ResMut<Client>,
+) {
     let now = time.elapsed_secs_f64();
     let Some(g) = &mut client.session.game else {
         return;
     };
+    let k = keyboard_intent(&keys, &logical);
+    // gilrs keeps reporting pads in the background; only a focused window plays.
+    let p = if window.focused {
+        gamepad_intent(&pads, &mut stick)
+    } else {
+        *stick = None;
+        Intent::default()
+    };
     let mut out = vec![];
-    for pad in &pads {
-        if let Some(d) = stick_dir(pad.left_stick() + pad.dpad()) {
-            out.extend(g.try_move(d, now));
-        }
-        if pad.just_pressed(GamepadButton::LeftTrigger) {
-            out.extend(g.vertical(Dir::Up, now));
-        }
-        if pad.just_pressed(GamepadButton::RightTrigger) {
-            out.extend(g.vertical(Dir::Down, now));
-        }
-        if pad.just_pressed(GamepadButton::South) {
-            out.extend(g.dig());
-        }
-        if pad.just_pressed(GamepadButton::North) {
-            g.mode = match g.mode {
-                DesignationKind::Dig => DesignationKind::Stairs,
-                DesignationKind::Stairs => DesignationKind::Dig,
-            };
-        }
+    if let Some(d) = k.walk.or(p.walk) {
+        out.extend(g.try_move(d, now));
+    }
+    if k.up || p.up {
+        out.extend(g.vertical(Dir::Up, now));
+    }
+    if k.down || p.down {
+        out.extend(g.vertical(Dir::Down, now));
+    }
+    if k.dig || p.dig {
+        out.extend(g.dig());
+    }
+    if let Some(m) = k.mode {
+        g.mode = m;
+    } else if k.toggle || p.toggle {
+        g.mode = g.mode.toggled();
     }
     for m in out {
         client.send(m);
@@ -169,10 +218,35 @@ mod tests {
 
     #[test]
     fn stick_dir_picks_dominant_axis() {
-        assert_eq!(stick_dir(Vec2::new(0.2, 0.3)), None);
-        assert_eq!(stick_dir(Vec2::new(0.0, 1.0)), Some(Dir::N));
-        assert_eq!(stick_dir(Vec2::new(0.4, -0.9)), Some(Dir::S));
-        assert_eq!(stick_dir(Vec2::new(-0.8, 0.6)), Some(Dir::W));
-        assert_eq!(stick_dir(Vec2::new(0.7, 0.0)), Some(Dir::E));
+        assert_eq!(stick_dir(Vec2::new(0.2, 0.3), None), None);
+        assert_eq!(stick_dir(Vec2::new(0.0, 1.0), None), Some(Dir::N));
+        assert_eq!(stick_dir(Vec2::new(0.4, -0.9), None), Some(Dir::S));
+        assert_eq!(stick_dir(Vec2::new(-0.8, 0.6), None), Some(Dir::W));
+        assert_eq!(stick_dir(Vec2::new(0.7, 0.0), None), Some(Dir::E));
+        // Exact diagonal: ties go vertical.
+        assert_eq!(stick_dir(Vec2::new(0.7, 0.7), None), Some(Dir::N));
+        assert_eq!(stick_dir(Vec2::new(-0.7, -0.7), None), Some(Dir::S));
+    }
+
+    #[test]
+    fn stick_dir_hysteresis() {
+        // Noise around the diagonal keeps the held direction.
+        assert_eq!(stick_dir(Vec2::new(0.71, 0.70), Some(Dir::N)), Some(Dir::N));
+        assert_eq!(stick_dir(Vec2::new(0.71, 0.70), None), Some(Dir::E));
+        // Clearly turning switches.
+        assert_eq!(stick_dir(Vec2::new(1.0, 0.1), Some(Dir::N)), Some(Dir::E));
+        // Under PRESS but over RELEASE keeps walking; under RELEASE stops.
+        assert_eq!(stick_dir(Vec2::new(0.0, 0.4), Some(Dir::N)), Some(Dir::N));
+        assert_eq!(stick_dir(Vec2::new(0.0, 0.4), None), None);
+        assert_eq!(stick_dir(Vec2::new(0.0, 0.2), Some(Dir::N)), None);
+    }
+
+    #[test]
+    fn dpad_overrides_stick() {
+        let (r, l, u) = (Vec2::X, Vec2::new(-0.6, 0.0), Vec2::Y);
+        assert_eq!(pad_dir(u, r, None), Some(Dir::N));
+        assert_eq!(pad_dir(r, l, None), Some(Dir::E));
+        assert_eq!(pad_dir(Vec2::ZERO, r, None), Some(Dir::E));
+        assert_eq!(pad_dir(Vec2::ZERO, Vec2::ZERO, Some(Dir::N)), None);
     }
 }

@@ -32,6 +32,16 @@ pub enum DesignationKind {
     Stairs,
 }
 
+impl DesignationKind {
+    /// The other mode: what X / the gamepad's north button switch to.
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Dig => Self::Stairs,
+            Self::Stairs => Self::Dig,
+        }
+    }
+}
+
 impl Tile {
     pub fn is_solid(self) -> bool {
         matches!(self, Tile::Rock | Tile::Gold | Tile::Mithril)
