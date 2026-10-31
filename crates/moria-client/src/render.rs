@@ -57,11 +57,12 @@ pub fn plugin(app: &mut App) {
         );
 }
 
+/// Heads have a dark square background; drawn smaller so the tile underneath shows.
 fn head(image: Handle<Image>) -> impl Bundle {
     (
         Sprite {
             image,
-            custom_size: Some(Vec2::splat(TILE)),
+            custom_size: Some(Vec2::splat(TILE * 0.7)),
             ..default()
         },
         DespawnOnExit(Screen::Playing),
@@ -127,8 +128,9 @@ fn sync_tiles(client: Res<Client>, art: Res<Art>, mut q: Query<(&mut TileSprite,
     }
 }
 
-fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8) {
-    t.translation = to_world(p.x, p.y).extend(1.0);
+/// `depth` keeps the hero drawn above a dwarf sharing its tile.
+fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32) {
+    t.translation = to_world(p.x, p.y).extend(depth);
     *v = if p.z == z {
         Visibility::Inherited
     } else {
@@ -148,19 +150,19 @@ fn sync_marks(
     let z = g.current_z();
     let mut ds = g.dwarves.iter();
     for (e, mark, mut t, mut v) in &mut marks {
-        let pos = match mark {
-            Mark::Hero => Some(g.hero.pos),
-            Mark::Dwarf => ds.next().map(|&(_, p)| p),
+        let (pos, depth) = match mark {
+            Mark::Hero => (Some(g.hero.pos), 2.0),
+            Mark::Dwarf => (ds.next().map(|&(_, p)| p), 1.0),
         };
         match pos {
-            Some(p) => place(&mut t, &mut v, p, z),
+            Some(p) => place(&mut t, &mut v, p, z, depth),
             None => commands.entity(e).despawn(),
         }
     }
     for &(_, p) in ds {
         let mut t = Transform::default();
         let mut v = Visibility::default();
-        place(&mut t, &mut v, p, z);
+        place(&mut t, &mut v, p, z, 1.0);
         commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
     }
 }
@@ -183,7 +185,7 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
     let z = g.current_z();
     if g.hero.pos.z == z {
         let at = to_world(g.hero.pos.x, g.hero.pos.y);
-        gizmos.rect_2d(at, Vec2::splat(TILE), Color::srgb(1.0, 0.15, 0.15));
+        gizmos.rect_2d(at, Vec2::splat(TILE * 0.7), Color::srgb(1.0, 0.15, 0.15));
     }
     // TilePos orders by x first, so a z-range is not contiguous; the map is small.
     for (p, k) in g.mountain.designations.iter().filter(|(p, _)| p.z == z) {

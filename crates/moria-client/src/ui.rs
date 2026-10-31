@@ -116,7 +116,12 @@ fn centered(title: &str) -> egui::Window<'_> {
 }
 
 /// Paints `image` behind every window, cropped to fill the screen without stretching.
-fn backdrop(ctx: &mut EguiContexts, image: &Handle<Image>, aspect: f32) -> Result {
+/// Nothing is drawn until the image has loaded.
+fn backdrop(ctx: &mut EguiContexts, images: &Assets<Image>, image: &Handle<Image>) -> Result {
+    let Some(size) = images.get(image).map(Image::size_f32) else {
+        return Ok(());
+    };
+    let aspect = size.x / size.y.max(1.0);
     let id = ctx.add_image(EguiTextureHandle::Weak(image.id()));
     let c = ctx.ctx_mut()?;
     let screen = c.content_rect();
@@ -142,10 +147,11 @@ fn error_label(ui: &mut egui::Ui, s: &Session) {
 fn login(
     mut ctx: EguiContexts,
     art: Res<Art>,
+    images: Res<Assets<Image>>,
     mut form: ResMut<LoginForm>,
     mut client: ResMut<Client>,
 ) -> Result {
-    backdrop(&mut ctx, &art.castle, 1280.0 / 711.0)?;
+    backdrop(&mut ctx, &images, &art.castle)?;
     let connecting = client.net.is_some();
     centered("Moria — Connexion").show(ctx.ctx_mut()?, |ui| {
         egui::Grid::new("login").num_columns(2).show(ui, |ui| {
@@ -199,10 +205,11 @@ fn login(
 fn create_hero(
     mut ctx: EguiContexts,
     art: Res<Art>,
+    images: Res<Assets<Image>>,
     mut form: ResMut<HeroForm>,
     mut client: ResMut<Client>,
 ) -> Result {
-    backdrop(&mut ctx, &art.castle, 1280.0 / 711.0)?;
+    backdrop(&mut ctx, &images, &art.castle)?;
     let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(form.race).id()));
     centered("Création du héros").show(ctx.ctx_mut()?, |ui| {
         egui::ComboBox::from_label("Race")
