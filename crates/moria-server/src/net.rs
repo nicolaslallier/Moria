@@ -98,9 +98,14 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
         anyhow::Ok(())
     };
     let reader = async {
+        // One CreateHero per session reaches the shared request queue; repeats are dropped
+        // so they cannot crowd out everyone's Lookup/Login.
+        let mut hero_requested = false;
         loop {
             match read_frame_async::<ClientMsg>(&mut rd).await? {
+                ClientMsg::CreateHero { .. } if hero_requested => {}
                 ClientMsg::CreateHero { race, class } => {
+                    hero_requested = true;
                     let r = Request::CreateHero {
                         player,
                         name: display.clone(),
