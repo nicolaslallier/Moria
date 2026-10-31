@@ -9,7 +9,9 @@ pub enum Tile {
     Stair,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 pub struct Resources {
     pub stone: u32,
     pub gold: u32,

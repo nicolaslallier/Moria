@@ -110,7 +110,10 @@ impl Mountain {
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
-                if let Some(t) = self.get(below).filter(|t| t.is_solid() || *t == Tile::Floor) {
+                if let Some(t) = self
+                    .get(below)
+                    .filter(|t| t.is_solid() || *t == Tile::Floor)
+                {
                     res.add(t.yield_());
                     self.set(below, Tile::Stair);
                 }
@@ -136,7 +139,14 @@ mod tests {
     fn dig_rock_gives_stone_and_floor() {
         let mut m = rock();
         let r = m.dig(p(1, 1, 0), DesignationKind::Dig).unwrap();
-        assert_eq!(r, Resources { stone: 1, gold: 0, mithril: 0 });
+        assert_eq!(
+            r,
+            Resources {
+                stone: 1,
+                gold: 0,
+                mithril: 0
+            }
+        );
         assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Floor));
         assert_eq!(m.dig(p(1, 1, 0), DesignationKind::Dig), None);
     }
@@ -156,7 +166,10 @@ mod tests {
     fn stairs_designation_allowed_on_floor() {
         let mut m = rock();
         m.set(p(2, 2, 0), Tile::Floor);
-        assert_eq!(m.designate(p(2, 2, 0), p(2, 2, 0), DesignationKind::Stairs), 1);
+        assert_eq!(
+            m.designate(p(2, 2, 0), p(2, 2, 0), DesignationKind::Stairs),
+            1
+        );
         // Dig stays solid-only.
         assert_eq!(m.designate(p(2, 2, 0), p(2, 2, 0), DesignationKind::Dig), 0);
         let r = m.dig(p(2, 2, 0), DesignationKind::Stairs).unwrap();
@@ -167,7 +180,10 @@ mod tests {
         // Floor below also becomes stair, yielding nothing.
         m.set(p(3, 3, 0), Tile::Floor);
         m.set(p(3, 3, 1), Tile::Floor);
-        assert_eq!(m.dig(p(3, 3, 0), DesignationKind::Stairs), Some(Resources::default()));
+        assert_eq!(
+            m.dig(p(3, 3, 0), DesignationKind::Stairs),
+            Some(Resources::default())
+        );
         assert_eq!(m.get(p(3, 3, 1)), Some(Tile::Stair));
         // Not on the bottom level, nor on a Stair.
         m.set(p(0, 0, 2), Tile::Floor);
@@ -199,16 +215,26 @@ mod tests {
     #[test]
     fn stairs_not_designated_on_bottom_level() {
         let mut m = rock();
-        assert_eq!(m.designate(p(0, 0, 2), p(2, 2, 2), DesignationKind::Stairs), 0);
+        assert_eq!(
+            m.designate(p(0, 0, 2), p(2, 2, 2), DesignationKind::Stairs),
+            0
+        );
     }
 
     #[test]
     fn designate_huge_rect_is_clamped() {
         let mut m = rock();
-        let n = m.designate(p(-32768, -32768, 0), p(32767, 32767, 0), DesignationKind::Dig);
+        let n = m.designate(
+            p(-32768, -32768, 0),
+            p(32767, 32767, 0),
+            DesignationKind::Dig,
+        );
         assert_eq!(n, 25);
         assert_eq!(m.designate(p(0, 0, 9), p(1, 1, 9), DesignationKind::Dig), 0);
-        assert_eq!(m.designate(p(-9, -9, 0), p(-3, -3, 0), DesignationKind::Dig), 0);
+        assert_eq!(
+            m.designate(p(-9, -9, 0), p(-3, -3, 0), DesignationKind::Dig),
+            0
+        );
     }
 
     #[test]
