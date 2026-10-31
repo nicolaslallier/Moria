@@ -33,20 +33,20 @@ pub async fn run(
     mut views: mpsc::Receiver<AiView>,
     assign: mpsc::Sender<Assignments>,
 ) {
-    let client = loop {
-        match async_nats::connect(&url).await {
-            Ok(c) => break c,
+    let (client, mut sub) = loop {
+        let r = match async_nats::connect(&url).await {
+            Ok(c) => match c.subscribe(SUBJECT_ASSIGN).await {
+                Ok(sub) => Ok((c, sub)),
+                Err(e) => Err(format!("abonnement impossible ({e})")),
+            },
+            Err(e) => Err(format!("NATS indisponible ({e})")),
+        };
+        match r {
+            Ok(x) => break x,
             Err(e) => {
-                tracing::warn!("NATS indisponible ({e}), nouvel essai dans 2 s");
+                tracing::warn!("{e}, nouvel essai dans 2 s");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        }
-    };
-    let mut sub = match client.subscribe(SUBJECT_ASSIGN).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("abonnement NATS impossible: {e}");
-            return;
         }
     };
     tracing::info!("pont NATS connecte a {url}");

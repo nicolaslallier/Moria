@@ -22,6 +22,10 @@ struct Server {
 
 impl Server {
     async fn start(name: &str) -> Server {
+        Server::start_with(name, None).await
+    }
+
+    async fn start_with(name: &str, invite: Option<&str>) -> Server {
         let dir = std::env::temp_dir().join(format!("moria-net-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let data = dir.join("world.bin");
@@ -33,6 +37,7 @@ impl Server {
             data: data.clone(),
             bind: addr,
             nats_url: None,
+            invite: invite.map(Into::into),
         };
         let done = tokio::spawn(run_with_listener(cfg, listener, async {
             let _ = rx.await;
@@ -71,10 +76,19 @@ impl Client {
             .expect("frame")
     }
     async fn hello(&mut self, name: &str, password: &str) -> ServerMsg {
+        self.hello_invite(name, password, None).await
+    }
+    async fn hello_invite(
+        &mut self,
+        name: &str,
+        password: &str,
+        invite: Option<&str>,
+    ) -> ServerMsg {
         self.send(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             name: name.into(),
             password: password.into(),
+            invite: invite.map(Into::into),
         })
         .await;
         self.recv().await
@@ -126,6 +140,7 @@ async fn version_mismatch_rejected() {
         version: PROTOCOL_VERSION + 1,
         name: "gimli".into(),
         password: "x".into(),
+        invite: None,
     })
     .await;
     assert_eq!(
@@ -282,6 +297,7 @@ async fn missing_world_file_is_an_error() {
         data: std::env::temp_dir().join("moria-net-does-not-exist/world.bin"),
         bind: listener.local_addr().unwrap(),
         nats_url: None,
+        invite: None,
     };
     let e = run_with_listener(cfg, listener, async {})
         .await
@@ -290,4 +306,57 @@ async fn missing_world_file_is_an_error() {
         e.to_string().contains("lancez d'abord moria-worldgen"),
         "{e}"
     );
+}
+
+#[tokio::test]
+async fn connections_beyond_cap_are_dropped() {
+    use tokio::io::AsyncReadExt;
+    let s = Server::start("conncap").await;
+    let mut idle = vec![];
+    for _ in 0..32 {
+        idle.push(TcpStream::connect(s.addr).await.unwrap());
+    }
+    let mut extra = TcpStream::connect(s.addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let r = timeout(Duration::from_secs(5), extra.read(&mut buf))
+        .await
+        .expect("33rd connection must be closed, not hang");
+    assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
+    drop(idle);
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn new_account_requires_invite_when_configured() {
+    let s = Server::start_with("invite", Some("mellon")).await;
+    for bad in [None, Some("wrong")] {
+        let mut c = Client::connect(&s).await;
+        assert_eq!(
+            c.hello_invite("gimli", "pw", bad).await,
+            ServerMsg::Reject(Reject::BadInvite)
+        );
+    }
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.hello_invite("gimli", "pw", Some("mellon")).await,
+        ServerMsg::Welcome { .. }
+    ));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn existing_account_needs_no_invite() {
+    let s = Server::start_with("invite-existing", Some("mellon")).await;
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.hello_invite("gimli", "pw", Some("mellon")).await,
+        ServerMsg::Welcome { .. }
+    ));
+    drop(c);
+    let mut c = Client::connect(&s).await;
+    assert!(matches!(
+        c.hello("gimli", "pw").await,
+        ServerMsg::Welcome { .. }
+    ));
+    s.stop().await;
 }

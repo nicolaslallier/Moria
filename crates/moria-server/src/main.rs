@@ -12,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
         data: env("MORIA_DATA", "/data/world.bin").into(),
         bind: env("MORIA_BIND", "0.0.0.0:7777").parse()?,
         nats_url: Some(env("NATS_URL", "nats://nats:4222")),
+        invite: std::env::var("MORIA_INVITE").ok(),
     };
     run(cfg, shutdown_signal()).await
 }

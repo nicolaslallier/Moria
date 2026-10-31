@@ -12,6 +12,8 @@ pub enum ClientMsg {
         version: u32,
         name: String,
         password: String,
+        /// Required to create a new account when the server has an invite code.
+        invite: Option<String>,
     },
     CreateHero {
         race: Race,
@@ -37,6 +39,7 @@ pub enum Reject {
     ServerFull,
     NoFreeMountain,
     InvalidName,
+    BadInvite,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

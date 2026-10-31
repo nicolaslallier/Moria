@@ -9,7 +9,7 @@ pub mod sim;
 use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg};
 use moria_core::srd::{Class, Race, roll_abilities};
-use moria_core::world::{self, Account, Hero, MAX_OWNED, World};
+use moria_core::world::{self, Account, Hero, World};
 use moria_core::{MountainId, PlayerId, TilePos};
 use sim::{Changes, Command};
 use std::collections::{BTreeMap, HashMap};
@@ -17,15 +17,20 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::Bound;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 const TICK: Duration = Duration::from_millis(100);
 const SAVE_EVERY: u64 = 300;
 /// Most commands applied per tick; the rest wait in the channel (sessions get backpressure).
+/// Connected players (ServerFull beyond this).
+pub const MAX_SESSIONS: usize = 10;
+/// Open TCP connections, authenticated or not; extra connections are closed on accept.
+pub const MAX_CONNECTIONS: usize = 32;
 const MAX_CMDS_PER_TICK: usize = 1024;
 const MAX_REQS_PER_TICK: usize = 64;
 const MAX_ASSIGN_PER_TICK: usize = 16;
@@ -35,6 +40,8 @@ pub struct Config {
     pub bind: SocketAddr,
     /// `None` disables the NATS bridge.
     pub nats_url: Option<String>,
+    /// Invite code required to create a new account; `None` means open registration.
+    pub invite: Option<String>,
 }
 
 pub enum Lookup {
@@ -99,17 +106,28 @@ pub async fn run_with_listener(
     });
     drop(assign_tx);
 
+    match &cfg.invite {
+        None => tracing::warn!("MORIA_INVITE absent : inscription ouverte à tous"),
+        Some(_) => tracing::info!("inscription sur code d'invitation"),
+    }
     let handles = net::Handles {
         req: req_tx,
         cmd: cmd_tx,
+        invite: cfg.invite.clone(),
     };
+    let conns = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tracing::info!("serveur prêt sur {}", listener.local_addr()?);
     let accept = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    // Over the cap: drop the stream right away (closes the socket).
+                    let Ok(permit) = conns.clone().try_acquire_owned() else {
+                        continue;
+                    };
                     let h = handles.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // held for the whole connection
                         if let Err(e) = net::session(stream, h).await {
                             tracing::debug!("session {peer} terminee : {e}");
                         }
@@ -240,7 +258,7 @@ impl State {
             Request::Lookup { name, reply } => {
                 let acc = self.w.accounts.get(&name);
                 let connected = acc.is_some_and(|a| self.sessions.contains_key(&a.player));
-                let l = if self.sessions.len() >= MAX_OWNED && !connected {
+                let l = if self.sessions.len() >= MAX_SESSIONS && !connected {
                     Lookup::Full
                 } else if let Some(a) = acc {
                     Lookup::Existing(a.password_hash.clone())
@@ -305,7 +323,7 @@ impl State {
     ) -> Result<(PlayerId, MountainId), Reject> {
         let existing = self.w.accounts.get(&name).map(|a| a.player);
         let replacing = existing.is_some_and(|p| self.sessions.contains_key(&p));
-        if self.sessions.len() >= MAX_OWNED && !replacing {
+        if self.sessions.len() >= MAX_SESSIONS && !replacing {
             return Err(Reject::ServerFull);
         }
         let player = match (existing, new_hash) {

@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 pub const SESSION_QUEUE: usize = 64;
@@ -25,6 +25,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Handles {
     pub req: mpsc::Sender<Request>,
     pub cmd: mpsc::Sender<(PlayerId, Command)>,
+    pub invite: Option<String>,
 }
 
 pub fn valid_name(n: &str) -> bool {
@@ -44,8 +45,12 @@ async fn ask<T>(h: &Handles, make: impl FnOnce(oneshot::Sender<T>) -> Request) -
     rx.await.ok()
 }
 
+/// At most this many argon2 runs at once, whatever the number of handshakes.
+static ARGON: Semaphore = Semaphore::const_new(2);
+
 /// Runs argon2 off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let _permit = ARGON.acquire().await.ok()?;
     tokio::task::spawn_blocking(f).await.ok()
 }
 
@@ -55,6 +60,7 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
         version,
         name,
         password,
+        invite,
     } = timeout(HELLO_TIMEOUT, read_frame_async(&mut rd)).await??
     else {
         return Ok(());
@@ -80,6 +86,9 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
         None => return Ok(()), // server shutting down
         Some(Lookup::Full) => return reject(&mut wr, Reject::ServerFull).await,
         Some(Lookup::New) => {
+            if h.invite.is_some() && invite != h.invite {
+                return reject(&mut wr, Reject::BadInvite).await;
+            }
             let hash = blocking(move || {
                 Argon2::default()
                     .hash_password(password.as_bytes())
