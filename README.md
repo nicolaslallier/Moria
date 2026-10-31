@@ -24,6 +24,7 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 2. Repository URL : `https://github.com/nicolaslallier/Moria`, branche `main`, Compose path : `docker-compose.yml`. Si le dépôt est privé, activer « Authentication » et fournir un jeton GitHub (token) à Portainer.
 3. Dans « Environment variables », ajouter `MORIA_INVITE` (**obligatoire**, voir ci-dessous) : sans elle, le déploiement échoue.
 4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Seul ce port est publié ; NATS reste sur le réseau interne.
+5. Logs : l'Alloy de la pile Infra collecte le stdout des conteneurs de cet hôte ; dans Grafana (https://grafana.infra.famillelallier.net), Explore > Loki, requête `{compose_project="moria"}` (filtrer par `compose_service`). Le nom de stack Portainer doit rester `moria`.
 
 ## Code d'invitation
 

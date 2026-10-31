@@ -6,6 +6,8 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Pas de couleurs hors terminal : Docker → Alloy → Loki garde un texte lisible.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
     let max_per_ip: usize = env("MORIA_MAX_PER_IP", &MAX_CONNECTIONS_PER_IP.to_string())
