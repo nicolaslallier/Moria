@@ -1,10 +1,8 @@
-use moria_core::ai::AiView;
+use moria_core::ai::{AiView, MAX_DWARVES_PER_VIEW};
 use moria_core::path::distances_from;
 use moria_core::{Dir, DwarfId, TilePos};
 use moria_core::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
 use std::collections::HashSet;
-
-pub const MAX_DWARVES: usize = 64;
 
 /// A deserialized view is untrusted: postcard bypasses `Mountain`'s invariants.
 pub fn validate(view: &AiView) -> Result<(), &'static str> {
@@ -16,7 +14,7 @@ pub fn validate(view: &AiView) -> Result<(), &'static str> {
     if !m.is_consistent() {
         return Err("tuiles incoherentes");
     }
-    if view.dwarves.len() > MAX_DWARVES {
+    if view.dwarves.len() > MAX_DWARVES_PER_VIEW {
         return Err("trop de nains");
     }
     if m.designations.len() > w as usize * h as usize * d as usize {
@@ -41,12 +39,12 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
     let m = &view.mountain;
     let claimed: HashSet<TilePos> = view.claimed.iter().copied().collect();
     let occupied: HashSet<TilePos> = view.occupied.iter().copied().collect();
-    // BTreeMap keys are already sorted by TilePos.
+    // BTreeMap keys are already sorted by TilePos. The server rejects undiggable targets.
     let tasks: Vec<TilePos> = m
         .designations
-        .keys()
-        .copied()
-        .filter(|t| !claimed.contains(t) && !occupied.contains(t))
+        .iter()
+        .filter(|&(&t, &k)| m.diggable(t, k) && !claimed.contains(&t) && !occupied.contains(&t))
+        .map(|(&t, _)| t)
         .collect();
     let mut dwarves: Vec<_> = view.dwarves.iter().filter(|d| d.idle).collect();
     dwarves.sort_by_key(|d| d.id);
@@ -346,5 +344,18 @@ mod tests {
         let mut m = corridor(10);
         let t = task(&mut m, 4);
         assert!(assign(&view(m, vec![dw(1, 1, true)], vec![], vec![t])).is_empty());
+    }
+
+    #[test]
+    fn undiggable_designation_not_assigned() {
+        let mut m = corridor(10);
+        // Stale designation on a tile already turned into Stair (e.g. under a stairway).
+        m.set(p(2, 0), Tile::Stair);
+        m.designations.insert(p(2, 0), DesignationKind::Dig);
+        let valid = task(&mut m, 8);
+        assert_eq!(
+            assign(&view(m, vec![dw(1, 1, true)], vec![], vec![])),
+            vec![(DwarfId(1), valid)]
+        );
     }
 }

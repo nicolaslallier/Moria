@@ -78,7 +78,7 @@ impl Mountain {
     }
 
     /// Whether `kind` can be applied at `p` right now.
-    fn diggable(&self, p: TilePos, kind: DesignationKind) -> bool {
+    pub fn diggable(&self, p: TilePos, kind: DesignationKind) -> bool {
         match (self.get(p), kind) {
             (Some(t), DesignationKind::Dig) => t.is_solid(),
             (Some(t), DesignationKind::Stairs) => {
@@ -140,6 +140,8 @@ impl Mountain {
                 {
                     res.add(t.yield_());
                     self.set(below, Tile::Stair);
+                    // A designation there could never be dug any more.
+                    self.designations.remove(&below);
                 }
             }
         }
@@ -213,6 +215,15 @@ mod tests {
         m.set(p(0, 0, 2), Tile::Floor);
         assert_eq!(m.dig(p(0, 0, 2), DesignationKind::Stairs), None);
         assert_eq!(m.dig(p(2, 2, 0), DesignationKind::Stairs), None);
+    }
+
+    #[test]
+    fn stairs_clear_designation_below() {
+        let mut m = rock();
+        m.designate(p(1, 1, 1), p(1, 1, 1), DesignationKind::Dig);
+        m.dig(p(1, 1, 0), DesignationKind::Stairs).unwrap();
+        assert_eq!(m.get(p(1, 1, 1)), Some(Tile::Stair));
+        assert!(m.designations.is_empty());
     }
 
     #[test]

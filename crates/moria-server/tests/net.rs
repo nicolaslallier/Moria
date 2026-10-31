@@ -440,13 +440,28 @@ async fn unknown_account_without_create_rejected() {
         let mut c = Client::connect(&s).await;
         assert_eq!(
             c.login("gimli", "secret12").await,
-            ServerMsg::Reject(Reject::UnknownAccount)
+            ServerMsg::Reject(Reject::BadPassword)
         );
     }
     let data = s.data.clone();
     s.stop().await;
     let w = moria_core::world::load(&data).unwrap();
     assert!(w.accounts.is_empty() && w.fortresses.is_empty());
+}
+
+/// No account enumeration: an unknown name and a wrong password get the same reply.
+#[tokio::test]
+async fn unknown_and_wrong_password_look_the_same() {
+    let s = Server::start("enum").await;
+    let (c, _) = Client::new_player(&s, "gimli").await;
+    drop(c);
+    let mut c = Client::connect(&s).await;
+    let wrong = c.login("gimli", "mauvais-mdp").await;
+    let mut c = Client::connect(&s).await;
+    let unknown = c.login("legolas", "mauvais-mdp").await;
+    assert_eq!(wrong, ServerMsg::Reject(Reject::BadPassword));
+    assert_eq!(unknown, wrong);
+    s.stop().await;
 }
 
 #[tokio::test]
@@ -509,5 +524,36 @@ async fn weak_password_rejected_at_creation() {
         c.hello("gimli", "12345678").await,
         ServerMsg::Welcome { .. }
     ));
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn create_hero_flood_keeps_server_usable() {
+    let s = Server::start("hero-flood").await;
+    let (mut a, pos) = Client::new_player(&s, "alice").await;
+    let flood: Vec<u8> = (0..500)
+        .flat_map(|_| {
+            encode(&ClientMsg::CreateHero {
+                race: Race::Dwarf,
+                class: Class::Fighter,
+            })
+        })
+        .collect();
+    a.0.write_all(&flood).await.unwrap();
+    let mut b = Client::connect(&s).await;
+    assert!(matches!(
+        timeout(Duration::from_secs(5), b.hello("bob", "secret12"))
+            .await
+            .expect("login well within the handshake timeout"),
+        ServerMsg::Welcome { .. }
+    ));
+    // The flooding session still works.
+    a.send(&ClientMsg::Move(Dir::S)).await;
+    let want = pos.step(Dir::S);
+    let moved = timeout(Duration::from_secs(10), async {
+        while a.next_tick().await.hero_pos != want {}
+    })
+    .await;
+    assert!(moved.is_ok(), "flooding session stopped working");
     s.stop().await;
 }

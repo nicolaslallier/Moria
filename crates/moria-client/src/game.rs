@@ -10,8 +10,10 @@ use std::collections::VecDeque;
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
 // ponytail: fixed margin; measure real RTT jitter if moves still get dropped server-side.
 pub const MOVE_COOLDOWN: f64 = 0.22;
-/// Ticks after which an unacknowledged predicted move is considered dropped.
-const PENDING_TICKS: u64 = 5;
+/// Ticks after which an unacknowledged predicted move is considered dropped. Bound: the
+/// round trip, plus up to 2 ticks of server cooldown buffering the move, plus margin;
+/// 10 ticks (~1 s) keeps good predictions on links up to ~700 ms RTT.
+const PENDING_TICKS: u64 = 10;
 
 /// Bounds on an untrusted snapshot, well above the real 48×48×8.
 fn valid_view(v: &FortressView) -> bool {
@@ -39,12 +41,13 @@ pub fn reject_fr(r: &Reject) -> String {
         Reject::VersionMismatch { server } => {
             format!("Version différente du serveur (serveur v{server}) — mettez le client à jour")
         }
-        Reject::BadPassword => "Mot de passe incorrect".into(),
+        Reject::BadPassword => {
+            "Pseudo ou mot de passe incorrect — première fois ? utilisez « Créer un compte »".into()
+        }
         Reject::ServerFull => "Serveur plein (10 joueurs)".into(),
         Reject::NoFreeMountain => "Plus de montagne libre".into(),
         Reject::InvalidName => "Nom invalide (3–16 caractères : lettres, chiffres, _ ou -)".into(),
         Reject::BadInvite => "Code d'invitation invalide".into(),
-        Reject::UnknownAccount => "Compte inconnu — utilisez « Créer un compte »".into(),
         Reject::WeakPassword => "Mot de passe trop court (8 caractères minimum)".into(),
     }
 }
@@ -308,7 +311,10 @@ mod tests {
                 Reject::VersionMismatch { server: 3 },
                 "Version différente du serveur (serveur v3) — mettez le client à jour",
             ),
-            (Reject::BadPassword, "Mot de passe incorrect"),
+            (
+                Reject::BadPassword,
+                "Pseudo ou mot de passe incorrect — première fois ? utilisez « Créer un compte »",
+            ),
             (Reject::ServerFull, "Serveur plein (10 joueurs)"),
             (Reject::NoFreeMountain, "Plus de montagne libre"),
             (
@@ -316,10 +322,6 @@ mod tests {
                 "Nom invalide (3–16 caractères : lettres, chiffres, _ ou -)",
             ),
             (Reject::BadInvite, "Code d'invitation invalide"),
-            (
-                Reject::UnknownAccount,
-                "Compte inconnu — utilisez « Créer un compte »",
-            ),
             (
                 Reject::WeakPassword,
                 "Mot de passe trop court (8 caractères minimum)",
@@ -393,13 +395,27 @@ mod tests {
     fn old_pending_expires() {
         let mut g = game();
         g.try_move(Dir::E, 10.0).unwrap();
-        for _ in 0..5 {
+        for _ in 0..PENDING_TICKS {
             g.apply_tick(&tick(p(2, 1, 0)));
             assert_eq!(g.hero.pos, p(3, 1, 0));
         }
-        // The move was dropped server-side: give up after ~5 ticks.
+        // The move was dropped server-side: give up after PENDING_TICKS (~1 s).
         g.apply_tick(&tick(p(2, 1, 0)));
         assert_eq!(g.hero.pos, p(2, 1, 0));
+        assert!(g.pending.is_empty());
+    }
+
+    #[test]
+    fn slow_link_keeps_prediction() {
+        let mut g = game();
+        g.try_move(Dir::E, 10.0).unwrap();
+        // ~800 ms before the server's tick shows the move: the hero never snaps back.
+        for _ in 0..7 {
+            g.apply_tick(&tick(p(2, 1, 0)));
+            assert_eq!(g.hero.pos, p(3, 1, 0));
+        }
+        g.apply_tick(&tick(p(3, 1, 0)));
+        assert_eq!(g.hero.pos, p(3, 1, 0));
         assert!(g.pending.is_empty());
     }
 

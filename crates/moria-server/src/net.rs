@@ -7,7 +7,7 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use moria_core::PlayerId;
 use moria_core::protocol::{
-    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, decode_body, encode, read_frame_async,
+    ClientMsg, PROTOCOL_VERSION, Reject, ServerMsg, decode, encode, read_frame_async,
     read_frame_bytes_async,
 };
 use std::sync::{Arc, LazyLock};
@@ -63,6 +63,23 @@ async fn ask<T>(h: &Handles, make: impl FnOnce(oneshot::Sender<T>) -> Request) -
 /// At most this many argon2 runs at once, whatever the number of handshakes.
 static ARGON: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
+/// Verified against for unknown names, so they cost the same argon2 work as a wrong
+/// password. Hashed lazily, inside the first `blocking` call that needs it.
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    Argon2::default()
+        .hash_password(b"moria-dummy-password")
+        .expect("argon2 dummy hash")
+        .to_string()
+});
+
+fn verify(stored: &str, password: &str) -> bool {
+    PasswordHash::new(stored).is_ok_and(|p| {
+        Argon2::default()
+            .verify_password(password.as_bytes(), &p)
+            .is_ok()
+    })
+}
+
 /// Runs argon2 off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     blocking_on(ARGON.clone(), f).await
@@ -98,9 +115,14 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
         anyhow::Ok(())
     };
     let reader = async {
+        // One CreateHero per session reaches the shared request queue; repeats are dropped
+        // so they cannot crowd out everyone's Lookup/Login.
+        let mut hero_requested = false;
         loop {
             match read_frame_async::<ClientMsg>(&mut rd).await? {
+                ClientMsg::CreateHero { .. } if hero_requested => {}
                 ClientMsg::CreateHero { race, class } => {
+                    hero_requested = true;
                     let r = Request::CreateHero {
                         player,
                         name: display.clone(),
@@ -158,7 +180,7 @@ async fn handshake(
         invite,
         create,
         ..
-    } = decode_body(&buf)?
+    } = decode(&buf)?
     else {
         return Ok(None);
     };
@@ -176,7 +198,9 @@ async fn handshake(
         None => return Ok(None), // server shutting down
         Some(Lookup::Full) => return reject(wr, Reject::ServerFull).await.map(|()| None),
         Some(Lookup::New) if !create => {
-            return reject(wr, Reject::UnknownAccount).await.map(|()| None);
+            // Same work and same reply as a wrong password: no account enumeration.
+            blocking(move || verify(&DUMMY_HASH, &password)).await;
+            return reject(wr, Reject::BadPassword).await.map(|()| None);
         }
         Some(Lookup::New) => {
             if let Some(want) = &h.invite
@@ -199,14 +223,7 @@ async fn handshake(
             }
         }
         Some(Lookup::Existing(stored)) => {
-            let ok = blocking(move || {
-                PasswordHash::new(&stored).is_ok_and(|p| {
-                    Argon2::default()
-                        .verify_password(password.as_bytes(), &p)
-                        .is_ok()
-                })
-            })
-            .await;
+            let ok = blocking(move || verify(&stored, &password)).await;
             if ok != Some(true) {
                 return reject(wr, Reject::BadPassword).await.map(|()| None);
             }
@@ -251,6 +268,73 @@ mod tests {
         })
         .await
         .expect("permit released once the job ends");
+    }
+
+    /// Deterministic: the reader is sequential, so once the trailing Move reaches `cmd`,
+    /// every CreateHero before it has been handled.
+    #[tokio::test]
+    async fn repeated_create_hero_is_ignored() {
+        use super::{Handles, session};
+        use crate::{Lookup, Request};
+        use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION, encode};
+        use moria_core::srd::{Class, Race};
+        use moria_core::{Dir, PlayerId};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::mpsc::{self, error::TryRecvError};
+        use tokio::time::timeout;
+
+        let (req_tx, mut req_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let h = Handles {
+            req: req_tx,
+            cmd: cmd_tx,
+            invite: None,
+        };
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut c = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (srv, _) = l.accept().await.unwrap();
+        tokio::spawn(session(srv, h));
+        c.write_all(&encode(&ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+            name: "gimli".into(),
+            password: "secret12".into(),
+            invite: None,
+            create: true,
+        }))
+        .await
+        .unwrap();
+        // Fake world: answer the handshake, keep the session's queue open.
+        let wait = Duration::from_secs(30); // argon2 in debug builds
+        let Some(Request::Lookup { reply, .. }) = timeout(wait, req_rx.recv()).await.unwrap()
+        else {
+            panic!("expected Lookup")
+        };
+        reply.send(Lookup::New).ok().unwrap();
+        let Some(Request::Login { reply, tx, .. }) = timeout(wait, req_rx.recv()).await.unwrap()
+        else {
+            panic!("expected Login")
+        };
+        reply.send(Ok(PlayerId(0))).unwrap();
+
+        let hero = encode(&ClientMsg::CreateHero {
+            race: Race::Dwarf,
+            class: Class::Fighter,
+        });
+        let mut frames: Vec<u8> = hero.repeat(500);
+        frames.extend(encode(&ClientMsg::Move(Dir::S)));
+        c.write_all(&frames).await.unwrap();
+        let (p, cmd) = timeout(wait, cmd_rx.recv())
+            .await
+            .expect("Move after the flood")
+            .unwrap();
+        assert_eq!(p, PlayerId(0));
+        assert_eq!(cmd, crate::sim::Command::Move(Dir::S));
+        assert!(matches!(req_rx.try_recv(), Ok(Request::CreateHero { .. })));
+        assert!(matches!(req_rx.try_recv(), Err(TryRecvError::Empty)));
+        drop(tx);
     }
 
     #[test]
