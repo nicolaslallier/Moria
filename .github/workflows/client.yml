@@ -51,10 +51,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/moria-client-linux
-            dist/moria-client-windows.exe
+      # Official gh CLI (preinstalled on the runner): no third-party action with contents:write.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            dist/moria-client-linux \
+            dist/moria-client-windows.exe \
             dist/moria-client-macos
-          fail_on_unmatched_files: true
