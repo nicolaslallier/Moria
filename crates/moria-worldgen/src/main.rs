@@ -19,7 +19,8 @@ fn main() {
     let out =
         out.unwrap_or_else(|| die("usage : moria-worldgen --out <fichier> [--seed N] [--force]"));
     if out.exists() && !force {
-        die(&format!("{} existe déjà (utilisez --force)", out.display()));
+        println!("monde déjà présent, rien à faire");
+        return;
     }
     let w = moria_core::world::generate(seed);
     moria_core::world::save(&w, &out)

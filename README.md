@@ -7,18 +7,20 @@ Architecture : `server` (TCP 7777, simulation 10 Hz), `dwarf-ai` (IA des nains v
 ## Premier démarrage
 
 ```sh
-docker compose --profile tools run --rm worldgen   # crée /data/world.bin (refuse d'écraser un monde existant)
 docker compose up -d
-docker compose logs server                          # attendre « serveur prêt sur 0.0.0.0:7777 »
+docker compose logs server    # attendre « serveur prêt sur 0.0.0.0:7777 »
 ```
+
+Le monde est généré automatiquement au premier démarrage (service `worldgen`, qui s'arrête ensuite). Aux démarrages suivants il détecte le monde existant (« monde déjà présent, rien à faire ») et ne l'écrase jamais.
+
+Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-data` (`docker compose down -v`). **Cela détruit définitivement le monde et toutes les forteresses.**
 
 ## Déploiement avec Portainer (192.168.2.10)
 
-1. Portainer > Stacks > Add stack > Repository (ou Web editor avec `docker-compose.yml`).
-2. Dans « Environment variables », ajouter `MORIA_INVITE` (voir ci-dessous).
-3. Déployer la stack, puis lancer une fois la génération du monde : console du dépôt ou
-   `docker compose --profile tools run --rm worldgen` sur l'hôte (même projet, même volume `moria-data`).
-4. Le serveur écoute sur `192.168.2.10:7777`. Seul ce port est publié ; NATS reste sur le réseau interne.
+1. Portainer > Stacks > Add stack > **Repository**.
+2. Repository URL : `https://github.com/nicolaslallier/Moria`, branche `main`, Compose path : `docker-compose.yml`. Si le dépôt est privé, activer « Authentication » et fournir un jeton GitHub (token) à Portainer.
+3. Dans « Environment variables », ajouter `MORIA_INVITE` (voir ci-dessous).
+4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Seul ce port est publié ; NATS reste sur le réseau interne.
 
 ## Code d'invitation
 

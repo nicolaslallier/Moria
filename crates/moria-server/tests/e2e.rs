@@ -64,6 +64,10 @@ async fn start_server(data: &Path) -> (Task, SocketAddr) {
     (Task { stop, done }, addr)
 }
 
+fn rm(data: &Path) {
+    let _ = std::fs::remove_dir_all(data.parent().unwrap());
+}
+
 fn world_file(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("moria-e2e-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -142,6 +146,23 @@ impl Client {
         }
     }
 
+    /// Waits (bounded) until dwarves and tiles have not changed for 30 ticks.
+    async fn quiesce(&mut self) {
+        let snap = |c: &Client| (c.view.dwarves.clone(), c.view.mountain.clone());
+        let mut last = snap(self);
+        let mut calm = 0;
+        for _ in 0..600 {
+            self.pump().await;
+            let now = snap(self);
+            calm = if now == last { calm + 1 } else { 0 };
+            if calm >= 30 {
+                return;
+            }
+            last = now;
+        }
+        panic!("dwarves never went idle");
+    }
+
     async fn until(&mut self, max_ticks: u64, mut cond: impl FnMut(&Client) -> bool) {
         for _ in 0..max_ticks {
             if cond(self) {
@@ -205,6 +226,7 @@ async fn dwarves_dig_designation_via_ai_service() {
     c.until(300, |c| c.dug(&t) == 3).await;
     srv.stop().await;
     ai.stop().await;
+    rm(&data);
 }
 
 #[tokio::test]
@@ -219,7 +241,7 @@ async fn ai_restart_dwarves_pause_then_resume() {
     c.until(300, |c| c.dug(&t) >= 1).await;
 
     ai.stop().await;
-    c.ticks(40).await; // dwarves finish their current task
+    c.quiesce().await; // in-flight assignments have landed and finished
     let settled = c.dug(&t);
     assert!(settled < 12, "AI was killed too late for the test");
     c.ticks(50).await;
@@ -229,6 +251,7 @@ async fn ai_restart_dwarves_pause_then_resume() {
     c.until(600, |c| c.dug(&t) == 12).await;
     srv.stop().await;
     ai.stop().await;
+    rm(&data);
 }
 
 #[tokio::test]
@@ -239,15 +262,27 @@ async fn reconnect_receives_snapshot_with_offline_progress() {
     let ai = start_ai();
     let (srv, addr) = start_server(&data).await;
     let mut c = Client::login(addr, "alice").await;
-    let t = c.designate_near_dwarves(3).await;
-    c.ticks(2).await;
+    let t = c.designate_near_dwarves(12).await;
+    c.ticks(5).await;
+    assert!(c.dug(&t) < 12, "all dug before disconnect");
     drop(c);
 
-    tokio::time::sleep(Duration::from_secs(20)).await;
-    let c = Client::login(addr, "alice").await;
-    assert_eq!(c.dug(&t), 3, "offline progress in snapshot");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let c = Client::login(addr, "alice").await;
+        if c.dug(&t) == 12 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no offline progress in 60 s"
+        );
+        drop(c);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     srv.stop().await;
     ai.stop().await;
+    rm(&data);
 }
 
 #[tokio::test]
@@ -275,4 +310,5 @@ async fn restart_server_restores_fortress() {
     assert!(c.view.resources.stone >= 3);
     assert_eq!(c.view.dwarves.len(), 3);
     srv.stop().await;
+    rm(&data);
 }

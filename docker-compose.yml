@@ -8,7 +8,18 @@ services:
     image: nats:2-alpine
     restart: unless-stopped
 
+  # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
+  worldgen:
+    image: moria-worldgen:local
+    build:
+      <<: *build
+      args: { BIN: moria-worldgen }
+    volumes: ["moria-data:/data"]
+    command: ["--out", "/data/world.bin"]
+    restart: "no"
+
   server:
+    image: moria-server:local
     build:
       <<: *build
       args: { BIN: moria-server }
@@ -18,9 +29,12 @@ services:
       NATS_URL: nats://nats:4222
       MORIA_INVITE: ${MORIA_INVITE:-}
     restart: unless-stopped
-    depends_on: [nats]
+    depends_on:
+      nats: { condition: service_started }
+      worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
+    image: moria-dwarf-ai:local
     build:
       <<: *build
       args: { BIN: moria-dwarf-ai }
@@ -31,13 +45,6 @@ services:
     deploy:
       replicas: 1
 
-  worldgen:
-    build:
-      <<: *build
-      args: { BIN: moria-worldgen }
-    profiles: ["tools"]
-    volumes: ["moria-data:/data"]
-    command: ["--out", "/data/world.bin"]
-
 volumes:
   moria-data:
+    name: moria-data
