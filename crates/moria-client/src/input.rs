@@ -63,6 +63,8 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             Some(DesignationKind::Dig)
         } else if keys.just_pressed(KeyCode::Digit2) {
             Some(DesignationKind::Stairs)
+        } else if keys.just_pressed(KeyCode::Digit3) {
+            Some(DesignationKind::Wall)
         } else {
             None
         },

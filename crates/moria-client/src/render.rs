@@ -17,6 +17,7 @@ fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
         Tile::Gold => (art.rock.clone(), Color::srgb_u8(0xff, 0xc8, 0x30)),
         Tile::Mithril => (art.rock.clone(), Color::srgb_u8(0x60, 0xc0, 0xff)),
         Tile::Stair => (art.stair.clone(), Color::WHITE),
+        Tile::Wall => (art.rock.clone(), Color::srgb(0.85, 0.55, 0.4)),
     }
 }
 
@@ -192,6 +193,7 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
         let color = match k {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),
+            DesignationKind::Wall => Color::srgb(1.0, 0.5, 0.2),
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }

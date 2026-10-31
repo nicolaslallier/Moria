@@ -186,13 +186,18 @@ impl Game {
         None
     }
 
-    /// Hero dig toward the last move direction, only at a solid tile.
+    /// Hero action toward the last move direction: dig a solid tile, or in Wall mode build
+    /// on floor (with stone).
     pub fn dig(&self) -> Option<ClientMsg> {
         let target = self.hero.pos.step(self.last_dir);
-        self.mountain
-            .get(target)
-            .is_some_and(|t| t.is_solid())
-            .then_some(ClientMsg::Dig(self.last_dir))
+        if self.mountain.get(target)?.is_solid() {
+            Some(ClientMsg::Dig(self.last_dir))
+        } else {
+            (self.mode == DesignationKind::Wall
+                && self.mountain.diggable(target, DesignationKind::Wall)
+                && self.resources.stone > 0)
+                .then_some(ClientMsg::Build(self.last_dir))
+        }
     }
 }
 
@@ -513,6 +518,13 @@ mod tests {
         let mut g = game();
         g.last_dir = Dir::E;
         assert_eq!(g.dig(), None); // (3,1) is floor
+        // In Wall mode the hero builds on floor, given stone.
+        g.mode = DesignationKind::Wall;
+        assert_eq!(g.dig(), None);
+        g.resources.stone = 1;
+        assert_eq!(g.dig(), Some(ClientMsg::Build(Dir::E)));
+        g.last_dir = Dir::N; // rock: Wall mode still digs
+        assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::N)));
     }
 
     #[test]
