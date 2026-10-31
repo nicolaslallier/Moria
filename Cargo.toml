@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["full"] }
+async-nats = "0.38"
+rand = "0.9"
+rand_chacha = "0.9"
+argon2 = "0.5"
+thiserror = "2"
