@@ -10,7 +10,6 @@ async-nats = "0.51"
 rand = "0.10"
 rand_chacha = "0.10"
 argon2 = "0.6"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

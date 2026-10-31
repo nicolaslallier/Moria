@@ -8,6 +8,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
+/// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
+pub const SAVE_VERSION: u32 = 1;
 const GRID: i32 = 4;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -172,7 +174,8 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
 }
 
 pub fn save(w: &World, path: &Path) -> io::Result<()> {
-    let bytes = postcard::to_allocvec(w).map_err(io::Error::other)?;
+    let mut bytes = SAVE_VERSION.to_le_bytes().to_vec();
+    bytes.extend(postcard::to_allocvec(w).map_err(io::Error::other)?);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -183,7 +186,15 @@ pub fn save(w: &World, path: &Path) -> io::Result<()> {
 }
 
 pub fn load(path: &Path) -> io::Result<World> {
-    postcard::from_bytes(&std::fs::read(path)?).map_err(io::Error::other)
+    let bytes = std::fs::read(path)?;
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    let Some((v, body)) = bytes.split_first_chunk::<4>() else {
+        return Err(bad("fichier de sauvegarde tronqué".into()));
+    };
+    match u32::from_le_bytes(*v) {
+        SAVE_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+        n => Err(bad(format!("format de sauvegarde v{n} non supporté"))),
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +271,22 @@ mod tests {
         let p = tmpdir("rt").join("w.bin");
         save(&w, &p).unwrap();
         assert_eq!(load(&p).unwrap(), w);
+    }
+
+    #[test]
+    fn save_has_version_and_unknown_version_is_refused() {
+        let p = tmpdir("version").join("w.bin");
+        save(&generate(3), &p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(bytes[..4], SAVE_VERSION.to_le_bytes());
+        let mut other = 2u32.to_le_bytes().to_vec();
+        other.extend(&bytes[4..]);
+        std::fs::write(&p, other).unwrap();
+        let e = load(&p).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(e.to_string(), "format de sauvegarde v2 non supporté");
+        std::fs::write(&p, [1u8, 0]).unwrap(); // too short for a version
+        assert!(load(&p).is_err());
     }
 
     #[test]
