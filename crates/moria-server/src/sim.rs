@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 
 const MOVE_COOLDOWN: u8 = 2;
 const STAIRS_EXTRA_TICKS: u16 = 10;
+const WALL_BUILD_TICKS: u16 = 15;
 const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
 
 /// `ClientMsg` minus the handshake messages.
@@ -181,10 +182,11 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
             .dwarves
             .iter()
             .any(|d| d.task.as_ref().is_some_and(|t| t.target == target));
-        let under_occupant = kind == DesignationKind::Stairs
+        let under_occupant = kind != DesignationKind::Dig
             && (f.hero.as_ref().is_some_and(|h| h.pos == target)
                 || f.dwarves.iter().any(|d| d.pos == target));
-        if taken || under_occupant {
+        let no_stone = kind == DesignationKind::Wall && f.resources.stone == 0;
+        if taken || under_occupant || no_stone {
             continue;
         }
         let Some(d) = f
@@ -328,17 +330,23 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 let needed = match task.kind {
                     DesignationKind::Dig => base,
                     DesignationKind::Stairs => base.saturating_add(STAIRS_EXTRA_TICKS),
+                    DesignationKind::Wall => WALL_BUILD_TICKS,
                 };
                 if task.progress >= needed {
-                    let blocked = task.kind == DesignationKind::Stairs
+                    let wall = task.kind == DesignationKind::Wall;
+                    let blocked = task.kind != DesignationKind::Dig
                         && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
-                            || f.dwarves.iter().any(|d| d.pos == task.target));
+                            || f.dwarves.iter().any(|d| d.pos == task.target))
+                        || (wall && f.resources.stone == 0);
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked
                         && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
+                        if wall {
+                            f.resources.stone -= 1;
+                        }
                     }
                     continue;
                 }
@@ -653,6 +661,35 @@ mod tests {
             step(&mut w);
         }
         assert_eq!(tile(&w, t), Tile::Stair);
+    }
+
+    #[test]
+    fn dwarf_builds_wall_with_stone() {
+        let mut w = setup();
+        let t = p(5, 24, 0);
+        designate(&mut w, t, DesignationKind::Wall);
+        let id = w.fortresses[&M].dwarves[0].id;
+        let assign = |w: &mut World| {
+            apply_assignments(
+                w,
+                &Assignments {
+                    mountain: M,
+                    tick: 0,
+                    list: vec![(id, t)],
+                },
+            )
+        };
+        // No stone: not assigned, the designation waits.
+        assign(&mut w);
+        assert!(w.fortresses[&M].dwarves[0].task.is_none());
+        w.fortresses.get_mut(&M).unwrap().resources.stone = 2;
+        assign(&mut w);
+        for _ in 0..60 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, t), Tile::Wall);
+        assert_eq!(w.fortresses[&M].resources.stone, 1);
+        assert!(!w.mountains[&M].designations.contains_key(&t));
     }
 
     #[test]

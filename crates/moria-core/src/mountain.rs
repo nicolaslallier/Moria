@@ -84,6 +84,7 @@ impl Mountain {
             (Some(t), DesignationKind::Stairs) => {
                 (t.is_solid() || t == Tile::Floor) && p.z + 1 < self.d
             }
+            (Some(t), DesignationKind::Wall) => t == Tile::Floor,
             (None, _) => false,
         }
     }
@@ -131,6 +132,8 @@ impl Mountain {
         let mut res = self.get(p)?.yield_();
         match kind {
             DesignationKind::Dig => self.set(p, Tile::Floor),
+            // The stone cost is paid by the caller, which holds the resources.
+            DesignationKind::Wall => self.set(p, Tile::Wall),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
@@ -224,6 +227,23 @@ mod tests {
         m.dig(p(1, 1, 0), DesignationKind::Stairs).unwrap();
         assert_eq!(m.get(p(1, 1, 1)), Some(Tile::Stair));
         assert!(m.designations.is_empty());
+    }
+
+    #[test]
+    fn wall_only_on_floor_and_digs_back_to_stone() {
+        let mut m = rock();
+        m.set(p(1, 1, 0), Tile::Floor);
+        assert_eq!(
+            m.designate(p(0, 1, 0), p(1, 1, 0), DesignationKind::Wall),
+            1
+        );
+        assert_eq!(
+            m.dig(p(1, 1, 0), DesignationKind::Wall),
+            Some(Resources::default())
+        );
+        assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Wall));
+        assert!(!m.walkable(p(1, 1, 0)));
+        assert_eq!(m.dig(p(1, 1, 0), DesignationKind::Dig).unwrap().stone, 1);
     }
 
     #[test]

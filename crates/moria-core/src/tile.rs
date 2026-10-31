@@ -7,6 +7,8 @@ pub enum Tile {
     Mithril,
     Floor,
     Stair,
+    /// Built by dwarves from stone; dug back like rock.
+    Wall,
 }
 
 #[derive(
@@ -30,26 +32,29 @@ impl Resources {
 pub enum DesignationKind {
     Dig,
     Stairs,
+    /// Build a wall on a floor tile; costs 1 stone.
+    Wall,
 }
 
 impl DesignationKind {
-    /// The other mode: what X / the gamepad's north button switch to.
+    /// The next mode: what X / the gamepad's north button switch to.
     pub fn toggled(self) -> Self {
         match self {
             Self::Dig => Self::Stairs,
-            Self::Stairs => Self::Dig,
+            Self::Stairs => Self::Wall,
+            Self::Wall => Self::Dig,
         }
     }
 }
 
 impl Tile {
     pub fn is_solid(self) -> bool {
-        matches!(self, Tile::Rock | Tile::Gold | Tile::Mithril)
+        matches!(self, Tile::Rock | Tile::Gold | Tile::Mithril | Tile::Wall)
     }
 
     pub fn dig_ticks(self) -> u16 {
         match self {
-            Tile::Rock => 10,
+            Tile::Rock | Tile::Wall => 10,
             Tile::Gold => 15,
             Tile::Mithril => 25,
             Tile::Floor | Tile::Stair => 0,
@@ -59,7 +64,7 @@ impl Tile {
     pub fn yield_(self) -> Resources {
         let mut r = Resources::default();
         match self {
-            Tile::Rock => r.stone = 1,
+            Tile::Rock | Tile::Wall => r.stone = 1,
             Tile::Gold => r.gold = 1,
             Tile::Mithril => r.mithril = 1,
             Tile::Floor | Tile::Stair => {}
