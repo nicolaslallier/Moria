@@ -5,10 +5,24 @@ use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::protocol::{ClientMsg, FortressView, HeroView, Reject, ServerMsg, TickDelta};
 use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, TilePos};
+use std::collections::VecDeque;
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
 // ponytail: fixed margin; measure real RTT jitter if moves still get dropped server-side.
 pub const MOVE_COOLDOWN: f64 = 0.22;
+/// Ticks after which an unacknowledged predicted move is considered dropped.
+const PENDING_TICKS: u64 = 5;
+
+/// Bounds on an untrusted snapshot, well above the real 48×48×8.
+fn valid_view(v: &FortressView) -> bool {
+    let (w, h, d) = v.mountain.size();
+    v.mountain.is_consistent()
+        && (1..=256).contains(&w)
+        && (1..=256).contains(&h)
+        && (1..=64).contains(&d)
+        && v.mountain.in_bounds(v.hero.pos)
+        && v.dwarves.len() <= 1024
+}
 
 #[derive(States, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Screen {
@@ -58,11 +72,17 @@ pub struct Game {
     /// `Some` while the player browses another level than the hero's.
     pub browse_z: Option<u8>,
     last_move: f64,
+    /// Last hero position reported by the server.
+    pub confirmed: TilePos,
+    /// Predicted positions not yet seen in a tick, with the local tick count at send.
+    pub pending: VecDeque<(TilePos, u64)>,
+    ticks: u64,
 }
 
 impl Game {
     pub fn new(v: FortressView) -> Self {
         Self {
+            confirmed: v.hero.pos,
             mountain: v.mountain,
             hero: v.hero,
             dwarves: v.dwarves,
@@ -71,6 +91,8 @@ impl Game {
             mode: DesignationKind::Dig,
             browse_z: None,
             last_move: f64::NEG_INFINITY,
+            pending: VecDeque::new(),
+            ticks: 0,
         }
     }
 
@@ -78,8 +100,9 @@ impl Game {
         self.browse_z.unwrap_or(self.hero.pos.z)
     }
 
-    /// Server state wins: tiles, designations, dwarves, resources, and the hero snaps to
-    /// the authoritative position.
+    /// Server state wins for the map, dwarves and resources. The hero is reconciled: a
+    /// tick that predates our pending moves keeps the prediction, an ack drains it, and a
+    /// divergent or long-unacked position snaps to the server's.
     pub fn apply_tick(&mut self, d: &TickDelta) {
         for &(p, t) in &d.tiles {
             self.mountain.set(p, t);
@@ -90,9 +113,28 @@ impl Game {
         for &(p, k) in &d.designations_added {
             self.mountain.designations.insert(p, k);
         }
-        self.dwarves.clone_from(&d.dwarves);
+        self.dwarves.clear();
+        let m = &self.mountain;
+        self.dwarves
+            .extend(d.dwarves.iter().filter(|(_, p)| m.in_bounds(*p)));
         self.resources = d.resources;
-        self.hero.pos = d.hero_pos;
+        self.ticks += 1;
+        let s = d.hero_pos;
+        if !self.mountain.in_bounds(s) {
+            return;
+        }
+        if let Some(i) = self.pending.iter().position(|&(p, _)| p == s) {
+            self.pending.drain(..=i);
+        } else if s != self.confirmed
+            || self
+                .pending
+                .front()
+                .is_some_and(|&(_, t)| self.ticks - t > PENDING_TICKS)
+        {
+            self.pending.clear();
+        }
+        self.confirmed = s;
+        self.hero.pos = self.pending.back().map_or(s, |p| p.0);
     }
 
     /// Predicted move at time `now` (seconds): applied locally and returned for sending
@@ -106,6 +148,7 @@ impl Game {
         }
         self.last_move = now;
         self.hero.pos = self.hero.pos.step(dir);
+        self.pending.push_back((self.hero.pos, self.ticks));
         if matches!(dir, Dir::Up | Dir::Down) {
             self.browse_z = None;
         }
@@ -121,7 +164,7 @@ impl Game {
         let z = self.current_z();
         let z = match dir {
             Dir::Up => z.saturating_sub(1),
-            _ => (z + 1).min(depth - 1),
+            _ => z.saturating_add(1).min(depth.saturating_sub(1)),
         };
         self.browse_z = (z != self.hero.pos.z).then_some(z);
         None
@@ -144,6 +187,8 @@ pub struct Session {
     /// Login error or disconnect reason, in French.
     pub error: Option<String>,
     pub game: Option<Game>,
+    /// Bumped on every accepted snapshot so the renderer rebuilds the map.
+    pub snapshots: u32,
 }
 
 impl Session {
@@ -161,7 +206,15 @@ impl Session {
                 self.end(Screen::Login, reject_fr(&r));
                 true
             }
+            NetEvent::Msg(ServerMsg::Snapshot(v)) if !valid_view(&v) => {
+                self.end(
+                    Screen::Disconnected,
+                    "Données invalides reçues du serveur".into(),
+                );
+                true
+            }
             NetEvent::Msg(ServerMsg::Snapshot(v)) => {
+                self.snapshots += 1;
                 self.game = Some(Game::new(*v));
                 self.screen = Screen::Playing;
                 false
@@ -261,8 +314,115 @@ mod tests {
         let mut g = game();
         assert_eq!(g.try_move(Dir::E, 10.0), Some(ClientMsg::Move(Dir::E)));
         assert_eq!(g.hero.pos, p(3, 1, 0));
+        // A position neither confirmed nor predicted: the server wins.
+        g.apply_tick(&tick(p(1, 1, 0)));
+        assert_eq!(g.hero.pos, p(1, 1, 0));
+    }
+
+    #[test]
+    fn stale_tick_keeps_prediction() {
+        let mut g = game();
+        g.try_move(Dir::E, 10.0).unwrap();
+        // The server has not seen the move yet: it still reports the old position.
+        g.apply_tick(&tick(p(2, 1, 0)));
+        assert_eq!(g.hero.pos, p(3, 1, 0));
+        // The next prediction starts from the predicted position.
+        assert_eq!(g.try_move(Dir::E, 11.0), None); // (4,1) is rock
+        assert_eq!(g.try_move(Dir::W, 12.0), Some(ClientMsg::Move(Dir::W)));
+        assert_eq!(g.hero.pos, p(2, 1, 0));
+    }
+
+    #[test]
+    fn ack_tick_drains_pending() {
+        let mut g = game();
+        g.try_move(Dir::E, 10.0).unwrap();
+        g.try_move(Dir::W, 11.0).unwrap();
+        g.apply_tick(&tick(p(3, 1, 0)));
+        assert_eq!(g.hero.pos, p(2, 1, 0)); // the W move is still pending
         g.apply_tick(&tick(p(2, 1, 0)));
         assert_eq!(g.hero.pos, p(2, 1, 0));
+        assert!(g.pending.is_empty());
+        assert_eq!(g.confirmed, p(2, 1, 0));
+    }
+
+    #[test]
+    fn divergent_tick_snaps_and_clears() {
+        let mut g = game();
+        g.try_move(Dir::E, 10.0).unwrap();
+        g.apply_tick(&tick(p(1, 1, 0)));
+        assert_eq!(g.hero.pos, p(1, 1, 0));
+        assert!(g.pending.is_empty());
+    }
+
+    #[test]
+    fn old_pending_expires() {
+        let mut g = game();
+        g.try_move(Dir::E, 10.0).unwrap();
+        for _ in 0..5 {
+            g.apply_tick(&tick(p(2, 1, 0)));
+            assert_eq!(g.hero.pos, p(3, 1, 0));
+        }
+        // The move was dropped server-side: give up after ~5 ticks.
+        g.apply_tick(&tick(p(2, 1, 0)));
+        assert_eq!(g.hero.pos, p(2, 1, 0));
+        assert!(g.pending.is_empty());
+    }
+
+    #[test]
+    fn tick_ignores_out_of_bounds_positions() {
+        let mut g = game();
+        let mut d = tick(p(99, 1, 0));
+        d.dwarves = vec![(DwarfId(1), p(3, 1, 0)), (DwarfId(2), p(-1, 0, 0))];
+        g.apply_tick(&d);
+        assert_eq!(g.hero.pos, p(2, 1, 0));
+        assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0))]);
+    }
+
+    #[test]
+    fn invalid_snapshot_disconnects() {
+        let view = |m: Mountain| {
+            let g = game();
+            NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+                mountain: m,
+                hero: g.hero,
+                dwarves: vec![],
+                resources: Resources::default(),
+            })))
+        };
+        // Tile vec not matching the dimensions (only possible via deserialization).
+        let mut bytes = moria_core::protocol::encode(&game().mountain);
+        assert_eq!(bytes[5], 12); // w = 6, zigzag varint, after the 4-byte length and id
+        bytes[5] = 14;
+        let bad: Mountain = moria_core::protocol::read_frame(&mut &bytes[..]).unwrap();
+        assert!(!bad.is_consistent());
+        let mut hero_outside = Mountain::new(MountainId(0), 2, 2, 1, Tile::Floor);
+        hero_outside.set(p(0, 0, 0), Tile::Rock);
+        for m in [
+            bad,
+            Mountain::new(MountainId(0), 6, 6, 0, Tile::Rock),
+            Mountain::new(MountainId(0), 300, 6, 3, Tile::Rock),
+            Mountain::new(MountainId(0), 6, 6, 65, Tile::Rock),
+            hero_outside,
+        ] {
+            let mut s = Session {
+                screen: Screen::CreateHero,
+                ..Default::default()
+            };
+            assert!(s.handle(view(m)));
+            assert_eq!(s.screen, Screen::Disconnected);
+            assert_eq!(
+                s.error.as_deref(),
+                Some("Données invalides reçues du serveur")
+            );
+            assert!(s.game.is_none());
+        }
+        let mut s = Session::default();
+        let NetEvent::Msg(ServerMsg::Snapshot(mut v)) = view(game().mountain) else {
+            unreachable!()
+        };
+        v.dwarves = vec![(DwarfId(0), p(2, 1, 0)); 1025];
+        assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v))));
+        assert_eq!(s.screen, Screen::Disconnected);
     }
 
     #[test]

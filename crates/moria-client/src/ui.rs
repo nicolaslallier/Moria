@@ -59,9 +59,21 @@ fn prefs_path() -> Option<PathBuf> {
     )
 }
 
+/// Used when the binary's folder is not writable.
+fn fallback_prefs_path() -> Option<PathBuf> {
+    let dir = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("APPDATA")?)
+    } else {
+        PathBuf::from(std::env::var_os("HOME")?).join(".config")
+    };
+    Some(dir.join("moria").join("prefs"))
+}
+
 fn load_prefs() -> LoginForm {
-    let text = prefs_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    let text = [prefs_path(), fallback_prefs_path()]
+        .into_iter()
+        .flatten()
+        .find_map(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
     let mut l = text.lines().map(str::to_owned);
     LoginForm {
@@ -75,10 +87,19 @@ fn load_prefs() -> LoginForm {
     }
 }
 
+/// Never contains the password.
 fn save_prefs(f: &LoginForm) {
-    if let Some(p) = prefs_path() {
-        // Best effort: a read-only install folder only loses the convenience.
-        let _ = std::fs::write(p, format!("{}\n{}\n{}\n", f.addr, f.name, f.invite));
+    let text = format!("{}\n{}\n{}\n", f.addr, f.name, f.invite);
+    if prefs_path().is_some_and(|p| std::fs::write(p, &text).is_ok()) {
+        return;
+    }
+    if let Some(p) = fallback_prefs_path() {
+        // Best effort: losing the prefs only costs some typing.
+        let _ = p
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::write(&p, &text));
     }
 }
 

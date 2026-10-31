@@ -5,7 +5,7 @@ use moria_core::ai::Assignments;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, TickDelta};
 use moria_core::srd::hero_dig_ticks;
-use moria_core::world::{DigJob, DwarfTask, World};
+use moria_core::world::{DigJob, DwarfTask, Hero, World};
 use moria_core::{DesignationKind, Dir, Mountain, MountainId, Resources, Tile, TilePos};
 use std::collections::{BTreeMap, HashSet};
 
@@ -94,14 +94,10 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         return ch;
     };
     match c {
-        Command::Move(d) => {
-            if h.move_cooldown == 0 && mt.can_move(h.pos, d) {
-                h.pos = h.pos.step(d);
-                h.move_cooldown = MOVE_COOLDOWN;
-                h.dig = None;
-            }
-        }
+        Command::Move(d) if h.move_cooldown > 0 => h.pending_move = Some(d),
+        Command::Move(d) => hero_move(h, mt, d),
         Command::Dig(d) => {
+            h.pending_move = None;
             if matches!(d, Dir::Up | Dir::Down) {
                 return ch;
             }
@@ -131,6 +127,15 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         Command::Cancel { a, b } => ch.removed = mt.cancel_designations(a, b),
     }
     ch
+}
+
+fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
+    h.pending_move = None;
+    if mt.can_move(h.pos, d) {
+        h.pos = h.pos.step(d);
+        h.move_cooldown = MOVE_COOLDOWN;
+        h.dig = None;
+    }
 }
 
 /// Whether the target of a task can still be dug as `kind`.
@@ -253,6 +258,12 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
 
         if let Some(h) = f.hero.as_mut() {
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
+            // A Move that arrived during the cooldown (network jitter) is not lost.
+            if h.move_cooldown == 0
+                && let Some(d) = h.pending_move
+            {
+                hero_move(h, m, d);
+            }
             if let Some(j) = h.dig.as_mut() {
                 match m.get(j.target).filter(|t| t.is_solid()) {
                     None => h.dig = None,
@@ -372,6 +383,7 @@ mod tests {
             pos: p(2, 23, 0),
             dig: None,
             move_cooldown: 0,
+            pending_move: None,
         });
         w
     }
@@ -407,6 +419,34 @@ mod tests {
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::E));
         assert_eq!(hero(&w).pos, p(4, 23, 0));
+    }
+
+    #[test]
+    fn move_during_cooldown_is_buffered_not_dropped() {
+        let mut w = setup();
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        // Two moves during the cooldown: only the latest is kept.
+        apply_command(&mut w, M, Command::Move(Dir::W));
+        apply_command(&mut w, M, Command::Move(Dir::E));
+        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        let d = step(&mut w);
+        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        assert_eq!(d[&M].hero_pos, p(3, 23, 0));
+        let d = step(&mut w);
+        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        assert_eq!(d[&M].hero_pos, p(4, 23, 0));
+        assert_eq!(hero(&w).pending_move, None);
+        step(&mut w);
+        step(&mut w);
+        assert_eq!(hero(&w).pos, p(4, 23, 0)); // applied once only
+        // A Dig clears the buffered move.
+        apply_command(&mut w, M, Command::Move(Dir::W));
+        step(&mut w);
+        apply_command(&mut w, M, Command::Move(Dir::W));
+        apply_command(&mut w, M, Command::Dig(Dir::N));
+        step(&mut w);
+        step(&mut w);
+        assert_eq!(hero(&w).pos, p(3, 23, 0));
     }
 
     #[test]
@@ -797,6 +837,7 @@ mod tests {
                 pos: p(2, 23, 0),
                 dig: None,
                 move_cooldown: 0,
+                pending_move: None,
             });
             let m = w.mountains.get_mut(&id).unwrap();
             for k in 0..50 {

@@ -358,6 +358,7 @@ impl State {
                     pos,
                     dig: None,
                     move_cooldown: 0,
+                    pending_move: None,
                 });
                 self.send_snapshot(player, m);
             }

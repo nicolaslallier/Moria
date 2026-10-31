@@ -45,23 +45,23 @@ fn keyboard(
     let Some(g) = &mut client.session.game else {
         return;
     };
-    let mut out = None;
+    let mut out = vec![];
     // Held keys keep walking; the cooldown paces them.
     if let Some(&(_, _, d)) = MOVES
         .iter()
         .find(|(a, b, _)| keys.pressed(*a) || keys.pressed(*b))
     {
-        out = g.try_move(d, now);
+        out.extend(g.try_move(d, now));
     }
     let ch = |s: &str| logical.just_pressed(Key::Character(s.into()));
     if ch("<") || keys.just_pressed(KeyCode::KeyQ) {
-        out = g.vertical(Dir::Up, now);
+        out.extend(g.vertical(Dir::Up, now));
     }
     if ch(">") || keys.just_pressed(KeyCode::KeyE) {
-        out = g.vertical(Dir::Down, now);
+        out.extend(g.vertical(Dir::Down, now));
     }
     if keys.just_pressed(KeyCode::Space) {
-        out = g.dig();
+        out.extend(g.dig());
     }
     if keys.just_pressed(KeyCode::Digit1) {
         g.mode = DesignationKind::Dig;
@@ -75,7 +75,7 @@ fn keyboard(
             DesignationKind::Stairs => DesignationKind::Dig,
         };
     }
-    if let Some(m) = out {
+    for m in out {
         client.send(m);
     }
 }

@@ -41,6 +41,9 @@ pub struct Hero {
     pub pos: TilePos,
     pub dig: Option<DigJob>,
     pub move_cooldown: u8,
+    /// Latest Move received during the cooldown, applied when it ends. Not saved.
+    #[serde(skip)]
+    pub pending_move: Option<Dir>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

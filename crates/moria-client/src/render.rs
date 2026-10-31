@@ -42,10 +42,15 @@ enum Mark {
 }
 
 pub fn plugin(app: &mut App) {
-    app.add_systems(OnEnter(Screen::Playing), spawn_map)
+    app.init_resource::<Built>()
+        .add_systems(OnExit(Screen::Playing), |mut b: ResMut<Built>| b.0 = 0)
         .add_systems(
             Update,
-            (sync_tiles, sync_marks, follow_camera, draw_outlines)
+            (
+                spawn_map,
+                (sync_tiles, sync_marks, follow_camera, draw_outlines),
+            )
+                .chain()
                 .after(crate::input::InputSet)
                 .run_if(in_state(Screen::Playing)),
         );
@@ -57,13 +62,35 @@ fn glyph(c: &str, color: Color) -> impl Bundle {
         TextFont::from_font_size(14.0),
         TextColor(color),
         DespawnOnExit(Screen::Playing),
+        MapPart,
     )
 }
 
-fn spawn_map(mut commands: Commands, client: Res<Client>) {
+/// Everything `spawn_map` must clear before a rebuild.
+#[derive(Component)]
+struct MapPart;
+
+/// `Session::snapshots` value the map sprites were built for (0: none).
+#[derive(Resource, Default)]
+struct Built(u32);
+
+/// (Re)builds the sprites on entering Playing and on every new snapshot.
+fn spawn_map(
+    mut commands: Commands,
+    client: Res<Client>,
+    mut built: ResMut<Built>,
+    old: Query<Entity, With<MapPart>>,
+) {
     let Some(g) = &client.session.game else {
         return;
     };
+    if built.0 == client.session.snapshots {
+        return;
+    }
+    built.0 = client.session.snapshots;
+    for e in &old {
+        commands.entity(e).despawn();
+    }
     let (w, h, _) = g.mountain.size();
     for y in 0..h {
         for x in 0..w {
@@ -72,6 +99,7 @@ fn spawn_map(mut commands: Commands, client: Res<Client>) {
                 Transform::from_translation(to_world(x, y).extend(0.0)),
                 TileSprite { x, y, shown: None },
                 DespawnOnExit(Screen::Playing),
+                MapPart,
             ));
         }
     }
