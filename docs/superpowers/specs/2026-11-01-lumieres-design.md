@@ -28,7 +28,7 @@ Aujourd'hui, tout l'étage affiché est visible en permanence, de jour comme de 
 - **[Proposé]** Dans une zone en souvenir, les **têtes des nains sont cachées** : on ne voit les nains que là où il y a de la lumière (et un nain éclaire toujours sa propre case). Les **contours de désignation restent visibles** dans le souvenir, pour qu'on puisse planifier un tunnel.
 - **[Proposé]** Le souvenir est **propre à chaque joueur** et se **garde d'une connexion à l'autre** : le client l'enregistre dans un fichier local, par serveur et par compte. Le perdre à chaque reconnexion rendrait le souvenir presque inutile.
 - **[Proposé]** Le souvenir sert aussi la nuit **dehors** : une forêt explorée le jour reste visible en sombre la nuit.
-- **[Au constructeur]** Le format du fichier de souvenir (un bit par case suffit : 176 × 96 × 8 étages ≈ 17 ko).
+- **[Au constructeur]** Le format du fichier de souvenir (un bit par case suffit : 176 × 96 × 12 étages ≈ 25 ko).
 
 ## 3. Le jour, la nuit et les mines
 
