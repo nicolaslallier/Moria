@@ -315,11 +315,16 @@ fn add_iron_and_coal(w: &mut World) {
 }
 
 /// The version header of a save file; `None` if the file does not exist.
+/// `Some(0)` means no readable version (file shorter than 4 bytes); `SAVE_VERSION` is never 0.
 pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
     use std::io::Read;
     let mut b = [0u8; 4];
     match std::fs::File::open(path) {
-        Ok(mut f) => f.read_exact(&mut b).map(|_| Some(u32::from_le_bytes(b))),
+        Ok(mut f) => match f.read_exact(&mut b) {
+            Ok(()) => Ok(Some(u32::from_le_bytes(b))),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Some(0)),
+            Err(e) => Err(e),
+        },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -439,6 +444,7 @@ mod tests {
                 }
                 if matches!(t, Tile::IronOre | Tile::Coal) {
                     assert_eq!(b, Tile::Rock, "{p:?}");
+                    assert!(p.x >= ENTRANCE_X.start || p.z > GROUND_Z + 2, "{p:?}");
                 }
             }
             assert!(n.0 > 0 && n.1 > 0, "{id:?}");
@@ -451,6 +457,10 @@ mod tests {
         assert_eq!(save_version(&p).unwrap(), None);
         std::fs::write(&p, 2u32.to_le_bytes()).unwrap();
         assert_eq!(save_version(&p).unwrap(), Some(2));
+        std::fs::write(&p, [2u8, 0]).unwrap();
+        assert_eq!(save_version(&p).unwrap(), Some(0));
+        std::fs::write(&p, []).unwrap();
+        assert_eq!(save_version(&p).unwrap(), Some(0));
     }
 
     #[test]
