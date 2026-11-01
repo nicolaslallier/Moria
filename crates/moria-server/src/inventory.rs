@@ -15,6 +15,9 @@ pub struct InvSync {
     seeded: BTreeSet<MountainId>,
     outbox: Vec<Batch>,
     before: BTreeMap<MountainId, Resources>,
+    /// No bus: `Fortress.resources` stays authoritative and nothing is cached or batched.
+    disabled: bool,
+    dropped_seen: u64,
 }
 
 impl InvSync {
@@ -26,6 +29,15 @@ impl InvSync {
             seeded: BTreeSet::new(),
             outbox: Vec::new(),
             before: BTreeMap::new(),
+            disabled: false,
+            dropped_seen: 0,
+        }
+    }
+
+    pub fn disabled() -> InvSync {
+        InvSync {
+            disabled: true,
+            ..InvSync::new("", 0)
         }
     }
 
@@ -34,6 +46,9 @@ impl InvSync {
     /// `end_tick` (anything outside is overwritten by the view or never batched). Task 9's
     /// order: begin_tick -> requests/commands -> sim::step -> end_tick.
     pub fn begin_tick(&mut self, w: &mut World) {
+        if self.disabled {
+            return;
+        }
         for (&m, f) in &w.fortresses {
             if self.seeded.insert(m) {
                 let b = self.cache.push(m, f.resources, Resources::default(), true);
@@ -51,6 +66,9 @@ impl InvSync {
     /// See `begin_tick` for the contract on when `Fortress.resources` may change.
     // ponytail: net diff per tick, so add-then-take inside one tick clamps on the net; fine unless a tick both exhausts and refills a resource
     pub fn end_tick(&mut self, w: &World) -> Vec<Batch> {
+        if self.disabled {
+            return Vec::new();
+        }
         let mut out = std::mem::take(&mut self.outbox);
         for (&m, f) in &w.fortresses {
             // A fortress claimed mid-run is not in `before`: the next begin_tick seeds it.
@@ -61,6 +79,14 @@ impl InvSync {
             if add != Resources::default() || take != Resources::default() {
                 out.push(self.cache.push(m, add, take, false));
             }
+        }
+        let dropped = self.cache.dropped();
+        if dropped > self.dropped_seen {
+            tracing::error!(
+                "inventaire injoignable: {} lots non confirmes oubliés par le cache (total {dropped})",
+                dropped - self.dropped_seen
+            );
+            self.dropped_seen = dropped;
         }
         out
     }
@@ -113,6 +139,21 @@ mod tests {
             st.apply(b);
         }
         inv.on_state(st.clone());
+    }
+
+    #[test]
+    fn disabled_sync_leaves_resources_alone_and_keeps_nothing() {
+        let mut w = world(food(12));
+        let mut inv = InvSync::disabled();
+        for _ in 0..50 {
+            inv.begin_tick(&mut w);
+            w.fortresses.get_mut(&M).unwrap().resources.add(stone(1));
+            assert!(inv.end_tick(&w).is_empty());
+        }
+        assert_eq!(res(&w).stone, 50);
+        assert_eq!(res(&w).food, 12);
+        assert_eq!(inv.cache.pending_len(), 0);
+        assert!(!inv.inventory_up(Instant::now()));
     }
 
     #[test]

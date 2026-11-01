@@ -228,12 +228,18 @@ pub async fn run_with_listener(
         }
     });
 
-    // Strictly increases per run: the inventory tells runs apart by it.
+    // Wall-clock ms: the inventory tells runs apart by it (not monotonic if the clock is set back).
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
+    tracing::info!("époque de l'inventaire : {epoch}");
+    let inv = if cfg.amqp_url.is_some() {
+        InvSync::new("server", epoch)
+    } else {
+        InvSync::disabled()
+    };
     let state = State {
-        inv: InvSync::new("server", epoch),
+        inv,
         batch_tx,
         states_rx,
         w,

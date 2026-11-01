@@ -1,12 +1,17 @@
 use crate::inventory::{Batch, State};
 use crate::{MountainId, Resources};
+use std::collections::VecDeque;
+
+/// Unacked batches kept; beyond it the oldest go (already published, the next ack heals the view).
+pub const MAX_PENDING: usize = 50_000;
 
 /// Server-side view of the inventory: confirmed state plus batches not yet acked.
 pub struct Cache {
     sender: String,
     epoch: u64,
     next_seq: u64,
-    pending: Vec<Batch>,
+    pending: VecDeque<Batch>,
+    dropped: u64,
 }
 
 impl Cache {
@@ -15,7 +20,8 @@ impl Cache {
             sender: sender.into(),
             epoch,
             next_seq: 1,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
+            dropped: 0,
         }
     }
 
@@ -36,7 +42,11 @@ impl Cache {
             seed,
         };
         self.next_seq += 1;
-        self.pending.push(b.clone());
+        if self.pending.len() >= MAX_PENDING {
+            self.pending.pop_front();
+            self.dropped += 1;
+        }
+        self.pending.push_back(b.clone());
         b
     }
 
@@ -63,6 +73,11 @@ impl Cache {
             r.take(&b.take);
         }
         r
+    }
+
+    /// Pending batches dropped by the cap since start.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     pub fn pending_len(&self) -> usize {
@@ -100,6 +115,17 @@ mod tests {
         st.seeded.insert(M);
         assert_eq!(c.view(&st, M).stone, 7);
         assert_eq!(c.view(&state(7, None), M).stone, 19);
+    }
+
+    #[test]
+    fn pending_is_capped_oldest_first() {
+        let mut c = Cache::new("srv", 1);
+        for _ in 0..MAX_PENDING + 3 {
+            c.push(M, res(1), res(0), false);
+        }
+        assert_eq!(c.pending_len(), MAX_PENDING);
+        assert_eq!(c.dropped(), 3);
+        assert_eq!(c.pending.front().unwrap().seq, 4);
     }
 
     #[test]
