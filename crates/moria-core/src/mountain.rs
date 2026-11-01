@@ -18,6 +18,8 @@ pub struct Mountain {
     d: u8,
     tiles: Vec<Tile>,
     pub designations: BTreeMap<TilePos, DesignationKind>,
+    /// Standing work orders per workshop tile: how many more runs are wanted.
+    pub orders: BTreeMap<TilePos, u8>,
 }
 
 impl Mountain {
@@ -29,6 +31,7 @@ impl Mountain {
             d,
             tiles: vec![fill; w as usize * h as usize * d as usize],
             designations: BTreeMap::new(),
+            orders: BTreeMap::new(),
         }
     }
 
@@ -164,9 +167,22 @@ impl Mountain {
                     && !self.holds_up_a_way_down(p)
             }
             K::Chop => t == Tile::Tree,
+            K::Smelt => t == Tile::Forge,
+            K::Smith => t == Tile::Anvil,
             K::Stairs => stairs_ok(t) && p.z + 1 < self.d && !self.holds_up_a_way_down(p),
             _ => t.is_floor_like(), // builds
         }
+    }
+
+    /// What a dwarf can do at `p`: its designation, else the workshop's recipe when ordered.
+    pub fn work_at(&self, p: TilePos) -> Option<DesignationKind> {
+        self.designations.get(&p).copied().or_else(|| {
+            if self.orders.get(&p).copied()? > 0 {
+                self.get(p)?.recipe()
+            } else {
+                None
+            }
+        })
     }
 
     /// Tiles of the rectangle `a..=b` on level `a.z`, clamped to the mountain (the rectangle
@@ -213,6 +229,7 @@ impl Mountain {
         }
         let mut res = self.get(p)?.yield_();
         match kind {
+            DesignationKind::Smelt | DesignationKind::Smith => return None,
             DesignationKind::Dig => self.set(p, self.ground_at(p)),
             DesignationKind::Chop => self.set(p, Tile::Grass),
             // The stone cost is paid by the caller, which holds the resources.
@@ -228,7 +245,12 @@ impl Mountain {
             | DesignationKind::Lamp
             | DesignationKind::Campfire
             | DesignationKind::Hearth
-            | DesignationKind::Stove => self.set(p, kind.builds()?),
+            | DesignationKind::Stove
+            | DesignationKind::Forge
+            | DesignationKind::Anvil
+            | DesignationKind::WoodDoor
+            | DesignationKind::StoneDoor
+            | DesignationKind::IronDoor => self.set(p, kind.builds()?),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
@@ -241,6 +263,7 @@ impl Mountain {
             }
         }
         self.designations.remove(&p);
+        self.orders.remove(&p);
         Some(res)
     }
 }
@@ -269,9 +292,7 @@ mod tests {
             r,
             Resources {
                 stone: 1,
-                gold: 0,
-                mithril: 0,
-                wood: 0
+                ..Default::default()
             }
         );
         assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Floor));
@@ -371,6 +392,21 @@ mod tests {
         assert!(m.can_move(p(0, 0, 0), Dir::E));
         assert!(!m.can_move(p(0, 0, 0), Dir::Down));
         assert!(!m.can_move(p(0, 0, 0), Dir::Up));
+    }
+
+    #[test]
+    fn orders_make_work_and_die_with_the_workshop() {
+        let mut m = Mountain::new(MountainId(0), 4, 4, 1, Tile::Floor);
+        let p = TilePos::new(1, 1, 0);
+        m.set(p, Tile::Forge);
+        assert_eq!(m.work_at(p), None);
+        m.orders.insert(p, 5);
+        assert_eq!(m.work_at(p), Some(DesignationKind::Smelt));
+        assert!(m.diggable(p, DesignationKind::Smelt) && !m.diggable(p, DesignationKind::Smith));
+        m.designate(p, p, DesignationKind::Dig);
+        assert_eq!(m.work_at(p), Some(DesignationKind::Dig)); // dismantling wins
+        assert_eq!(m.dig(p, DesignationKind::Dig).unwrap().stone, 6);
+        assert!(m.orders.is_empty());
     }
 
     #[test]

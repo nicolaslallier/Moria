@@ -278,6 +278,7 @@ mod tests {
             u8,
             Vec<Tile>,
             std::collections::BTreeMap<TilePos, DesignationKind>,
+            std::collections::BTreeMap<TilePos, u8>,
         );
         let raw = Raw(
             MountainId(0),
@@ -285,6 +286,7 @@ mod tests {
             8,
             1,
             vec![Tile::Rock; 10],
+            Default::default(),
             Default::default(),
         );
         let trunc: Mountain = postcard::from_bytes(&postcard::to_allocvec(&raw).unwrap()).unwrap();

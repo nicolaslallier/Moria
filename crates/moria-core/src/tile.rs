@@ -44,6 +44,16 @@ tiles! {
     Campfire,
     Hearth,
     Stove,
+    IronOre,
+    Coal,
+    Forge,
+    Anvil,
+    WoodDoor,
+    StoneDoor,
+    IronDoor,
+    WoodDoorLocked,
+    StoneDoorLocked,
+    IronDoorLocked,
 }
 
 #[derive(
@@ -54,6 +64,10 @@ pub struct Resources {
     pub gold: u32,
     pub mithril: u32,
     pub wood: u32,
+    pub iron_ore: u32,
+    pub coal: u32,
+    pub iron: u32,
+    pub iron_door: u32,
 }
 
 impl Resources {
@@ -62,6 +76,10 @@ impl Resources {
         self.gold = self.gold.saturating_add(o.gold);
         self.mithril = self.mithril.saturating_add(o.mithril);
         self.wood = self.wood.saturating_add(o.wood);
+        self.iron_ore = self.iron_ore.saturating_add(o.iron_ore);
+        self.coal = self.coal.saturating_add(o.coal);
+        self.iron = self.iron.saturating_add(o.iron);
+        self.iron_door = self.iron_door.saturating_add(o.iron_door);
     }
 
     pub fn covers(&self, c: &Resources) -> bool {
@@ -69,6 +87,10 @@ impl Resources {
             && self.gold >= c.gold
             && self.mithril >= c.mithril
             && self.wood >= c.wood
+            && self.iron_ore >= c.iron_ore
+            && self.coal >= c.coal
+            && self.iron >= c.iron
+            && self.iron_door >= c.iron_door
     }
 
     pub fn take(&mut self, c: &Resources) {
@@ -76,6 +98,10 @@ impl Resources {
         self.gold = self.gold.saturating_sub(c.gold);
         self.mithril = self.mithril.saturating_sub(c.mithril);
         self.wood = self.wood.saturating_sub(c.wood);
+        self.iron_ore = self.iron_ore.saturating_sub(c.iron_ore);
+        self.coal = self.coal.saturating_sub(c.coal);
+        self.iron = self.iron.saturating_sub(c.iron);
+        self.iron_door = self.iron_door.saturating_sub(c.iron_door);
     }
 }
 
@@ -98,6 +124,15 @@ pub enum DesignationKind {
     Campfire,
     Hearth,
     Stove,
+    Forge,
+    Anvil,
+    WoodDoor,
+    StoneDoor,
+    IronDoor,
+    /// Work at a workshop: smelt ore into iron.
+    Smelt,
+    /// Work at a workshop: forge an iron door.
+    Smith,
 }
 
 impl DesignationKind {
@@ -114,7 +149,7 @@ impl DesignationKind {
     /// The tile this kind builds; `None` for digging kinds.
     pub fn builds(self) -> Option<Tile> {
         match self {
-            Self::Dig | Self::Stairs | Self::Chop => None,
+            Self::Dig | Self::Stairs | Self::Chop | Self::Smelt | Self::Smith => None,
             Self::Wall => Some(Tile::Wall),
             Self::Bed => Some(Tile::Bed),
             Self::Table => Some(Tile::Table),
@@ -128,6 +163,38 @@ impl DesignationKind {
             Self::Campfire => Some(Tile::Campfire),
             Self::Hearth => Some(Tile::Hearth),
             Self::Stove => Some(Tile::Stove),
+            Self::Forge => Some(Tile::Forge),
+            Self::Anvil => Some(Tile::Anvil),
+            Self::WoodDoor => Some(Tile::WoodDoor),
+            Self::StoneDoor => Some(Tile::StoneDoor),
+            Self::IronDoor => Some(Tile::IronDoor),
+        }
+    }
+
+    /// A job done at a workshop rather than a change to the map.
+    pub fn is_work(self) -> bool {
+        matches!(self, Self::Smelt | Self::Smith)
+    }
+
+    pub fn product(self) -> Resources {
+        match self {
+            Self::Smelt => Resources {
+                iron: 1,
+                ..Default::default()
+            },
+            Self::Smith => Resources {
+                iron_door: 1,
+                ..Default::default()
+            },
+            _ => Resources::default(),
+        }
+    }
+
+    pub fn work_ticks(self) -> u16 {
+        match self {
+            Self::Smelt => 30,
+            Self::Smith => 40,
+            _ => 0,
         }
     }
 
@@ -147,11 +214,26 @@ impl DesignationKind {
             Self::Campfire => (0, 3, 0),
             Self::Hearth => (4, 0, 0),
             Self::Stove => (3, 2, 0),
+            Self::Forge => (6, 0, 0),
+            Self::WoodDoor => (0, 3, 0),
+            Self::StoneDoor => (3, 0, 0),
+            Self::Anvil | Self::IronDoor | Self::Smelt | Self::Smith => (0, 0, 0),
+        };
+        let (iron_ore, coal, iron, iron_door) = match self {
+            Self::Anvil => (0, 0, 3, 0),
+            Self::IronDoor => (0, 0, 0, 1),
+            Self::Smelt => (2, 1, 0, 0),
+            Self::Smith => (0, 0, 2, 0),
+            _ => (0, 0, 0, 0),
         };
         Resources {
             stone,
             wood,
             gold,
+            iron_ore,
+            coal,
+            iron,
+            iron_door,
             ..Default::default()
         }
     }
@@ -161,7 +243,14 @@ impl Tile {
     pub fn is_solid(self) -> bool {
         matches!(
             self,
-            Tile::Rock | Tile::Gold | Tile::Mithril | Tile::Wall | Tile::Soil | Tile::Tree
+            Tile::Rock
+                | Tile::Gold
+                | Tile::Mithril
+                | Tile::IronOre
+                | Tile::Coal
+                | Tile::Wall
+                | Tile::Soil
+                | Tile::Tree
         ) || self.is_furniture()
     }
 
@@ -189,7 +278,50 @@ impl Tile {
                 | Tile::Campfire
                 | Tile::Hearth
                 | Tile::Stove
+                | Tile::Forge
+                | Tile::Anvil
+        ) || self.is_door()
+    }
+
+    pub fn is_door(self) -> bool {
+        matches!(
+            self,
+            Tile::WoodDoor
+                | Tile::StoneDoor
+                | Tile::IronDoor
+                | Tile::WoodDoorLocked
+                | Tile::StoneDoorLocked
+                | Tile::IronDoorLocked
         )
+    }
+
+    pub fn is_locked_door(self) -> bool {
+        matches!(
+            self,
+            Tile::WoodDoorLocked | Tile::StoneDoorLocked | Tile::IronDoorLocked
+        )
+    }
+
+    /// The same door open <-> locked; `None` for anything else.
+    pub fn toggled_door(self) -> Option<Tile> {
+        Some(match self {
+            Tile::WoodDoor => Tile::WoodDoorLocked,
+            Tile::WoodDoorLocked => Tile::WoodDoor,
+            Tile::StoneDoor => Tile::StoneDoorLocked,
+            Tile::StoneDoorLocked => Tile::StoneDoor,
+            Tile::IronDoor => Tile::IronDoorLocked,
+            Tile::IronDoorLocked => Tile::IronDoor,
+            _ => return None,
+        })
+    }
+
+    /// The work a workshop offers.
+    pub fn recipe(self) -> Option<DesignationKind> {
+        match self {
+            Tile::Forge => Some(DesignationKind::Smelt),
+            Tile::Anvil => Some(DesignationKind::Smith),
+            _ => None,
+        }
     }
 
     pub fn dig_ticks(self) -> u16 {
@@ -201,8 +333,17 @@ impl Tile {
             | Tile::Lamp
             | Tile::Campfire
             | Tile::Hearth
-            | Tile::Stove => 10,
-            Tile::Gold => 15,
+            | Tile::Stove
+            | Tile::Forge
+            | Tile::Anvil
+            | Tile::WoodDoor
+            | Tile::StoneDoor
+            | Tile::IronDoor
+            | Tile::WoodDoorLocked
+            | Tile::StoneDoorLocked
+            | Tile::IronDoorLocked => 10,
+            Tile::Gold | Tile::IronOre => 15,
+            Tile::Coal => 12,
             Tile::Mithril => 25,
             Tile::Soil | Tile::Slope => 8,
             Tile::Tree => 20,
@@ -216,6 +357,8 @@ impl Tile {
             Tile::Rock => r.stone = 1,
             Tile::Gold => r.gold = 1,
             Tile::Mithril => r.mithril = 1,
+            Tile::IronOre => r.iron_ore = 1,
+            Tile::Coal => r.coal = 1,
             Tile::Tree => r.wood = 3,
             Tile::Wall => return DesignationKind::Wall.cost(),
             Tile::Bed => return DesignationKind::Bed.cost(),
@@ -230,6 +373,11 @@ impl Tile {
             Tile::Campfire => return DesignationKind::Campfire.cost(),
             Tile::Hearth => return DesignationKind::Hearth.cost(),
             Tile::Stove => return DesignationKind::Stove.cost(),
+            Tile::Forge => return DesignationKind::Forge.cost(),
+            Tile::Anvil => return DesignationKind::Anvil.cost(),
+            Tile::WoodDoor | Tile::WoodDoorLocked => return DesignationKind::WoodDoor.cost(),
+            Tile::StoneDoor | Tile::StoneDoorLocked => return DesignationKind::StoneDoor.cost(),
+            Tile::IronDoor | Tile::IronDoorLocked => return DesignationKind::IronDoor.cost(),
             _ => {}
         }
         r
@@ -252,8 +400,40 @@ mod tests {
         use Tile::*;
         // The original variant order since save format v2; the index is the postcard byte.
         let expected = [
-            Rock, Gold, Mithril, Floor, Stair, Wall, Bed, Table, Chair, Grass, Tree, Water, Slope,
-            Soil, Sky, WoodBed, WoodTable, WoodChair, Candle, Torch, Lamp, Campfire, Hearth, Stove,
+            Rock,
+            Gold,
+            Mithril,
+            Floor,
+            Stair,
+            Wall,
+            Bed,
+            Table,
+            Chair,
+            Grass,
+            Tree,
+            Water,
+            Slope,
+            Soil,
+            Sky,
+            WoodBed,
+            WoodTable,
+            WoodChair,
+            Candle,
+            Torch,
+            Lamp,
+            Campfire,
+            Hearth,
+            Stove,
+            IronOre,
+            Coal,
+            Forge,
+            Anvil,
+            WoodDoor,
+            StoneDoor,
+            IronDoor,
+            WoodDoorLocked,
+            StoneDoorLocked,
+            IronDoorLocked,
         ];
         assert_eq!(Tile::ALL, expected);
         for (i, t) in expected.iter().enumerate() {
@@ -267,11 +447,69 @@ mod tests {
         // The variant order is the postcard byte on the wire and in saves.
         let expected = [
             Dig, Stairs, Wall, Bed, Table, Chair, Chop, WoodBed, WoodTable, WoodChair, Candle,
-            Torch, Lamp, Campfire, Hearth, Stove,
+            Torch, Lamp, Campfire, Hearth, Stove, Forge, Anvil, WoodDoor, StoneDoor, IronDoor,
+            Smelt, Smith,
         ];
         for (i, k) in expected.iter().enumerate() {
             assert_eq!(postcard::to_allocvec(k).unwrap(), [i as u8], "{k:?}");
         }
+    }
+
+    #[test]
+    fn iron_chain_costs_and_recipes() {
+        use DesignationKind as K;
+        let r = |f: fn(&mut Resources)| {
+            let mut r = Resources::default();
+            f(&mut r);
+            r
+        };
+        assert_eq!(K::Forge.cost(), r(|r| r.stone = 6));
+        assert_eq!(K::Anvil.cost(), r(|r| r.iron = 3));
+        assert_eq!(K::WoodDoor.cost(), r(|r| r.wood = 3));
+        assert_eq!(K::StoneDoor.cost(), r(|r| r.stone = 3));
+        assert_eq!(K::IronDoor.cost(), r(|r| r.iron_door = 1));
+        assert_eq!(
+            K::Smelt.cost(),
+            r(|r| {
+                r.iron_ore = 2;
+                r.coal = 1
+            })
+        );
+        assert_eq!(K::Smelt.product(), r(|r| r.iron = 1));
+        assert_eq!(K::Smith.cost(), r(|r| r.iron = 2));
+        assert_eq!(K::Smith.product(), r(|r| r.iron_door = 1));
+        assert_eq!((K::Smelt.work_ticks(), K::Smith.work_ticks()), (30, 40));
+        assert_eq!(Tile::Forge.recipe(), Some(K::Smelt));
+        assert_eq!(Tile::Anvil.recipe(), Some(K::Smith));
+        assert_eq!(Tile::Rock.recipe(), None);
+        assert!(K::Smelt.builds().is_none() && K::Smelt.is_work());
+    }
+
+    #[test]
+    fn ores_and_doors_dig_back() {
+        assert_eq!(Tile::IronOre.yield_().iron_ore, 1);
+        assert_eq!(Tile::Coal.yield_().coal, 1);
+        assert_eq!(
+            (Tile::IronOre.dig_ticks(), Tile::Coal.dig_ticks()),
+            (15, 12)
+        );
+        assert_eq!(Tile::IronDoorLocked.yield_().iron_door, 1);
+        assert_eq!(
+            Tile::StoneDoorLocked.yield_(),
+            DesignationKind::StoneDoor.cost()
+        );
+        assert_eq!(Tile::WoodDoor.toggled_door(), Some(Tile::WoodDoorLocked));
+        assert_eq!(Tile::IronDoorLocked.toggled_door(), Some(Tile::IronDoor));
+        assert_eq!(Tile::Forge.toggled_door(), None);
+        for t in [
+            Tile::Forge,
+            Tile::Anvil,
+            Tile::WoodDoor,
+            Tile::IronDoorLocked,
+        ] {
+            assert!(t.is_furniture() && !t.is_stone(), "{t:?}");
+        }
+        assert!(Tile::IronOre.is_stone() && Tile::Coal.is_stone());
     }
 
     #[test]
@@ -374,7 +612,7 @@ mod tests {
     fn stone_is_solid_but_not_tree_or_furniture() {
         let stone: Vec<_> = Tile::ALL.into_iter().filter(|t| t.is_stone()).collect();
         use Tile::*;
-        assert_eq!(stone, [Rock, Gold, Mithril, Wall, Soil]);
+        assert_eq!(stone, [Rock, Gold, Mithril, Wall, Soil, IronOre, Coal]);
     }
 
     #[test]

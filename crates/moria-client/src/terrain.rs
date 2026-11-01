@@ -62,15 +62,19 @@ fn pixels(tile: Tile, on_grass: bool) -> Vec<u8> {
                 [65, 73, 83]
             };
             let mut rgb = base.map(|c| (c + shade).clamp(0, 255) as u8);
-            if matches!(tile, Tile::Gold | Tile::Mithril) {
+            if matches!(
+                tile,
+                Tile::Gold | Tile::Mithril | Tile::IronOre | Tile::Coal
+            ) {
                 let vein = 44 + ((y as f32 * 0.11).sin() * 14.0) as i32;
                 let branch = 22 + y / 2;
                 let distance = (x - vein).abs().min((x - branch).abs());
                 if distance < 4 && (x + y * 3) % 17 < 14 {
-                    let ore = if tile == Tile::Gold {
-                        [213, 158, 54]
-                    } else {
-                        [102, 194, 219]
+                    let ore = match tile {
+                        Tile::Gold => [213, 158, 54],
+                        Tile::IronOre => [168, 112, 90],
+                        Tile::Coal => [28, 28, 32],
+                        _ => [102, 194, 219],
                     };
                     let glint = if distance < 2 { 30 } else { -28 };
                     rgb = ore.map(|c| (c + noise + glint).clamp(0, 255) as u8);
@@ -154,7 +158,17 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
             (26, 16, 70, 30, [226, 220, 204]), // pillow
             (24, 36, 72, 82, [150, 48, 44]),   // blanket
         ],
-        Tile::Table | Tile::WoodTable => &[
+        // ponytail: placeholder looks until the forge and door drawings.
+        Tile::Table
+        | Tile::WoodTable
+        | Tile::Forge
+        | Tile::Anvil
+        | Tile::WoodDoor
+        | Tile::StoneDoor
+        | Tile::IronDoor
+        | Tile::WoodDoorLocked
+        | Tile::StoneDoorLocked
+        | Tile::IronDoorLocked => &[
             (12, 20, 84, 70, dark),
             (16, 24, 80, 66, top),
             (40, 36, 56, 52, [190, 150, 70]), // tankard

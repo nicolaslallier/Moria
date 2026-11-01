@@ -404,7 +404,14 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
             | DesignationKind::Lamp
             | DesignationKind::Campfire
             | DesignationKind::Hearth
-            | DesignationKind::Stove => Color::srgb(0.7, 0.45, 1.0),
+            | DesignationKind::Stove
+            | DesignationKind::Forge
+            | DesignationKind::Anvil
+            | DesignationKind::WoodDoor
+            | DesignationKind::StoneDoor
+            | DesignationKind::IronDoor
+            | DesignationKind::Smelt
+            | DesignationKind::Smith => Color::srgb(0.7, 0.45, 1.0),
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }
