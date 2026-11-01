@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use moria_core::light::{Area, LightMap, light_map};
 use moria_core::{DesignationKind, Tile, TilePos};
+use std::collections::BTreeMap;
 
 pub const TILE: f32 = 48.0;
 
@@ -294,7 +295,7 @@ fn sync_marks(
 struct OrderCount(TilePos, Option<(u8, u8)>);
 
 /// Orders of the viewed level `z`, as `(workshop, count)`.
-fn visible_orders(g: &Game, z: u8) -> Vec<(TilePos, u8)> {
+fn visible_orders(g: &Game, z: u8) -> BTreeMap<TilePos, u8> {
     g.mountain
         .orders
         .iter()
@@ -322,11 +323,10 @@ fn sync_order_counts(
     let z = g.current_z();
     let mut orders = visible_orders(g, z);
     for (e, mut c, mut text, mut color, mut v) in &mut counts {
-        let Some(&(_, n)) = orders.iter().find(|(p, _)| *p == c.0) else {
+        let Some(n) = orders.remove(&c.0) else {
             commands.entity(e).despawn();
             continue;
         };
-        orders.retain(|(p, _)| *p != c.0);
         let steps = (brightness(g, &l, c.0.x, c.0.y, z) * 32.0).round() as u8;
         if c.1 != Some((n, steps)) {
             c.1 = Some((n, steps));
@@ -339,7 +339,7 @@ fn sync_order_counts(
             };
         }
     }
-    for (p, _) in orders {
+    for p in orders.into_keys() {
         commands.spawn((
             Text2d::default(),
             TextFont::from_font_size(TILE * 0.4),
@@ -518,9 +518,9 @@ mod tests {
             TilePos::new(2, 2, 1),
         );
         g.mountain.orders.extend([(a, 5), (b, 2), (up, 7)]);
-        assert_eq!(visible_orders(&g, 0), vec![(a, 5), (b, 2)]);
-        assert_eq!(visible_orders(&g, 1), vec![(up, 7)]);
+        assert_eq!(visible_orders(&g, 0), BTreeMap::from([(a, 5), (b, 2)]));
+        assert_eq!(visible_orders(&g, 1), BTreeMap::from([(up, 7)]));
         g.mountain.orders.remove(&a);
-        assert_eq!(visible_orders(&g, 0), vec![(b, 2)]);
+        assert_eq!(visible_orders(&g, 0), BTreeMap::from([(b, 2)]));
     }
 }

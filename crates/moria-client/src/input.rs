@@ -1,12 +1,13 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{ORDER_ROWS, Screen, drag_msg};
+use crate::game::{Game, ORDER_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::input::EguiWantsInput;
+use moria_core::protocol::ClientMsg;
 use moria_core::{DesignationKind, Dir};
 
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
@@ -162,6 +163,35 @@ fn order_nav(prev: Option<Dir>, walk: Option<Dir>) -> OrderNav {
     }
 }
 
+/// The order menu's share of a frame: `Some(messages)` when the menu consumed it.
+fn order_frame(
+    g: &mut Game,
+    menu_dir: &mut Option<Dir>,
+    walk: Option<Dir>,
+    dig: bool,
+) -> Option<Vec<ClientMsg>> {
+    g.order_menu?;
+    let nav = order_nav(*menu_dir, walk);
+    *menu_dir = walk;
+    match nav {
+        OrderNav::Step(down) => {
+            let n = ORDER_ROWS.len();
+            g.order_sel = (g.order_sel + if down { 1 } else { n - 1 }) % n;
+        }
+        // Closing consumes the press: it does not also walk the hero.
+        OrderNav::Close => {
+            g.order_menu = None;
+            return Some(vec![]);
+        }
+        OrderNav::Keep => {}
+    }
+    Some(if dig {
+        g.pick_order(g.order_sel).into_iter().collect()
+    } else {
+        vec![]
+    })
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -211,28 +241,13 @@ fn play(
         }
         return;
     }
-    let mut out = vec![];
-    if g.order_menu.is_some() {
-        let nav = order_nav(*menu_dir, walk);
-        *menu_dir = walk;
-        match nav {
-            OrderNav::Step(down) => {
-                let n = ORDER_ROWS.len();
-                g.order_sel = (g.order_sel + if down { 1 } else { n - 1 }) % n;
-            }
-            OrderNav::Close => g.order_menu = None,
-            OrderNav::Keep => {}
+    if let Some(out) = order_frame(g, menu_dir, walk, k.dig || p.dig) {
+        for m in out {
+            client.send(m);
         }
-        if g.order_menu.is_some() {
-            if k.dig || p.dig {
-                out.extend(g.pick_order(g.order_sel));
-            }
-            for m in out {
-                client.send(m);
-            }
-            return;
-        }
+        return;
     }
+    let mut out = vec![];
     *menu_dir = None;
     if k.use_ || p.use_ {
         out.extend(g.use_());
@@ -338,6 +353,20 @@ mod tests {
         assert_eq!(order_nav(Some(Dir::S), Some(Dir::S)), OrderNav::Keep);
         assert_eq!(order_nav(None, Some(Dir::N)), OrderNav::Step(false));
         assert_eq!(order_nav(Some(Dir::E), None), OrderNav::Keep);
+    }
+
+    #[test]
+    fn closing_the_order_menu_consumes_the_press() {
+        let mut g = crate::game::tests::game();
+        g.order_menu = Some(Dir::E);
+        let mut menu_dir = None;
+        // A new E press closes the menu; the frame must not also walk the hero.
+        assert_eq!(
+            order_frame(&mut g, &mut menu_dir, Some(Dir::E), false),
+            Some(vec![])
+        );
+        assert_eq!(g.order_menu, None);
+        assert_eq!(menu_dir, Some(Dir::E));
     }
 
     #[test]

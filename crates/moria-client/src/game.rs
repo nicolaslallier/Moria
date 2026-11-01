@@ -10,7 +10,7 @@ use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
-use moria_core::{DesignationKind, Dir, Mountain, Resources, TilePos};
+use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -95,8 +95,8 @@ pub fn level_label(z: u8) -> String {
     }
 }
 
-/// "1 pierre", "3 bois".
-fn cost_fr(r: Resources) -> String {
+/// Each resource with its French name.
+fn named(r: Resources) -> [(u32, &'static str); 7] {
     [
         (r.stone, "pierre"),
         (r.wood, "bois"),
@@ -106,11 +106,36 @@ fn cost_fr(r: Resources) -> String {
         (r.iron, "lingots"),
         (r.iron_door, "porte en fer forgée"),
     ]
-    .iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, what)| format!("{n} {what}"))
-    .collect::<Vec<_>>()
-    .join(" + ")
+}
+
+/// "1 pierre", "3 bois".
+fn cost_fr(r: Resources) -> String {
+    named(r)
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Workshop stock line: how much of each input of `k` is spare, "En réserve : 1 lingots".
+pub fn stock_text(k: DesignationKind, spare: Resources) -> String {
+    let have = named(spare)
+        .iter()
+        .zip(named(k.cost()))
+        .filter(|(_, (cost, _))| *cost > 0)
+        .map(|((n, what), _)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("En réserve : {have}")
+}
+
+/// A workshop's name, from the build menu.
+pub fn workshop_label(t: Tile) -> &'static str {
+    BUILDS
+        .iter()
+        .find(|b| b.0.builds() == Some(t))
+        .map_or("?", |b| b.1)
 }
 
 /// Build-menu row: "Lit en bois (3 bois)".
@@ -314,6 +339,15 @@ impl Game {
             pending: VecDeque::new(),
             ticks: 0,
         }
+    }
+
+    /// Resources not promised to the dwarves' current jobs, as the server counts them.
+    pub fn spare(&self) -> Resources {
+        let mut r = self.resources;
+        for job in self.dwarves.iter().filter_map(|d| d.2) {
+            r.take(&job.kind.cost());
+        }
+        r
     }
 
     /// Status-page row per dwarf: name, level, activity.

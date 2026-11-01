@@ -4,7 +4,7 @@ use crate::Client;
 use crate::art::Art;
 use crate::game::{
     ACTIONS, BUILDS, Game, ORDER_ROWS, Screen, Session, ability_rows, build_text, clock_label,
-    level_label, mode_label, recipe_label,
+    level_label, mode_label, recipe_label, stock_text, workshop_label,
 };
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
@@ -13,7 +13,6 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
-use moria_core::{DesignationKind, Resources};
 use std::path::PathBuf;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
@@ -321,37 +320,21 @@ fn order_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     Ok(())
 }
 
-/// The stock line of a workshop window: only what the recipe consumes.
-fn stock_text(kind: DesignationKind, r: &Resources) -> String {
-    if kind == DesignationKind::Smelt {
-        format!(
-            "En réserve : {} minerai de fer · {} charbon",
-            r.iron_ore, r.coal
-        )
-    } else {
-        format!("En réserve : {} lingots", r.iron)
-    }
-}
-
 /// Workshop window: recipe, stock, standing order and the order buttons.
 fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     let dir = g.order_menu?;
     let at = g.hero.pos.step(dir);
-    let Some(kind) = g.mountain.get(at).and_then(|t| t.recipe()) else {
+    let Some((tile, kind)) = g.mountain.get(at).and_then(|t| Some((t, t.recipe()?))) else {
         g.order_menu = None;
         return None;
     };
-    let title = if kind == DesignationKind::Smelt {
-        "Forge"
-    } else {
-        "Enclume"
-    };
-    let r = g.resources;
+    // The server only starts work the spare stock can pay.
+    let r = g.spare();
     let queued = g.mountain.orders.get(&at).copied().unwrap_or(0);
     let mut picked = None;
-    centered(title).show(ctx, |ui| {
+    centered(workshop_label(tile)).show(ctx, |ui| {
         ui.label(build_text(kind, recipe_label(kind)));
-        ui.label(stock_text(kind, &r));
+        ui.label(stock_text(kind, r));
         ui.label(format!("Commande en cours : {queued}"));
         if !r.covers(&kind.cost()) {
             ui.colored_label(
@@ -514,14 +497,19 @@ fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moria_core::{DesignationKind, Resources};
 
     #[test]
     fn stock_text_lists_only_the_recipe_inputs() {
         let r = Resources::default();
-        let anvil = stock_text(DesignationKind::Smith, &r);
+        let anvil = stock_text(DesignationKind::Smith, r);
         assert!(anvil.contains("lingots") && !anvil.contains("charbon"));
-        let forge = stock_text(DesignationKind::Smelt, &r);
+        let forge = stock_text(DesignationKind::Smelt, r);
         assert!(forge.contains("charbon") && !forge.contains("lingots"));
+        assert_eq!(
+            stock_text(DesignationKind::Smelt, r),
+            "En réserve : 0 minerai de fer · 0 charbon"
+        );
     }
 
     /// Space digs; it must never also press a bar button that holds focus.
@@ -550,7 +538,6 @@ mod tests {
         assert!(!g.build_menu);
     }
 
-    /// Space digs: no status-window control may hold focus and take it as a click.
     /// Space picks the order row itself: no order button may hold focus.
     #[test]
     fn order_buttons_never_take_focus() {
@@ -585,6 +572,7 @@ mod tests {
         }
     }
 
+    /// Space digs: no status-window control may hold focus and take it as a click.
     #[test]
     fn status_window_never_takes_focus() {
         let mut g = crate::game::tests::game();
@@ -619,11 +607,16 @@ mod tests {
 
     /// All text painted by `order_window` for a forge east of the hero.
     fn order_text(res: moria_core::Resources) -> String {
-        use moria_core::{Dir, Tile};
         let mut g = crate::game::tests::game();
         g.resources = res;
+        order_text_at(g, moria_core::Tile::Forge)
+    }
+
+    /// All text painted by `order_window` for `workshop` east of the hero in `g`.
+    fn order_text_at(mut g: Game, workshop: moria_core::Tile) -> String {
+        use moria_core::Dir;
         let e = g.hero.pos.step(Dir::E);
-        g.mountain.set(e, Tile::Forge);
+        g.mountain.set(e, workshop);
         g.order_menu = Some(Dir::E);
         let ctx = egui::Context::default();
         // Two frames: a new window is laid out hidden on its first.
@@ -658,6 +651,26 @@ mod tests {
         let t = order_text(ok);
         assert!(!t.contains("En attente"));
         assert!(t.contains("Forge"));
+    }
+
+    #[test]
+    fn order_window_counts_only_the_spare_stock() {
+        use moria_core::protocol::DwarfJob;
+        use moria_core::{DwarfId, Tile};
+        let mut g = crate::game::tests::game();
+        g.resources = moria_core::Resources {
+            iron: 4,
+            ..Default::default()
+        };
+        // Building an anvil promises 3 of the 4 ingots; a door needs 2.
+        let job = DwarfJob {
+            kind: DesignationKind::Anvil,
+            working: true,
+        };
+        g.dwarves = vec![(DwarfId(1), g.hero.pos, Some(job))];
+        let t = order_text_at(g, Tile::Anvil);
+        assert!(t.contains("En attente"), "{t}");
+        assert!(t.contains("Enclume"), "{t}");
     }
 
     #[test]
