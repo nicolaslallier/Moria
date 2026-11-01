@@ -1,4 +1,4 @@
-//! Central server. One task owns the `World` and ticks at 10 Hz; sessions and the NATS
+//! Central server. One task owns the `World` and ticks at 10 Hz; sessions and the bus
 //! bridge talk to it only through bounded channels. The world task never awaits a session
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
@@ -47,8 +47,8 @@ const MAX_ASSIGN_PER_TICK: usize = 16;
 pub struct Config {
     pub data: PathBuf,
     pub bind: SocketAddr,
-    /// `None` disables the NATS bridge.
-    pub nats_url: Option<String>,
+    /// `None` disables the AI bridge.
+    pub amqp_url: Option<String>,
     /// Invite code required to create a new account; `None` means open registration.
     pub invite: Option<String>,
     /// Concurrent connections allowed per source IP.
@@ -152,7 +152,7 @@ pub async fn run_with_listener(
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (assign_tx, assign_rx) = mpsc::channel(64);
     let mut view_tx = None;
-    let bridge = cfg.nats_url.clone().map(|url| {
+    let bridge = cfg.amqp_url.clone().map(|url| {
         let (tx, rx) = mpsc::channel(16);
         view_tx = Some(tx);
         let known = w.mountains.keys().copied().collect();

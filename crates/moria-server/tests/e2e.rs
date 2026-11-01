@@ -1,5 +1,5 @@
-//! End-to-end tests: server + dwarf-ai in-process over a real NATS.
-//! Run: NATS_TEST_URL=nats://127.0.0.1:4222 cargo test -p moria-server --test e2e -- --ignored
+//! End-to-end tests: server + dwarf-ai in-process over a real RabbitMQ.
+//! Run: AMQP_TEST_URL=amqp://guest:guest@127.0.0.1:5672 cargo test -p moria-server --test e2e -- --ignored
 use moria_core::TilePos;
 use moria_core::protocol::{
     ClientMsg, FortressView, PROTOCOL_VERSION, ServerMsg, encode, read_frame_async,
@@ -17,11 +17,11 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-// All tests share one NATS and its subjects: run them one at a time.
+// All tests share one broker and its queues: run them one at a time.
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
-fn nats_url() -> String {
-    std::env::var("NATS_TEST_URL").expect("NATS_TEST_URL")
+fn amqp_url() -> String {
+    std::env::var("AMQP_TEST_URL").expect("AMQP_TEST_URL")
 }
 
 struct Task {
@@ -42,7 +42,7 @@ impl Task {
 
 fn start_ai() -> Task {
     let (stop, rx) = oneshot::channel();
-    let done = tokio::spawn(moria_dwarf_ai::run(nats_url(), async {
+    let done = tokio::spawn(moria_dwarf_ai::run(amqp_url(), async {
         let _ = rx.await;
     }));
     Task { stop, done }
@@ -55,7 +55,7 @@ async fn start_server(data: &Path) -> (Task, SocketAddr) {
     let cfg = Config {
         data: data.to_path_buf(),
         bind: addr,
-        nats_url: Some(nats_url()),
+        amqp_url: Some(amqp_url()),
         invite: None,
         max_per_ip: 1000,
     };

@@ -40,7 +40,7 @@ impl Server {
         let cfg = Config {
             data: data.clone(),
             bind: addr,
-            nats_url: None,
+            amqp_url: None,
             invite: invite.map(Into::into),
             max_per_ip,
         };
@@ -317,7 +317,7 @@ async fn missing_world_file_is_an_error() {
     let cfg = Config {
         data: std::env::temp_dir().join("moria-net-does-not-exist/world.bin"),
         bind: listener.local_addr().unwrap(),
-        nats_url: None,
+        amqp_url: None,
         invite: None,
         max_per_ip: 4,
     };

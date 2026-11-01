@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config {
         data: env("MORIA_DATA", "/data/world.bin").into(),
         bind: env("MORIA_BIND", "0.0.0.0:7777").parse()?,
-        nats_url: Some(env("NATS_URL", "nats://nats:4222")),
+        amqp_url: Some(env("AMQP_URL", "amqp://moria:moria@rabbitmq:5672/moria")),
         invite: std::env::var("MORIA_INVITE").ok().filter(|s| !s.is_empty()),
         max_per_ip,
     };

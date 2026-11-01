@@ -52,10 +52,10 @@ lint: ## fmt + clippy (comme la CI)
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
-e2e: ## Tests e2e avec un NATS jetable
-	docker run -d --rm --name moria-nats-test -p 4222:4222 nats:2-alpine
-	NATS_TEST_URL=nats://127.0.0.1:4222 cargo test -p moria-server --test e2e -- --ignored; \
-	  s=$$?; docker stop moria-nats-test >/dev/null; exit $$s
+e2e: ## Tests e2e avec un RabbitMQ jetable
+	docker run -d --rm --name moria-amqp-test -p 5672:5672 rabbitmq:4-alpine
+	AMQP_TEST_URL=amqp://guest:guest@127.0.0.1:5672 cargo test -p moria-server --test e2e -- --ignored --test-threads=1; \
+	  s=$$?; docker stop moria-amqp-test >/dev/null; exit $$s
 
 bots: ## Test de charge, SERVEUR DE TEST UNIQUEMENT : make bots SERVER=host:7777
 	cargo run --release -p moria-server --example bots -- $(SERVER)
