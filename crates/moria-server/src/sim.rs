@@ -6,7 +6,9 @@ use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
 use moria_core::srd::hero_dig_ticks;
 use moria_core::world::{DigJob, Dwarf, DwarfTask, Fortress, Hero, World};
-use moria_core::{DesignationKind, Dir, Mountain, MountainId, Resources, Tile, TilePos};
+use moria_core::{
+    DesignationKind, Dir, MAX_DESIGNATIONS, Mountain, MountainId, Resources, Tile, TilePos,
+};
 use std::collections::{BTreeMap, HashSet};
 
 const MOVE_COOLDOWN: u8 = 2;
@@ -157,7 +159,21 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
                 ch.tiles.push((t, new));
             }
         }
-        // Filled in by the workshop task.
+        Command::Order { dir, add } if !matches!(dir, Dir::Up | Dir::Down) => {
+            let t = h.pos.step(dir);
+            if mt.get(t).and_then(Tile::recipe).is_some() {
+                let old = mt.orders.remove(&t).unwrap_or(0);
+                let n = if add == 0 {
+                    0
+                } else {
+                    old.saturating_add(add).min(99)
+                };
+                if n > 0 {
+                    mt.orders.insert(t, n);
+                }
+                ch.orders.insert(t, n);
+            }
+        }
         Command::Use(_) | Command::Order { .. } => {}
         Command::Cancel { a, b } => {
             ch.designations = mt
@@ -202,6 +218,18 @@ pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
     // ponytail: a full clone (~200 KB of tiles, <= MAX_DESIGNATIONS entries) per view, i.e.
     // per tick; share an Arc<Mountain> with copy-on-write if it ever shows up in a profile.
     let mut m = mt.clone();
+    // Orders show as designations of their recipe, within the AI's cap.
+    for (&p, &n) in &mt.orders {
+        if m.designations.len() >= MAX_DESIGNATIONS {
+            break;
+        }
+        if n > 0
+            && !mt.designations.contains_key(&p)
+            && let Some(k) = mt.get(p).and_then(Tile::recipe)
+        {
+            m.designations.insert(p, k);
+        }
+    }
     // ponytail: per-designation check; with spare wood for one table the AI may still pick
     // several (the server keeps one). Send the spare in AiView if that ever matters.
     m.designations.retain(|_, k| spare.covers(&k.cost()));
@@ -240,9 +268,9 @@ fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
     }
 }
 
-/// Whether the target of a task is still designated as `kind` and diggable as such.
+/// Whether the target of a task is still designated (or ordered) as `kind` and diggable as such.
 fn target_valid(m: &Mountain, t: TilePos, kind: DesignationKind) -> bool {
-    m.designations.get(&t) == Some(&kind) && m.diggable(t, kind)
+    m.work_at(t) == Some(kind) && m.diggable(t, kind)
 }
 
 /// The hero and all dwarves.
@@ -278,7 +306,7 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
     let no_block = HashSet::new();
     let (mut searches, cap) = (0, f.dwarves.len());
     for &(id, target) in &a.list {
-        let Some(kind) = mt.designations.get(&target).copied() else {
+        let Some(kind) = mt.work_at(target) else {
             continue;
         };
         if !target_valid(mt, target, kind) {
@@ -328,7 +356,11 @@ fn dig_at(
 ) -> Option<Resources> {
     let below = p.step(Dir::Down);
     let old = [p, below].map(|q| (q, m.get(q), m.designations.contains_key(&q)));
+    let ordered = m.orders.contains_key(&p);
     let res = m.dig(p, kind)?;
+    if ordered && !m.orders.contains_key(&p) {
+        ch.orders.insert(p, 0);
+    }
     for (q, old_tile, had) in old {
         if let Some(now) = m.get(q).filter(|n| Some(*n) != old_tile) {
             tiles.push((q, now));
@@ -414,7 +446,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             .and_then(|h| h.dig.as_ref())
             .filter(|j| j.kind.builds().is_some())
             .map(|j| j.target);
-        let busy = |q: TilePos| m.designations.contains_key(&q) || hero_build == Some(q);
+        let busy = |q: TilePos| m.work_at(q).is_some() || hero_build == Some(q);
         for d in f.dwarves.iter_mut().filter(|d| d.task.is_none()) {
             if busy(d.pos)
                 && let Some(to) = Dir::HORIZONTAL
@@ -457,6 +489,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 let needed = match task.kind {
                     DesignationKind::Dig | DesignationKind::Chop => base,
                     DesignationKind::Stairs => base.saturating_add(STAIRS_EXTRA_TICKS),
+                    k if k.is_work() => k.work_ticks(),
                     _ => WALL_BUILD_TICKS, // builds
                 };
                 if task.progress >= needed {
@@ -466,7 +499,20 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                         || !f.resources.covers(&task.kind.cost());
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
-                    if !blocked
+                    if !blocked && task.kind.is_work() {
+                        f.resources.take(&task.kind.cost());
+                        f.resources.add(task.kind.product());
+                        let n = m
+                            .orders
+                            .get(&task.target)
+                            .map_or(0, |n| n.saturating_sub(1));
+                        if n == 0 {
+                            m.orders.remove(&task.target);
+                        } else {
+                            m.orders.insert(task.target, n);
+                        }
+                        ch.orders.insert(task.target, n);
+                    } else if !blocked
                         && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
@@ -487,7 +533,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 designations_added: vec![],
                 designations_removed: vec![],
                 resources: f.resources,
-                orders: vec![],
+                orders: vec![], // filled from `ch` below
             };
             ch.merge_into(&mut d);
             out.insert(id, d);
@@ -1648,5 +1694,153 @@ mod tests {
             "no tree was chopped"
         );
         assert!(mean.as_millis() < 10, "{mean:?}");
+    }
+
+    /// A forge at p(3, 1, 0), east of the hero, with `n` orders.
+    fn ordered_forge(w: &mut World, n: u8) -> TilePos {
+        let forge = p(3, 1, 0);
+        let mt = w.mountains.get_mut(&M).unwrap();
+        mt.set(forge, Tile::Forge);
+        mt.orders.insert(forge, n);
+        forge
+    }
+    fn ore(iron_ore: u32, coal: u32) -> Resources {
+        Resources {
+            iron_ore,
+            coal,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn order_needs_an_adjacent_workshop_and_clamps() {
+        let mut w = setup();
+        let forge = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(forge, Tile::Forge);
+        apply_command(
+            &mut w,
+            M,
+            Command::Order {
+                dir: Dir::W,
+                add: 5,
+            },
+        ); // not a workshop
+        apply_command(
+            &mut w,
+            M,
+            Command::Order {
+                dir: Dir::Up,
+                add: 5,
+            },
+        );
+        assert!(w.mountains[&M].orders.is_empty());
+        for _ in 0..30 {
+            apply_command(
+                &mut w,
+                M,
+                Command::Order {
+                    dir: Dir::E,
+                    add: 5,
+                },
+            );
+        }
+        assert_eq!(w.mountains[&M].orders[&forge], 99);
+        let ch = apply_command(
+            &mut w,
+            M,
+            Command::Order {
+                dir: Dir::E,
+                add: 0,
+            },
+        );
+        assert!(w.mountains[&M].orders.is_empty());
+        assert_eq!(ch.orders.get(&forge), Some(&0));
+        // The command's change reaches that tick's delta.
+        let mut d = step(&mut w).remove(&M).unwrap();
+        ch.merge_into(&mut d);
+        assert_eq!(d.orders, vec![(forge, 0)]);
+    }
+
+    #[test]
+    fn a_dwarf_smelts_the_ordered_ingots() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 2);
+        *res(&mut w) = ore(4, 2);
+        let mut last = None;
+        for _ in 0..300 {
+            if w.mountains[&M].orders.is_empty() {
+                break;
+            }
+            if w.fortresses[&M].dwarves[0].task.is_none() && in_view(&w, forge) {
+                assign(&mut w, 0, forge);
+                assert_eq!(
+                    w.fortresses[&M].dwarves[0].task.as_ref().map(|t| t.kind),
+                    Some(DesignationKind::Smelt)
+                );
+            }
+            last = step(&mut w).remove(&M);
+        }
+        let r = w.fortresses[&M].resources;
+        assert_eq!((r.iron, r.iron_ore, r.coal), (2, 0, 0));
+        assert!(w.mountains[&M].orders.is_empty());
+        assert!(last.unwrap().orders.contains(&(forge, 0)));
+        assert_eq!(tile(&w, forge), Tile::Forge);
+    }
+
+    #[test]
+    fn smelting_without_stock_produces_nothing() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 1);
+        *res(&mut w) = ore(2, 1);
+        assign(&mut w, 0, forge);
+        let progress = |w: &World| {
+            w.fortresses[&M].dwarves[0]
+                .task
+                .as_ref()
+                .map(|t| t.progress)
+        };
+        for _ in 0..300 {
+            if progress(&w) == Some(DesignationKind::Smelt.work_ticks() - 1) {
+                break;
+            }
+            step(&mut w);
+        }
+        assert_eq!(progress(&w), Some(29));
+        res(&mut w).coal = 0;
+        step(&mut w);
+        assert!(w.fortresses[&M].dwarves[0].task.is_none());
+        let r = w.fortresses[&M].resources;
+        assert_eq!((r.iron, r.iron_ore), (0, 2));
+        assert_eq!(w.mountains[&M].orders[&forge], 1);
+    }
+
+    #[test]
+    fn short_stock_hides_the_order_from_the_ai() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 3);
+        *res(&mut w) = ore(1, 0);
+        assert!(!in_view(&w, forge));
+        res(&mut w).add(ore(1, 1));
+        let view = view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert_eq!(view.designations.get(&forge), Some(&DesignationKind::Smelt));
+    }
+
+    #[test]
+    fn digging_a_forge_drops_its_order() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 3);
+        let stone = w.fortresses[&M].resources.stone;
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        let mut reported = false;
+        for _ in 0..100 {
+            if tile(&w, forge) != Tile::Forge {
+                break;
+            }
+            reported |= step(&mut w)[&M].orders.contains(&(forge, 0));
+        }
+        assert_ne!(tile(&w, forge), Tile::Forge);
+        assert!(w.mountains[&M].orders.is_empty());
+        assert_eq!(w.fortresses[&M].resources.stone, stone + 6);
+        assert!(reported);
     }
 }
