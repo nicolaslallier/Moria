@@ -2,7 +2,7 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{Screen, Session};
+use crate::game::{BUILDS, Screen, Session};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -45,7 +45,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                hud.run_if(in_state(Screen::Playing)),
+                (hud, build_menu).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -248,6 +248,35 @@ fn create_hero(
     Ok(())
 }
 
+fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if !g.build_menu {
+        return Ok(());
+    }
+    let stone = g.resources.stone;
+    centered("Construire").show(ctx.ctx_mut()?, |ui| {
+        ui.label(format!("Pierre disponible : {stone}"));
+        ui.separator();
+        let mut picked = None;
+        for (i, &(_, label, cost)) in BUILDS.iter().enumerate() {
+            let text = format!("{label} — {cost} pierre");
+            let b = egui::Button::new(text).selected(i == g.build_sel);
+            if ui.add_enabled(stone >= cost, b).clicked() {
+                picked = Some(i);
+            }
+        }
+        if let Some(i) = picked {
+            g.pick_build(i);
+        }
+        ui.separator();
+        ui.small("Clavier : flèches + Espace · 3 ou Échap : fermer");
+        ui.small("Manette : croix/stick + A/✕ · bouton gauche (X/□) ou B/○ : fermer");
+    });
+    Ok(())
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -281,10 +310,11 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             });
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode Mur : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X, 1, 2, 3 : mode · glisser clic gauche : désigner · clic droit : annuler",
+                 · X, 1, 2 : mode · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
-                 · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode");
+                 · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
+                 · bouton gauche (X/□) : menu construire");
         });
     Ok(())
 }

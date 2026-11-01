@@ -75,6 +75,10 @@ pub struct Game {
     /// Last horizontal direction pressed; Space digs that way.
     pub last_dir: Dir,
     pub mode: DesignationKind,
+    /// Build menu (key 3) open.
+    pub build_menu: bool,
+    /// Highlighted row of the build menu, for keyboard and gamepad.
+    pub build_sel: usize,
     /// `Some` while the player browses another level than the hero's.
     pub browse_z: Option<u8>,
     last_move: f64,
@@ -85,7 +89,26 @@ pub struct Game {
     ticks: u64,
 }
 
+/// Everything the player can build: mode, label, stone cost.
+pub const BUILDS: &[(DesignationKind, &str, u32)] = &[(DesignationKind::Wall, "Mur", 1)];
+
 impl Game {
+    /// Moves the build-menu highlight by one row, wrapping.
+    pub fn build_step(&mut self, down: bool) {
+        let n = BUILDS.len();
+        self.build_sel = (self.build_sel + if down { 1 } else { n - 1 }) % n;
+    }
+
+    /// Picks build `i` if the stone covers it: sets the mode and closes the menu.
+    pub fn pick_build(&mut self, i: usize) {
+        if let Some(&(kind, _, cost)) = BUILDS.get(i)
+            && self.resources.stone >= cost
+        {
+            self.mode = kind;
+            self.build_menu = false;
+        }
+    }
+
     pub fn new(v: FortressView) -> Self {
         Self {
             confirmed: v.hero.pos,
@@ -95,6 +118,8 @@ impl Game {
             resources: v.resources,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
+            build_menu: false,
+            build_sel: 0,
             browse_z: None,
             last_move: f64::NEG_INFINITY,
             pending: VecDeque::new(),
@@ -525,6 +550,21 @@ mod tests {
         assert_eq!(g.dig(), Some(ClientMsg::Build(Dir::E)));
         g.last_dir = Dir::N; // rock: Wall mode still digs
         assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::N)));
+    }
+
+    #[test]
+    fn build_menu_pick_needs_stone() {
+        let mut g = game();
+        g.build_menu = true;
+        g.build_step(true);
+        g.build_step(false);
+        assert_eq!(g.build_sel, 0); // wraps, stays in range
+        g.pick_build(g.build_sel);
+        assert!(g.build_menu); // no stone: stays open
+        g.resources.stone = 1;
+        g.pick_build(g.build_sel);
+        assert!(!g.build_menu);
+        assert_eq!(g.mode, DesignationKind::Wall);
     }
 
     #[test]

@@ -45,6 +45,8 @@ struct Intent {
     dig: bool,
     toggle: bool,
     mode: Option<DesignationKind>,
+    build_menu: bool,
+    close_menu: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -63,11 +65,11 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             Some(DesignationKind::Dig)
         } else if keys.just_pressed(KeyCode::Digit2) {
             Some(DesignationKind::Stairs)
-        } else if keys.just_pressed(KeyCode::Digit3) {
-            Some(DesignationKind::Wall)
         } else {
             None
         },
+        build_menu: keys.just_pressed(KeyCode::Digit3),
+        close_menu: keys.just_pressed(KeyCode::Escape),
     }
 }
 
@@ -127,7 +129,9 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         down: any(GamepadButton::RightTrigger),
         dig: any(GamepadButton::South),
         toggle: any(GamepadButton::North),
-        mode: None,
+        build_menu: any(GamepadButton::West),
+        close_menu: any(GamepadButton::East),
+        ..default()
     }
 }
 
@@ -136,7 +140,8 @@ fn play(
     logical: Res<ButtonInput<Key>>,
     pads: Query<&Gamepad>,
     window: Single<&Window, With<PrimaryWindow>>,
-    mut stick: Local<Option<Dir>>,
+    // Last stick direction (hysteresis) and last menu move (one step per press).
+    mut prev: Local<(Option<Dir>, Option<Dir>)>,
     time: Res<Time>,
     mut client: ResMut<Client>,
 ) {
@@ -146,14 +151,39 @@ fn play(
     };
     let k = keyboard_intent(&keys, &logical);
     // gilrs keeps reporting pads in the background; only a focused window plays.
+    let (stick, menu_dir) = &mut *prev;
     let p = if window.focused {
-        gamepad_intent(&pads, &mut stick)
+        gamepad_intent(&pads, stick)
     } else {
         *stick = None;
         Intent::default()
     };
+    if k.build_menu || p.build_menu {
+        g.build_menu = !g.build_menu;
+        g.build_sel = 0;
+    } else if k.close_menu || p.close_menu {
+        g.build_menu = false;
+    }
+    // Open menu: moves and the action button drive the menu, not the hero.
+    let walk = k.walk.or(p.walk);
+    if g.build_menu {
+        // Walk is held; step only on a new direction.
+        if walk != *menu_dir && matches!(walk, Some(Dir::N | Dir::S)) {
+            g.build_step(walk == Some(Dir::S));
+        }
+        *menu_dir = walk;
+        if k.dig || p.dig {
+            g.pick_build(g.build_sel);
+        }
+        if let Some(m) = k.mode {
+            g.mode = m;
+            g.build_menu = false;
+        }
+        return;
+    }
+    *menu_dir = None;
     let mut out = vec![];
-    if let Some(d) = k.walk.or(p.walk) {
+    if let Some(d) = walk {
         out.extend(g.try_move(d, now));
     }
     if k.up || p.up {
