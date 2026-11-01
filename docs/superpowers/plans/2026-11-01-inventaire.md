@@ -110,9 +110,10 @@
   - `Bus::publish(&self, key: &str, body: Vec<u8>, durable: bool) -> anyhow::Result<()>` — `durable` ⇒ persistent message and waits for the publisher confirm; otherwise fire-and-forget
   - `enum Queue<'a> { Shared { name: &'a str, latest_only: bool }, Exclusive, Durable(&'a str) }`
   - `Bus::subscribe(&self, key: &str, q: Queue) -> anyhow::Result<impl Stream<Item = Vec<u8>> + Unpin>` — declares and binds the queue; `latest_only` sets `x-max-length: 1` with `drop-head`; `Durable` is a durable named queue; the stream ends when the connection dies (callers reconnect); each delivery is acked automatically
+  - `Bus::declare(&self, key: &str, q: Queue) -> anyhow::Result<()>` — declare and bind only, no consumer (so the server can make sure the durable `inventory` queue exists before it publishes: a durable publish to an unbound key is silently dropped by the broker)
   - `Bus::is_connected(&self) -> bool`
 
-- [ ] **Step 1: Write failing test** `crates/moria-bus/tests/broker.rs`, `#[ignore]`, reads `AMQP_TEST_URL`: `publish_reaches_subscriber` (subscribe `Queue::Exclusive` on `test.a`, publish `b"x"`, receive it within 2 s), `latest_only_keeps_one` (publish 3 to a `latest_only` shared queue with no consumer, then subscribe: only the last arrives), `durable_publish_survives_late_subscriber` (publish to a `Durable` queue before subscribing, then receive).
+- [ ] **Step 1: Write failing test** `crates/moria-bus/tests/broker.rs`, `#[ignore]`, reads `AMQP_TEST_URL`: `publish_reaches_subscriber` (subscribe `Queue::Exclusive` on `test.a`, publish `b"x"`, receive it within 2 s), `latest_only_keeps_one` (publish 3 to a `latest_only` shared queue with no consumer, then subscribe: only the last arrives), `durable_publish_survives_late_subscriber` (`declare` a `Durable` queue, publish, then subscribe and receive).
 - [ ] **Step 2: Run** `AMQP_TEST_URL=... cargo test -p moria-bus -- --ignored` — expect FAIL (compile). Start a throwaway broker with `docker run -d --rm --name moria-amqp-test -p 5672:5672 rabbitmq:4-alpine`.
 - [ ] **Step 3: Implement.** Check the current `lapin` API and executor features on docs.rs before writing (tokio runtime); follow `bridge.rs`'s retry style (2 s, French warnings).
 - [ ] **Step 4: Run** the same command — expect PASS.
@@ -178,12 +179,12 @@
 - Consumes: `Cache`, `State`, `Resources::delta`, `World`
 - Produces: `struct InvSync` with
   - `InvSync::new(sender: &str, epoch: u64) -> InvSync`
-  - `InvSync::begin_tick(&mut self, w: &mut World) -> ()` — for each fortress sets `f.resources = cache.view(&state, m)` **only for mountains the state has seen or that have no pending seed**; then snapshots `before`
-  - `InvSync::end_tick(&mut self, w: &World) -> Vec<Batch>` — for each fortress, `Resources::delta(before, f.resources)`; skips an all-zero delta; sends pending seeds (mountains not in `state.seeded`) as `seed: true` batches built from the world's loaded resources, once per start until seeded
+  - `InvSync::begin_tick(&mut self, w: &mut World) -> ()` — first, for every fortress not yet seeded **in this run**, `cache.push(m, f.resources, zero, true)` (a seed batch from the loaded resources, kept in an outbox); then for each fortress sets `f.resources = cache.view(&state, m)`; then snapshots `before`. Seeding happens exactly once per mountain per run, so the cache counts it once.
+  - `InvSync::end_tick(&mut self, w: &World) -> Vec<Batch>` — returns the outbox (seed batches) plus, for each fortress, `cache.push` of `Resources::delta(before, f.resources)`; skips an all-zero delta
   - `InvSync::on_state(&mut self, st: State)` — stores it and calls `cache.reconcile`
   - `InvSync::inventory_up(&self, now: Instant) -> bool` — a state received within `STOPPED_AFTER`
 
-- [ ] **Step 1: Write failing tests** (build a `World` via `moria_core::world::generate` + `claim_mountain`): `digging_yield_becomes_an_add_batch`, `build_cost_becomes_a_take_batch`, `quiet_tick_makes_no_batch`, `state_replaces_stale_world_bin_resources` (world.bin food 12, state food 7 → after `begin_tick` fortress food 7), `unacked_batch_survives_a_new_state` (no double count), `seed_is_sent_until_state_lists_it` (two `end_tick` calls without state → seed batch both times, none after `on_state` with `seeded`), `inventory_up_expires_after_five_seconds`.
+- [ ] **Step 1: Write failing tests** (build a `World` via `moria_core::world::generate` + `claim_mountain`): `digging_yield_becomes_an_add_batch`, `build_cost_becomes_a_take_batch`, `quiet_tick_makes_no_batch`, `state_replaces_stale_world_bin_resources` (world.bin food 12, state food 7 → after `begin_tick` fortress food 7), `unacked_batch_survives_a_new_state` (no double count), `seed_is_sent_once_and_counted_once` (two ticks without any state → exactly one seed batch in total, and `f.resources` unchanged = the loaded value; after `on_state` with the seed acked, resources equal the state totals), `inventory_up_expires_after_five_seconds`.
 - [ ] **Step 2: Run** `cargo test -p moria-server inventory::` — expect FAIL.
 - [ ] **Step 3: Implement** `InvSync`. Before the first state arrives `begin_tick` leaves `f.resources` alone (the game plays on the loaded value). Mark with `// ponytail: net diff per tick, so add-then-take inside one tick clamps on the net; fine unless a tick both exhausts and refills a resource`.
 - [ ] **Step 4: Run** — expect PASS.
@@ -197,7 +198,7 @@
 **Interfaces:**
 - Consumes: `InvSync` (Task 8), `Bus`, `KEY_APPLY`, `KEY_STATE`
 - Produces:
-  - `bridge::run` gains `batches: mpsc::Receiver<Batch>` and `states: mpsc::Sender<State>`; it publishes each batch durably, keeps failed ones in a `VecDeque<Batch>` capped by `const MAX_UNSENT: usize = 100_000` (drop oldest, `tracing::error!`), re-sends them in order after every reconnect, and forwards decoded `inventory.state` messages (non-durable queue, `Queue::Exclusive`)
+  - `bridge::run` gains `batches: mpsc::Receiver<Batch>` and `states: mpsc::Sender<State>`; it first `Bus::declare`s the durable `inventory` queue on every (re)connect, publishes each batch durably, keeps failed ones in a `VecDeque<Batch>` capped by `const MAX_UNSENT: usize = 100_000` (drop oldest, `tracing::error!`), re-sends them in order after every reconnect, and forwards decoded `inventory.state` messages (non-durable queue, `Queue::Exclusive`)
   - `fn push_unsent(q: &mut VecDeque<Batch>, b: Batch)` — the cap logic, unit-testable
   - `State.inv: InvSync`; `epoch` = `SystemTime` Unix ms at start; sender `"server"`
   - in `State::step`: drain `states_rx` (bounded, like `MAX_ASSIGN_PER_TICK`) → `inv.on_state`; `inv.begin_tick(&mut w)` right before `sim::step`; `inv.end_tick(&w)` right after, each batch `try_send` to the bridge (full channel = log + count, the unsent logic covers the broker side); metric `moria_nats_connected` also requires `inv.inventory_up` (keep one gauge)
