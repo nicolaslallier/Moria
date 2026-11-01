@@ -63,15 +63,21 @@ impl Command {
     }
 }
 
-/// Designation changes caused by commands, folded into that tick's delta. Per tile:
-/// `Some(kind)` = designated, `None` = removed; the last write wins.
+/// Changes caused by commands, folded into that tick's delta. Designations per tile:
+/// `Some(kind)` = designated, `None` = removed; the last write wins, for orders too.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Changes(pub BTreeMap<TilePos, Option<DesignationKind>>);
+pub struct Changes {
+    pub designations: BTreeMap<TilePos, Option<DesignationKind>>,
+    pub tiles: Vec<(TilePos, Tile)>,
+    pub orders: BTreeMap<TilePos, u8>,
+}
 
 impl Changes {
     /// Folds a `later` command's changes into `self`; the last write on a tile wins.
     pub fn then(&mut self, later: Changes) {
-        self.0.extend(later.0);
+        self.designations.extend(later.designations);
+        self.tiles.extend(later.tiles);
+        self.orders.extend(later.orders);
     }
 
     /// Merges into the tick delta. These changes happened before `step`, so whatever `d`
@@ -83,12 +89,24 @@ impl Changes {
             .map(|a| a.0)
             .chain(d.designations_removed.iter().copied())
             .collect();
-        for (p, k) in self.0.into_iter().filter(|(p, _)| !seen.contains(p)) {
+        for (p, k) in self
+            .designations
+            .into_iter()
+            .filter(|(p, _)| !seen.contains(p))
+        {
             match k {
                 Some(k) => d.designations_added.push((p, k)),
                 None => d.designations_removed.push(p),
             }
         }
+        // Command tiles go first: the step's later writes win on the client.
+        d.tiles.splice(0..0, self.tiles);
+        let reported: HashSet<TilePos> = d.orders.iter().map(|o| o.0).collect();
+        d.orders.extend(
+            self.orders
+                .into_iter()
+                .filter(|(p, _)| !reported.contains(p)),
+        );
     }
 }
 
@@ -124,14 +142,25 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
             mt.designate(a, b, kind);
             for (p, old) in rect.into_iter().zip(before) {
                 if old != Some(kind) && mt.designations.get(&p) == Some(&kind) {
-                    ch.0.insert(p, Some(kind));
+                    ch.designations.insert(p, Some(kind));
                 }
             }
         }
-        // Filled in by the door and workshop tasks.
+        Command::Use(d) if !matches!(d, Dir::Up | Dir::Down) => {
+            let t = h.pos.step(d);
+            let free = f.dwarves.iter().all(|w| w.pos != t);
+            if free
+                && h.pos != t
+                && let Some(new) = mt.get(t).and_then(Tile::toggled_door)
+            {
+                mt.set(t, new);
+                ch.tiles.push((t, new));
+            }
+        }
+        // Filled in by the workshop task.
         Command::Use(_) | Command::Order { .. } => {}
         Command::Cancel { a, b } => {
-            ch.0 = mt
+            ch.designations = mt
                 .cancel_designations(a, b)
                 .into_iter()
                 .map(|p| (p, None))
@@ -204,7 +233,7 @@ fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
 
 fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
     h.pending_move = None;
-    if let Some(to) = mt.move_dest(h.pos, d) {
+    if let Some(to) = mt.hero_move_dest(h.pos, d) {
         h.pos = to;
         h.move_cooldown = MOVE_COOLDOWN;
         h.dig = None;
@@ -305,7 +334,7 @@ fn dig_at(
             tiles.push((q, now));
         }
         if had && !m.designations.contains_key(&q) {
-            ch.0.insert(q, None);
+            ch.designations.insert(q, None);
         }
     }
     Some(res)
@@ -367,7 +396,8 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                                     && was == Some(DesignationKind::Stairs)
                                     && m.designate(target, target, DesignationKind::Stairs) == 1
                                 {
-                                    ch.0.insert(target, Some(DesignationKind::Stairs));
+                                    ch.designations
+                                        .insert(target, Some(DesignationKind::Stairs));
                                 }
                             }
                         }
@@ -516,6 +546,61 @@ mod tests {
     }
     fn designate(w: &mut World, q: TilePos, kind: DesignationKind) {
         apply_command(w, M, Command::Designate { a: q, b: q, kind });
+    }
+
+    #[test]
+    fn hero_locks_and_unlocks_a_door() {
+        let mut w = setup();
+        let door = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(door, Tile::WoodDoor);
+        let ch = apply_command(&mut w, M, Command::Use(Dir::E));
+        assert_eq!(tile(&w, door), Tile::WoodDoorLocked);
+        assert_eq!(ch.tiles, vec![(door, Tile::WoodDoorLocked)]);
+        apply_command(&mut w, M, Command::Move(Dir::E)); // the hero has the key
+        assert_eq!(hero(&w).pos, door);
+    }
+
+    #[test]
+    fn cannot_lock_an_occupied_door() {
+        let mut w = setup();
+        let door = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(door, Tile::StoneDoor);
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = door;
+        apply_command(&mut w, M, Command::Use(Dir::E));
+        assert_eq!(tile(&w, door), Tile::StoneDoor);
+    }
+
+    #[test]
+    fn locking_a_door_reroutes_or_drops_the_dwarf() {
+        let mut w = setup();
+        // A corridor east of the room: the door is the only way to the dig target.
+        let door = p(7, 1, 0);
+        let mt = w.mountains.get_mut(&M).unwrap();
+        for x in 6..10 {
+            mt.set(p(x, 1, 0), Tile::Floor);
+        }
+        mt.set(door, Tile::WoodDoor);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(6, 1, 0);
+        let t = p(10, 1, 0);
+        designate(&mut w, t, DesignationKind::Dig);
+        let id = w.fortresses[&M].dwarves[0].id;
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(id, t)],
+            },
+        );
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+        apply_command(&mut w, M, Command::Use(Dir::E));
+        assert_eq!(tile(&w, door), Tile::WoodDoorLocked);
+        for _ in 0..40 {
+            step(&mut w);
+            assert_ne!(w.fortresses[&M].dwarves[0].pos, door);
+        }
+        assert!(w.fortresses[&M].dwarves[0].task.is_none());
+        assert_eq!(tile(&w, t), Tile::Rock);
     }
 
     #[test]
@@ -1002,7 +1087,10 @@ mod tests {
                 kind: DesignationKind::Dig,
             },
         ));
-        assert_eq!(ch.0, BTreeMap::from([(t, Some(DesignationKind::Dig))]));
+        assert_eq!(
+            ch.designations,
+            BTreeMap::from([(t, Some(DesignationKind::Dig))])
+        );
         let mut d = step(&mut w).remove(&M).unwrap();
         ch.merge_into(&mut d);
         assert_eq!(d.designations_added, vec![(t, DesignationKind::Dig)]);
@@ -1020,7 +1108,7 @@ mod tests {
             },
         ));
         ch.then(apply_command(&mut w, M, Command::Cancel { a: t, b: t }));
-        assert_eq!(ch.0, BTreeMap::from([(t, None)]));
+        assert_eq!(ch.designations, BTreeMap::from([(t, None)]));
     }
 
     #[test]
@@ -1188,7 +1276,7 @@ mod tests {
                 kind: DesignationKind::Dig,
             },
         );
-        assert!(!c.0.is_empty() && c.0.values().all(Option::is_some));
+        assert!(!c.designations.is_empty() && c.designations.values().all(Option::is_some));
         let n = w.mountains[&M].designations.len();
         assert!(w.mountains[&M].designations.contains_key(&t));
         let c = apply_command(
@@ -1199,7 +1287,7 @@ mod tests {
                 b: p(99, 99, 0),
             },
         );
-        assert!(c.0.len() == n && c.0.values().all(Option::is_none));
+        assert!(c.designations.len() == n && c.designations.values().all(Option::is_none));
         assert!(w.mountains[&M].designations.is_empty());
         // Unknown mountain, and a mountain nobody owns: ignored.
         let before = w.clone();

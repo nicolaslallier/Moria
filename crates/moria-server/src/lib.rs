@@ -583,10 +583,14 @@ mod tests {
         }
         tx.try_send((PlayerId(1), designate(6, 23))).unwrap();
         let ch = s.commands();
-        assert_eq!(ch[&MountainId(1)].0.len(), 1, "player 1 served this tick");
-        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+        assert_eq!(
+            ch[&MountainId(1)].designations.len(),
+            1,
+            "player 1 served this tick"
+        );
+        assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
-        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+        assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
     }
 }
