@@ -23,7 +23,7 @@ services:
     build:
       <<: *build
       args: { BIN: moria-server }
-    # 9464 : /metrics pour Prometheus (stack Infra, job `moria` -> 192.168.2.10:9464).
+    # 9464 : /metrics pour Prometheus (stack Infra, via host.docker.internal:9464).
     # Ne jamais le rediriger sur le routeur : seul 7777 sort sur Internet.
     ports: ["7777:7777", "9464:9464"]
     volumes: ["moria-data:/data"]
