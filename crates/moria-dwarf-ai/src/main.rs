@@ -7,7 +7,8 @@ async fn main() -> anyhow::Result<()> {
         // Pas de couleurs hors terminal : Docker → Alloy → Loki garde un texte lisible.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
-    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".into());
+    let url = std::env::var("AMQP_URL")
+        .unwrap_or_else(|_| "amqp://moria:moria@rabbitmq:5672/moria".into());
     moria_dwarf_ai::run(url, shutdown_signal()).await
 }
 

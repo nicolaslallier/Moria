@@ -3,7 +3,7 @@
 use crate::metrics::{M, inc};
 use futures::StreamExt;
 use moria_core::MountainId;
-use moria_core::ai::{AiView, Assignments, MAX_DWARVES_PER_VIEW, SUBJECT_ASSIGN, SUBJECT_VIEW};
+use moria_core::ai::{AiView, Assignments, KEY_ASSIGN, KEY_VIEW, MAX_DWARVES_PER_VIEW};
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
@@ -34,7 +34,7 @@ pub async fn run(
 ) {
     let (client, mut sub) = loop {
         let r = match async_nats::connect(&url).await {
-            Ok(c) => match c.subscribe(SUBJECT_ASSIGN).await {
+            Ok(c) => match c.subscribe(KEY_ASSIGN).await {
                 Ok(sub) => Ok((c, sub)),
                 Err(e) => Err(format!("abonnement impossible ({e})")),
             },
@@ -61,7 +61,7 @@ pub async fn run(
                 }
                 match postcard::to_allocvec(&v) {
                     Ok(b) => {
-                        match client.publish(SUBJECT_VIEW, b.into()).await {
+                        match client.publish(KEY_VIEW, b.into()).await {
                             Ok(()) => inc(&M.views_published),
                             Err(e) => tracing::warn!("publication de vue echouee: {e}"),
                         }

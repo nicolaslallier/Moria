@@ -4622,8 +4622,8 @@ name = "moria-dwarf-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-nats",
  "futures",
+ "moria-bus",
  "moria-core",
  "postcard",
  "serde",
