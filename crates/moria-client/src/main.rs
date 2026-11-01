@@ -5,6 +5,7 @@ mod game;
 mod input;
 mod net;
 mod render;
+mod terrain;
 mod ui;
 
 use bevy::platform::cell::SyncCell;

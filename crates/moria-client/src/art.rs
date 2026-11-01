@@ -1,5 +1,5 @@
 //! Images baked into the binary: the release ships a lone executable, no assets folder.
-//! Sources are the user's art, shrunk once (tiles 96px, heads 96px, portraits 256px).
+//! Heads and portraits use the user's art; stone and floor are generated in `terrain`.
 //! The bytes go into Bevy's `embedded://` source, so decoding runs on the asset
 //! task pool instead of blocking startup.
 
@@ -61,6 +61,9 @@ fn slug(r: Race) -> &'static str {
 pub struct Art {
     pub rock: Handle<Image>,
     pub floor: Handle<Image>,
+    pub gold: Handle<Image>,
+    pub mithril: Handle<Image>,
+    pub wall: Handle<Image>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
     pub castle: Handle<Image>,
@@ -100,16 +103,25 @@ impl FromWorld for Art {
                 })
                 .load(format!("embedded://moria/{name}.png"))
         };
+        let stair = load("stair");
+        let worker_head = load("head_worker");
+        let castle = load("castle");
+        let heads = Race::ALL.map(|r| load(&format!("head_{}", slug(r)))).into();
+        let portraits = Race::ALL
+            .map(|r| load(&format!("portrait_{}", slug(r))))
+            .into();
+        let mut images = world.resource_mut::<Assets<Image>>();
         Art {
-            rock: load("rock"),
-            floor: load("floor"),
-            stair: load("stair"),
-            worker_head: load("head_worker"),
-            castle: load("castle"),
-            heads: Race::ALL.map(|r| load(&format!("head_{}", slug(r)))).into(),
-            portraits: Race::ALL
-                .map(|r| load(&format!("portrait_{}", slug(r))))
-                .into(),
+            rock: images.add(crate::terrain::image(moria_core::Tile::Rock)),
+            floor: images.add(crate::terrain::image(moria_core::Tile::Floor)),
+            gold: images.add(crate::terrain::image(moria_core::Tile::Gold)),
+            mithril: images.add(crate::terrain::image(moria_core::Tile::Mithril)),
+            wall: images.add(crate::terrain::image(moria_core::Tile::Wall)),
+            stair,
+            worker_head,
+            castle,
+            heads,
+            portraits,
         }
     }
 }
