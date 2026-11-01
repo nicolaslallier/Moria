@@ -225,7 +225,11 @@ impl Mountain {
         for p in self.rect(a, b) {
             // Cheap cap check first: a full mountain skips the per-tile rules (and their search).
             let full = self.designations.len() >= MAX_DESIGNATIONS;
-            if (!full || self.designations.contains_key(&p)) && self.diggable(p, kind) {
+            // A dragged dig leaves fields alone; grubbing one up takes a one-tile designation.
+            let field = kind == DesignationKind::Dig
+                && a != b
+                && matches!(self.get(p), Some(Tile::Field | Tile::Crop));
+            if (!full || self.designations.contains_key(&p)) && !field && self.diggable(p, kind) {
                 self.designations.insert(p, kind);
                 n += 1;
             }
@@ -619,6 +623,24 @@ mod tests {
         m.set(a, Tile::Crop);
         assert_eq!(m.dig(a, DesignationKind::Dig).map(|r| r.food), Some(2));
         assert_eq!(m.get(a), Some(Tile::Grass));
+    }
+
+    #[test]
+    fn a_dig_rectangle_spares_fields() {
+        let mut m = Mountain::new(MountainId(0), 4, 4, GROUND_Z + 1, Tile::Grass);
+        let (field, rock) = (p(1, 1, GROUND_Z), p(2, 1, GROUND_Z));
+        m.set(field, Tile::Field);
+        m.set(rock, Tile::Rock);
+        assert_eq!(m.designate(field, rock, DesignationKind::Dig), 1);
+        assert!(
+            !m.designations.contains_key(&field),
+            "a dragged dig leaves the crops alone"
+        );
+        assert_eq!(
+            m.designate(field, field, DesignationKind::Dig),
+            1,
+            "one tile on purpose"
+        );
     }
 
     #[test]

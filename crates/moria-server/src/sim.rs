@@ -253,9 +253,15 @@ pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
     m
 }
 
-/// Work that brings in food: harvesting a crop, butchering a cow.
+/// Work that brings in food: harvesting or grubbing up a crop, butchering a cow, sowing.
 fn food_work(m: &Mountain, p: TilePos, kind: DesignationKind) -> bool {
-    kind == DesignationKind::Chop && matches!(m.get(p), Some(Tile::Crop | Tile::Cow))
+    use DesignationKind as K;
+    matches!(
+        (kind, m.get(p)),
+        (K::Chop, Some(Tile::Crop | Tile::Cow))
+            | (K::Dig, Some(Tile::Crop))
+            | (K::Farm, Some(Tile::Grass))
+    )
 }
 
 /// Starts digging (`Dig`, a tree is chopped) or building the tile toward `d`.
@@ -271,6 +277,7 @@ fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
         k => k,
     };
     if mt.diggable(t, kind)
+        && !(kind == DesignationKind::Dig && mt.get(t) == Some(Tile::Field)) // one key, a lost field
         && h.dig
             .as_ref()
             .is_none_or(|j| j.target != t || j.kind != kind)
@@ -425,8 +432,11 @@ fn grow(m: &mut Mountain, n: u64, tiles: &mut Vec<(TilePos, Tile)>, ch: &mut Cha
             tiles.push((q, Tile::Crop));
         }
     }
+    // Past the designation cap: crops are bounded by the ground, and a famine hides every
+    // other designation, so a capped harvest would never come.
     for q in on_ground(m, Tile::Crop) {
-        if !m.designations.contains_key(&q) && m.designate(q, q, DesignationKind::Chop) == 1 {
+        if let std::collections::btree_map::Entry::Vacant(e) = m.designations.entry(q) {
+            e.insert(DesignationKind::Chop);
             ch.designations.insert(q, Some(DesignationKind::Chop));
         }
     }
@@ -1697,6 +1707,56 @@ mod tests {
             f.resources.food + f.dwarves.iter().filter(|d| !d.hungry).count() as u32,
             2
         );
+    }
+
+    #[test]
+    fn a_famine_still_sows_and_reaps() {
+        let mut w = setup();
+        let (g, c) = (p(-3, 1, 0), p(-3, 3, 0));
+        for q in [g, g.step(Dir::E), c, c.step(Dir::E)] {
+            w.mountains.get_mut(&M).unwrap().set(q, Tile::Grass);
+        }
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        designate(&mut w, g, DesignationKind::Farm);
+        designate(&mut w, c, DesignationKind::Dig);
+        w.tick = EAT_EVERY;
+        step(&mut w);
+        assert!(w.fortresses[&M].dwarves.iter().all(|d| d.hungry));
+        let view = view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert!(view.designations.contains_key(&g), "sowing is food work");
+        assert!(
+            view.designations.contains_key(&c),
+            "so is grubbing up a crop"
+        );
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = g.step(Dir::E);
+        assign(&mut w, 0, g);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+    }
+
+    #[test]
+    fn a_crop_asks_for_its_harvest_even_when_designations_are_full() {
+        let mut m = Mountain::new(M, 80, 80, GROUND_Z + 1, Tile::Rock);
+        m.designate(
+            TilePos::new(0, 0, 0),
+            TilePos::new(79, 79, 0),
+            DesignationKind::Dig,
+        );
+        assert_eq!(m.designations.len(), MAX_DESIGNATIONS);
+        let c = TilePos::new(1, 1, GROUND_Z);
+        m.set(c, Tile::Crop);
+        grow(&mut m, 0, &mut vec![], &mut Changes::default());
+        assert_eq!(m.designations.get(&c), Some(&DesignationKind::Chop));
+    }
+
+    #[test]
+    fn the_hero_does_not_trample_a_field() {
+        let mut w = setup();
+        w.mountains
+            .get_mut(&M)
+            .unwrap()
+            .set(p(3, 1, 0), Tile::Field);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert!(hero(&w).dig.is_none());
     }
 
     #[test]
