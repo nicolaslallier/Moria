@@ -417,6 +417,8 @@ pub struct Session {
     pub game: Option<Game>,
     /// Bumped on every accepted snapshot so the renderer rebuilds the map.
     pub snapshots: u32,
+    /// The game dropped by a disconnect or a new mountain, kept so its memory can be saved.
+    pub left: Option<Game>,
 }
 
 impl Session {
@@ -443,7 +445,17 @@ impl Session {
             }
             NetEvent::Msg(ServerMsg::Snapshot(v)) => {
                 self.snapshots += 1;
-                self.game = Some(Game::new(*v));
+                let mut g = Game::new(*v);
+                // A new snapshot of the same mountain keeps what the hero has explored.
+                if let Some(old) = self.game.take() {
+                    if old.mountain.id == g.mountain.id && old.mountain.size() == g.mountain.size()
+                    {
+                        g.explored = old.explored;
+                    } else {
+                        self.left = Some(old);
+                    }
+                }
+                self.game = Some(g);
                 self.screen = Screen::Playing;
                 false
             }
@@ -468,7 +480,7 @@ impl Session {
     fn end(&mut self, screen: Screen, msg: String) {
         self.screen = screen;
         self.error = Some(msg);
-        self.game = None;
+        self.left = self.game.take();
     }
 }
 
@@ -1135,5 +1147,22 @@ pub(crate) mod tests {
         let mut s = Session::default();
         assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));
         assert_eq!(s.screen, Screen::Playing);
+    }
+
+    #[test]
+    fn new_snapshot_keeps_explored() {
+        let g = game();
+        let view = FortressView {
+            mountain: g.mountain.clone(),
+            hero: g.hero.clone(),
+            dwarves: vec![],
+            resources: Resources::default(),
+            tick: 0,
+        };
+        let mut s = Session::default();
+        s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view.clone()))));
+        s.game.as_mut().unwrap().explored.mark(p(2, 1, 0));
+        s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
+        assert!(s.game.unwrap().explored.seen(p(2, 1, 0)));
     }
 }

@@ -1,7 +1,8 @@
 //! Client-side light model: what the hero has explored and how bright a tile is shown.
 //! Bevy-free, like `game.rs`.
 
-use moria_core::TilePos;
+use moria_core::{MountainId, TilePos};
+use std::path::{Path, PathBuf};
 
 /// A tile at or above this brightness becomes explored (moonlight alone does not explore).
 pub const SEEN_AT: f32 = 0.25;
@@ -66,6 +67,21 @@ impl Explored {
     }
 }
 
+/// Memory file for one server, account and mountain; anything but `[A-Za-z0-9_-]` becomes `_`.
+pub fn memory_file(dir: &Path, addr: &str, name: &str, mountain: MountainId) -> PathBuf {
+    let slug: String = format!("{addr}_{name}_{}", mountain.0)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("moria-souvenir-{slug}.bin"))
+}
+
 /// Brightness drawn for a tile: its light, or the dim memory if explored.
 pub fn shown(light: f32, seen: bool) -> f32 {
     light.max(if seen { MEMORY } else { 0.0 })
@@ -81,6 +97,25 @@ pub fn dwarf_visible(light: f32) -> bool {
 mod tests {
     use super::*;
     use moria_core::light::MOONLIGHT;
+
+    #[test]
+    fn memory_file_is_per_server_account_and_mountain() {
+        let d = Path::new("/x");
+        let a = memory_file(d, "192.168.2.10:7777", "Gimli", MountainId(3));
+        assert_eq!(
+            a,
+            Path::new("/x/moria-souvenir-192_168_2_10_7777_Gimli_3.bin")
+        );
+        assert_ne!(
+            a,
+            memory_file(d, "192.168.2.10:7777", "Gimli", MountainId(4))
+        );
+        assert!(
+            !memory_file(d, "../../etc", "a/b", MountainId(0))
+                .to_string_lossy()
+                .contains("..")
+        );
+    }
 
     #[test]
     fn explored_round_trips_and_marks() {
