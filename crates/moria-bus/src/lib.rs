@@ -3,18 +3,43 @@
 use anyhow::{Context, bail};
 use futures::{Stream, StreamExt};
 use lapin::options::{
-    BasicConsumeOptions, BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions,
-    QueueBindOptions, QueueDeclareOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
+    ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
 use moria_core::inventory::EXCHANGE;
 use std::time::Duration;
 
+const PUBLISH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Bus {
     conn: Connection,
     /// Canal en mode confirm, dedie aux publications.
     chan: Channel,
+}
+
+/// Message a acquitter explicitement ; sans `ack`, le broker le redistribue a la fermeture du canal.
+pub struct Delivery {
+    pub body: Vec<u8>,
+    inner: lapin::message::Delivery,
+}
+
+impl Delivery {
+    pub async fn ack(self) -> anyhow::Result<()> {
+        self.inner.ack(BasicAckOptions::default()).await?;
+        Ok(())
+    }
+}
+
+/// Borne l'attente d'une confirmation du broker.
+async fn within<T>(
+    d: Duration,
+    f: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(d, f)
+        .await
+        .map_err(|_| anyhow::anyhow!("delai depasse ({d:?}) en attendant le broker"))?
 }
 
 pub enum Queue<'a> {
@@ -77,7 +102,7 @@ impl Bus {
             .basic_publish(EXCHANGE.into(), key.into(), opts, &body, props)
             .await?;
         if durable {
-            let c = confirm.await?;
+            let c = within(PUBLISH_CONFIRM_TIMEOUT, async { Ok(confirm.await?) }).await?;
             if c.is_nack() {
                 bail!("publication refusee par le broker ({key})");
             }
@@ -110,6 +135,33 @@ impl Bus {
         Ok(consumer
             .take_while(|d| std::future::ready(d.is_ok()))
             .filter_map(|d| std::future::ready(d.ok().map(|d| d.data))))
+    }
+
+    /// Comme `subscribe` mais acquittement manuel (`Delivery::ack`), un message a la fois
+    /// (prefetch 1) : un message non acquitte est redistribue si le canal se ferme.
+    pub async fn subscribe_acked(
+        &self,
+        key: &str,
+        q: Queue<'_>,
+    ) -> anyhow::Result<impl Stream<Item = Delivery> + Unpin + use<>> {
+        let (chan, name) = self.bind(key, q).await?;
+        chan.basic_qos(1, BasicQosOptions::default()).await?;
+        let consumer = chan
+            .basic_consume(
+                name.as_str().into(),
+                "".into(),
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+        Ok(consumer
+            .take_while(|d| std::future::ready(d.is_ok()))
+            .filter_map(|d| {
+                std::future::ready(d.ok().map(|inner| Delivery {
+                    body: inner.data.clone(),
+                    inner,
+                }))
+            }))
     }
 
     /// Declare et lie seulement, sans consommateur.
@@ -150,16 +202,47 @@ impl Bus {
             ),
             Queue::Durable(name) => (name, QueueDeclareOptions::durable(), FieldTable::default()),
         };
-        let declared = chan.queue_declare(name.into(), opts, args).await?;
-        let name = declared.name().as_str().to_owned();
-        chan.queue_bind(
-            name.as_str().into(),
-            EXCHANGE.into(),
-            key.into(),
-            QueueBindOptions::default(),
-            FieldTable::default(),
+        let done = async {
+            let declared = chan.queue_declare(name.into(), opts, args).await?;
+            let name = declared.name().as_str().to_owned();
+            chan.queue_bind(
+                name.as_str().into(),
+                EXCHANGE.into(),
+                key.into(),
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await?;
+            anyhow::Ok(name)
+        }
+        .await;
+        match done {
+            Ok(name) => Ok((chan, name)),
+            Err(e) => {
+                let _ = chan.close(200, "echec de declaration".into()).await;
+                Err(e)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn within_errors_when_future_never_completes() {
+        let r = within(
+            PUBLISH_CONFIRM_TIMEOUT,
+            std::future::pending::<anyhow::Result<()>>(),
         )
-        .await?;
-        Ok((chan, name))
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn within_passes_through_a_ready_result() {
+        let r = within(PUBLISH_CONFIRM_TIMEOUT, async { Ok(7) }).await;
+        assert_eq!(r.unwrap(), 7);
     }
 }

@@ -82,3 +82,53 @@ async fn stream_ends_when_connection_closes() {
             .is_none()
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn unacked_delivery_is_redelivered_after_close() {
+    let key = uniq("test.unacked");
+    let bus = Bus::connect(&url()).await.unwrap();
+    bus.declare(&key, Queue::Durable(&key)).await.unwrap();
+    bus.publish(&key, b"keep".to_vec(), true).await.unwrap();
+    let mut s = bus
+        .subscribe_acked(&key, Queue::Durable(&key))
+        .await
+        .unwrap();
+    let d = timeout(S2, s.next()).await.unwrap().unwrap();
+    assert_eq!(d.body, b"keep");
+    bus.close().await;
+    let bus2 = Bus::connect(&url()).await.unwrap();
+    let mut s2 = bus2
+        .subscribe_acked(&key, Queue::Durable(&key))
+        .await
+        .unwrap();
+    let d = timeout(S2, s2.next()).await.unwrap().unwrap();
+    assert_eq!(d.body, b"keep");
+    d.ack().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn acked_delivery_is_not_redelivered() {
+    let key = uniq("test.acked");
+    let bus = Bus::connect(&url()).await.unwrap();
+    bus.declare(&key, Queue::Durable(&key)).await.unwrap();
+    bus.publish(&key, b"once".to_vec(), true).await.unwrap();
+    let mut s = bus
+        .subscribe_acked(&key, Queue::Durable(&key))
+        .await
+        .unwrap();
+    let d = timeout(S2, s.next()).await.unwrap().unwrap();
+    d.ack().await.unwrap();
+    bus.close().await;
+    let bus2 = Bus::connect(&url()).await.unwrap();
+    let mut s2 = bus2
+        .subscribe_acked(&key, Queue::Durable(&key))
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(700), s2.next())
+            .await
+            .is_err()
+    );
+}
