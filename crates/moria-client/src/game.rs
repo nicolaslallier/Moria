@@ -260,6 +260,7 @@ impl Game {
             None => {
                 self.build_menu = !self.build_menu;
                 self.build_sel = 0;
+                self.order_menu = None;
             }
         }
     }
@@ -1313,6 +1314,15 @@ pub(crate) mod tests {
         s.game.as_mut().unwrap().explored.mark(p(2, 1, 0));
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert!(s.game.unwrap().explored.seen(p(2, 1, 0)));
+    }
+
+    #[test]
+    fn opening_the_build_menu_closes_the_order_menu() {
+        let mut g = game();
+        g.order_menu = Some(Dir::E);
+        g.pick_action(None);
+        assert!(g.build_menu);
+        assert_eq!(g.order_menu, None);
     }
 
     #[test]

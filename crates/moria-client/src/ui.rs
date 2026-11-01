@@ -11,9 +11,9 @@ use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
-use moria_core::DesignationKind;
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
+use moria_core::{DesignationKind, Resources};
 use std::path::PathBuf;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
@@ -321,6 +321,18 @@ fn order_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     Ok(())
 }
 
+/// The stock line of a workshop window: only what the recipe consumes.
+fn stock_text(kind: DesignationKind, r: &Resources) -> String {
+    if kind == DesignationKind::Smelt {
+        format!(
+            "En réserve : {} minerai de fer · {} charbon",
+            r.iron_ore, r.coal
+        )
+    } else {
+        format!("En réserve : {} lingots", r.iron)
+    }
+}
+
 /// Workshop window: recipe, stock, standing order and the order buttons.
 fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     let dir = g.order_menu?;
@@ -339,10 +351,7 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     let mut picked = None;
     centered(title).show(ctx, |ui| {
         ui.label(build_text(kind, recipe_label(kind)));
-        ui.label(format!(
-            "En réserve : {} minerai de fer · {} charbon · {} lingots",
-            r.iron_ore, r.coal, r.iron
-        ));
+        ui.label(stock_text(kind, &r));
         ui.label(format!("Commande en cours : {queued}"));
         if !r.covers(&kind.cost()) {
             ui.colored_label(
@@ -505,6 +514,15 @@ fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_text_lists_only_the_recipe_inputs() {
+        let r = Resources::default();
+        let anvil = stock_text(DesignationKind::Smith, &r);
+        assert!(anvil.contains("lingots") && !anvil.contains("charbon"));
+        let forge = stock_text(DesignationKind::Smelt, &r);
+        assert!(forge.contains("charbon") && !forge.contains("lingots"));
+    }
 
     /// Space digs; it must never also press a bar button that holds focus.
     #[test]
