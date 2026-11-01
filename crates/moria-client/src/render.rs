@@ -9,15 +9,15 @@ use moria_core::{DesignationKind, Tile, TilePos};
 
 pub const TILE: f32 = 48.0;
 
-/// Image and tint per tile: ore veins are the rock texture tinted (no ore art yet).
+/// Ores share the stone background, with colored veins in their own texture.
 fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
     match t {
         Tile::Rock => (art.rock.clone(), Color::WHITE),
-        Tile::Floor => (art.floor.clone(), Color::srgb(0.55, 0.45, 0.35)),
-        Tile::Gold => (art.rock.clone(), Color::srgb_u8(0xff, 0xc8, 0x30)),
-        Tile::Mithril => (art.rock.clone(), Color::srgb_u8(0x60, 0xc0, 0xff)),
+        Tile::Floor => (art.floor.clone(), Color::WHITE),
+        Tile::Gold => (art.gold.clone(), Color::WHITE),
+        Tile::Mithril => (art.mithril.clone(), Color::WHITE),
         Tile::Stair => (art.stair.clone(), Color::WHITE),
-        Tile::Wall => (art.rock.clone(), Color::srgb(0.85, 0.55, 0.4)),
+        Tile::Wall => (art.wall.clone(), Color::WHITE),
     }
 }
 
@@ -50,7 +50,13 @@ pub fn plugin(app: &mut App) {
             Update,
             (
                 spawn_map,
-                (sync_tiles, sync_marks, follow_camera, draw_outlines),
+                (
+                    sync_tiles,
+                    sync_marks,
+                    follow_camera,
+                    draw_outlines,
+                    draw_relief,
+                ),
             )
                 .chain()
                 .after(crate::input::InputSet)
@@ -63,7 +69,7 @@ fn head(image: Handle<Image>) -> impl Bundle {
     (
         Sprite {
             image,
-            custom_size: Some(Vec2::splat(TILE * 0.7)),
+            custom_size: Some(Vec2::splat(TILE * 0.64)),
             ..default()
         },
         DespawnOnExit(Screen::Playing),
@@ -125,6 +131,16 @@ fn sync_tiles(client: Res<Client>, art: Res<Art>, mut q: Query<(&mut TileSprite,
                 Some(t) => tile_look(t, &art),
                 None => (Handle::default(), Color::BLACK),
             };
+            if tile.is_some_and(|tile| tile != Tile::Stair) {
+                let variation = ((i32::from(t.x) * 37 + i32::from(t.y) * 61).rem_euclid(11)) as f32;
+                let light = 0.88 + variation * 0.012;
+                s.color = Color::srgb(light, light, light);
+                s.flip_x = (t.x + t.y) % 2 == 0;
+                s.flip_y = t.x % 3 == 0;
+            } else {
+                s.flip_x = false;
+                s.flip_y = false;
+            }
         }
     }
 }
@@ -179,6 +195,60 @@ fn follow_camera(client: Res<Client>, mut cam: Query<&mut Transform, With<Camera
     }
 }
 
+/// Recomputed from neighbors so digging and level changes reveal the new edges immediately.
+fn draw_relief(client: Res<Client>, mut gizmos: Gizmos) {
+    let Some(g) = &client.session.game else {
+        return;
+    };
+    let z = g.current_z();
+    let (w, h, _) = g.mountain.size();
+    let half = TILE / 2.0;
+    for y in 0..h {
+        for x in 0..w {
+            if !g
+                .mountain
+                .get(TilePos::new(x, y, z))
+                .is_some_and(Tile::is_solid)
+            {
+                continue;
+            }
+            let center = to_world(x, y);
+            for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+                if !g.mountain.walkable(TilePos::new(x + dx, y + dy, z)) {
+                    continue;
+                }
+                let normal = Vec2::new(f32::from(dx), -f32::from(dy));
+                let tangent = Vec2::new(-normal.y, normal.x) * half;
+                let edge = center + normal * half;
+                // A dark face on the stone and a soft, stepped shadow on the floor.
+                for offset in 0..7 {
+                    let at = edge - normal * offset as f32;
+                    gizmos.line_2d(at - tangent, at + tangent, Color::srgb(0.10, 0.12, 0.16));
+                }
+                let rim = edge - normal * 7.0;
+                gizmos.line_2d(rim - tangent, rim + tangent, Color::srgb(0.39, 0.43, 0.48));
+                for offset in 1..6 {
+                    let at = edge + normal * offset as f32;
+                    gizmos.line_2d(
+                        at - tangent,
+                        at + tangent,
+                        Color::srgba(0.02, 0.025, 0.04, 0.36 - offset as f32 * 0.045),
+                    );
+                }
+            }
+        }
+    }
+    for &(_, p) in &g.dwarves {
+        if p.z == z {
+            gizmos.circle_2d(
+                to_world(p.x, p.y),
+                TILE * 0.47,
+                Color::srgba(0.61, 0.69, 0.70, 0.6),
+            );
+        }
+    }
+}
+
 fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
     let Some(g) = &client.session.game else {
         return;
@@ -186,7 +256,8 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
     let z = g.current_z();
     if g.hero.pos.z == z {
         let at = to_world(g.hero.pos.x, g.hero.pos.y);
-        gizmos.rect_2d(at, Vec2::splat(TILE * 0.7), Color::srgb(1.0, 0.15, 0.15));
+        gizmos.circle_2d(at, TILE * 0.47, Color::srgb(0.94, 0.73, 0.35));
+        gizmos.circle_2d(at, TILE * 0.49, Color::srgba(0.94, 0.73, 0.35, 0.3));
     }
     // TilePos orders by x first, so a z-range is not contiguous; the map is small.
     for (p, k) in g.mountain.designations.iter().filter(|(p, _)| p.z == z) {
