@@ -61,7 +61,7 @@ fn slug(r: Race) -> &'static str {
 #[derive(Resource)]
 pub struct Art {
     /// Baked textures, one per `terrain::BAKED` tile.
-    terrain: Vec<(Tile, Handle<Image>)>,
+    terrain: std::collections::HashMap<Tile, Handle<Image>>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
     pub castle: Handle<Image>,
@@ -79,12 +79,14 @@ impl Art {
         self.heads[race_index(r)].clone()
     }
 
-    /// The tile's texture; the stairs (not baked) fall back to their art.
+    /// The tile's texture: the stairs use the user's art, the rest are baked.
+    /// `is_baked` is an exhaustive match, so a new `Tile` cannot silently get the stair art.
     pub fn tile(&self, t: Tile) -> Handle<Image> {
-        self.terrain
-            .iter()
-            .find(|e| e.0 == t)
-            .map_or_else(|| self.stair.clone(), |e| e.1.clone())
+        if crate::terrain::is_baked(t) {
+            self.terrain[&t].clone()
+        } else {
+            self.stair.clone()
+        }
     }
 
     pub fn portrait(&self, r: Race) -> Handle<Image> {
@@ -120,7 +122,8 @@ impl FromWorld for Art {
         Art {
             terrain: crate::terrain::BAKED
                 .map(|t| (t, images.add(crate::terrain::image(t))))
-                .into(),
+                .into_iter()
+                .collect(),
             stair,
             worker_head,
             castle,

@@ -27,6 +27,31 @@ pub const BAKED: [Tile; 17] = [
     Tile::WoodChair,
 ];
 
+/// Compile-time exhaustive (no wildcard): a new `Tile` variant fails to build until it is
+/// classified here, and a baked one must also be added to `BAKED`.
+pub fn is_baked(t: Tile) -> bool {
+    match t {
+        Tile::Stair => false,
+        Tile::Rock
+        | Tile::Gold
+        | Tile::Mithril
+        | Tile::Floor
+        | Tile::Wall
+        | Tile::Bed
+        | Tile::Table
+        | Tile::Chair
+        | Tile::Grass
+        | Tile::Tree
+        | Tile::Water
+        | Tile::Slope
+        | Tile::Soil
+        | Tile::Sky
+        | Tile::WoodBed
+        | Tile::WoodTable
+        | Tile::WoodChair => true,
+    }
+}
+
 pub fn image(tile: Tile) -> Image {
     Image::new(
         Extent3d {
@@ -182,6 +207,12 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baked_list_matches_the_exhaustive_mapping() {
+        assert!(BAKED.iter().all(|&t| is_baked(t)));
+        assert!(!is_baked(Tile::Stair));
+    }
 
     #[test]
     fn terrain_is_opaque_and_ore_retains_the_rock_background() {

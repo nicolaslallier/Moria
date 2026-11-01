@@ -199,6 +199,8 @@ fn draw_relief(
     let (w, h, _) = g.mountain.size();
     let rx = (window.width() / TILE / 2.0) as i16 + 2;
     let ry = (window.height() / TILE / 2.0) as i16 + 2;
+    // ponytail: assumes the camera is pinned on the hero at scale 1; switch to the camera
+    // Transform and projection if zoom or panning is ever added.
     let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
     let half = TILE / 2.0;
     for y in (hy - ry).max(0)..(hy + ry).min(h) {
