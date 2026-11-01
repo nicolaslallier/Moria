@@ -41,9 +41,16 @@ pub fn blocks_light(t: Tile) -> bool {
     t.is_stone()
 }
 
-/// Radius of a built light source; filled in with the light tiles.
-pub fn light_radius(_t: Tile) -> Option<u8> {
-    None
+/// Radius of a built light source.
+pub fn light_radius(t: Tile) -> Option<u8> {
+    match t {
+        Tile::Candle => Some(3),
+        Tile::Torch => Some(5),
+        Tile::Lamp | Tile::Stove => Some(6),
+        Tile::Campfire => Some(7),
+        Tile::Hearth => Some(8),
+        _ => None,
+    }
 }
 
 /// Inclusive rectangle of one level.
@@ -196,6 +203,16 @@ mod tests {
             x1: 19,
             y1: 19,
         }
+    }
+
+    #[test]
+    fn built_lights_shine_in_the_mine() {
+        let mut m = mine();
+        m.set(TilePos::new(5, 5, 1), Tile::Torch);
+        assert_eq!(light_radius(Tile::Torch), Some(5));
+        let l = light_map(&m, 1, area(), &[], 20_000);
+        assert_eq!(l.get(8, 5), 1.0);
+        assert!(!blocks_light(Tile::Torch));
     }
 
     #[test]

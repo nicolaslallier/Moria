@@ -222,7 +222,13 @@ impl Mountain {
             | DesignationKind::Chair
             | DesignationKind::WoodBed
             | DesignationKind::WoodTable
-            | DesignationKind::WoodChair => self.set(p, kind.builds()?),
+            | DesignationKind::WoodChair
+            | DesignationKind::Candle
+            | DesignationKind::Torch
+            | DesignationKind::Lamp
+            | DesignationKind::Campfire
+            | DesignationKind::Hearth
+            | DesignationKind::Stove => self.set(p, kind.builds()?),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);

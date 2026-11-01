@@ -135,7 +135,8 @@ pub fn job_label(job: Option<DwarfJob>) -> String {
         Dig => "Creuse".into(),
         Stairs => "Taille un escalier".into(),
         Chop => "Coupe du bois".into(),
-        Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair => {
+        Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair | Candle | Torch | Lamp
+        | Campfire | Hearth | Stove => {
             let label = BUILDS.iter().find(|b| b.0 == kind).map_or("?", |b| b.1);
             format!("Construit : {label}")
         }

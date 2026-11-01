@@ -38,6 +38,12 @@ tiles! {
     WoodBed,
     WoodTable,
     WoodChair,
+    Candle,
+    Torch,
+    Lamp,
+    Campfire,
+    Hearth,
+    Stove,
 }
 
 #[derive(
@@ -86,6 +92,12 @@ pub enum DesignationKind {
     WoodBed,
     WoodTable,
     WoodChair,
+    Candle,
+    Torch,
+    Lamp,
+    Campfire,
+    Hearth,
+    Stove,
 }
 
 impl DesignationKind {
@@ -110,6 +122,12 @@ impl DesignationKind {
             Self::WoodBed => Some(Tile::WoodBed),
             Self::WoodTable => Some(Tile::WoodTable),
             Self::WoodChair => Some(Tile::WoodChair),
+            Self::Candle => Some(Tile::Candle),
+            Self::Torch => Some(Tile::Torch),
+            Self::Lamp => Some(Tile::Lamp),
+            Self::Campfire => Some(Tile::Campfire),
+            Self::Hearth => Some(Tile::Hearth),
+            Self::Stove => Some(Tile::Stove),
         }
     }
 
@@ -118,16 +136,22 @@ impl DesignationKind {
     }
 
     pub fn cost(self) -> Resources {
-        let (stone, wood) = match self {
-            Self::Dig | Self::Stairs | Self::Chop => (0, 0),
-            Self::Wall | Self::Bed | Self::Table | Self::Chair => (1, 0),
-            Self::WoodTable => (0, 4),
-            Self::WoodBed => (0, 3),
-            Self::WoodChair => (0, 2),
+        let (stone, wood, gold) = match self {
+            Self::Dig | Self::Stairs | Self::Chop => (0, 0, 0),
+            Self::Wall | Self::Bed | Self::Table | Self::Chair => (1, 0, 0),
+            Self::WoodTable => (0, 4, 0),
+            Self::WoodBed => (0, 3, 0),
+            Self::WoodChair => (0, 2, 0),
+            Self::Candle | Self::Torch => (0, 1, 0),
+            Self::Lamp => (1, 0, 1),
+            Self::Campfire => (0, 3, 0),
+            Self::Hearth => (4, 0, 0),
+            Self::Stove => (3, 2, 0),
         };
         Resources {
             stone,
             wood,
+            gold,
             ..Default::default()
         }
     }
@@ -159,6 +183,12 @@ impl Tile {
                 | Tile::WoodBed
                 | Tile::WoodTable
                 | Tile::WoodChair
+                | Tile::Candle
+                | Tile::Torch
+                | Tile::Lamp
+                | Tile::Campfire
+                | Tile::Hearth
+                | Tile::Stove
         )
     }
 
@@ -166,6 +196,12 @@ impl Tile {
         match self {
             Tile::Rock | Tile::Wall | Tile::Bed | Tile::Table | Tile::Chair => 10,
             Tile::WoodBed | Tile::WoodTable | Tile::WoodChair => 10,
+            Tile::Candle
+            | Tile::Torch
+            | Tile::Lamp
+            | Tile::Campfire
+            | Tile::Hearth
+            | Tile::Stove => 10,
             Tile::Gold => 15,
             Tile::Mithril => 25,
             Tile::Soil | Tile::Slope => 8,
@@ -188,6 +224,12 @@ impl Tile {
             Tile::WoodBed => return DesignationKind::WoodBed.cost(),
             Tile::WoodTable => return DesignationKind::WoodTable.cost(),
             Tile::WoodChair => return DesignationKind::WoodChair.cost(),
+            Tile::Candle => return DesignationKind::Candle.cost(),
+            Tile::Torch => return DesignationKind::Torch.cost(),
+            Tile::Lamp => return DesignationKind::Lamp.cost(),
+            Tile::Campfire => return DesignationKind::Campfire.cost(),
+            Tile::Hearth => return DesignationKind::Hearth.cost(),
+            Tile::Stove => return DesignationKind::Stove.cost(),
             _ => {}
         }
         r
@@ -211,7 +253,7 @@ mod tests {
         // The original variant order since save format v2; the index is the postcard byte.
         let expected = [
             Rock, Gold, Mithril, Floor, Stair, Wall, Bed, Table, Chair, Grass, Tree, Water, Slope,
-            Soil, Sky, WoodBed, WoodTable, WoodChair,
+            Soil, Sky, WoodBed, WoodTable, WoodChair, Candle, Torch, Lamp, Campfire, Hearth, Stove,
         ];
         assert_eq!(Tile::ALL, expected);
         for (i, t) in expected.iter().enumerate() {
@@ -224,7 +266,8 @@ mod tests {
         use DesignationKind::*;
         // The variant order is the postcard byte on the wire and in saves.
         let expected = [
-            Dig, Stairs, Wall, Bed, Table, Chair, Chop, WoodBed, WoodTable, WoodChair,
+            Dig, Stairs, Wall, Bed, Table, Chair, Chop, WoodBed, WoodTable, WoodChair, Candle,
+            Torch, Lamp, Campfire, Hearth, Stove,
         ];
         for (i, k) in expected.iter().enumerate() {
             assert_eq!(postcard::to_allocvec(k).unwrap(), [i as u8], "{k:?}");
@@ -263,6 +306,23 @@ mod tests {
             }
         );
         assert_eq!(DesignationKind::Chop.cost(), Resources::default());
+    }
+
+    #[test]
+    fn light_costs() {
+        use DesignationKind as K;
+        let r = |stone, wood, gold| Resources {
+            stone,
+            wood,
+            gold,
+            ..Default::default()
+        };
+        assert_eq!(K::Candle.cost(), r(0, 1, 0));
+        assert_eq!(K::Torch.cost(), r(0, 1, 0));
+        assert_eq!(K::Lamp.cost(), r(1, 0, 1));
+        assert_eq!(K::Campfire.cost(), r(0, 3, 0));
+        assert_eq!(K::Hearth.cost(), r(4, 0, 0));
+        assert_eq!(K::Stove.cost(), r(3, 2, 0));
     }
 
     #[test]

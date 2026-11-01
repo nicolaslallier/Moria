@@ -402,7 +402,13 @@ fn draw_outlines(
             | DesignationKind::Chair
             | DesignationKind::WoodBed
             | DesignationKind::WoodTable
-            | DesignationKind::WoodChair => Color::srgb(0.7, 0.45, 1.0),
+            | DesignationKind::WoodChair
+            | DesignationKind::Candle
+            | DesignationKind::Torch
+            | DesignationKind::Lamp
+            | DesignationKind::Campfire
+            | DesignationKind::Hearth
+            | DesignationKind::Stove => Color::srgb(0.7, 0.45, 1.0),
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }

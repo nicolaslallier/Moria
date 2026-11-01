@@ -163,6 +163,10 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
             (28, 22, 68, 72, dark),
             (32, 34, 64, 68, top), // seat; the dark strip above is the back
         ],
+        // Placeholder until the light tiles get their art.
+        Tile::Candle | Tile::Torch | Tile::Lamp | Tile::Campfire | Tile::Hearth | Tile::Stove => {
+            &[(40, 40, 56, 56, top)]
+        }
         _ => &[],
     };
     boxes
