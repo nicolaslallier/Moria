@@ -1,6 +1,8 @@
 use crate::{MountainId, Resources};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const EXCHANGE: &str = "moria";
@@ -8,6 +10,7 @@ pub const KEY_APPLY: &str = "inventory.apply";
 pub const KEY_STATE: &str = "inventory.state";
 pub const STATE_EVERY: Duration = Duration::from_secs(1);
 pub const STOPPED_AFTER: Duration = Duration::from_secs(5);
+pub const INVENTORY_VERSION: u32 = 1;
 
 /// Net resource change of one mountain over one tick, sent by a simulation.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -45,6 +48,36 @@ impl State {
         }
         self.acks.insert(b.sender.clone(), id);
         true
+    }
+
+    /// Atomic write: temp file, `sync_all`, rename.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let mut bytes = INVENTORY_VERSION.to_le_bytes().to_vec();
+        bytes.extend(postcard::to_allocvec(self).map_err(io::Error::other)?);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Missing file gives the empty state; anything unreadable is an error, never a silent reset.
+    pub fn load_or_default(path: &Path) -> io::Result<State> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(e),
+        };
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let Some((v, body)) = bytes.split_first_chunk::<4>() else {
+            return Err(bad("inventaire tronqué".into()));
+        };
+        match u32::from_le_bytes(*v) {
+            INVENTORY_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+            n => Err(bad(format!("inventaire v{n} non supporté"))),
+        }
     }
 }
 
@@ -139,5 +172,66 @@ mod tests {
         s.apply(&batch("a", 1, 5, 1, 0, false));
         assert!(s.apply(&batch("b", 1, 1, 1, 0, false)));
         assert_eq!(stone(&s), 2);
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("moria-inv-{}-{name}", std::process::id()))
+    }
+
+    fn seeded_state() -> State {
+        let mut s = State::default();
+        s.apply(&batch("a", 1, 1, 5, 2, false));
+        s
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let p = tmp("roundtrip");
+        let s = seeded_state();
+        s.save(&p).unwrap();
+        assert_eq!(State::load_or_default(&p).unwrap(), s);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn load_missing_file_is_default() {
+        let p = tmp("missing");
+        assert_eq!(State::load_or_default(&p).unwrap(), State::default());
+    }
+
+    #[test]
+    fn load_rejects_garbage_and_truncated() {
+        let p = tmp("garbage");
+        std::fs::write(&p, [1, 2, 3]).unwrap();
+        assert!(State::load_or_default(&p).is_err());
+        seeded_state().save(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        std::fs::write(&p, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(State::load_or_default(&p).is_err());
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_newer_version() {
+        let p = tmp("newer");
+        seeded_state().save(&p).unwrap();
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[..4].copy_from_slice(&(INVENTORY_VERSION + 1).to_le_bytes());
+        std::fs::write(&p, bytes).unwrap();
+        assert!(State::load_or_default(&p).is_err());
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn redelivered_batch_not_applied_twice_after_reload() {
+        let p = tmp("redeliver");
+        let b = batch("a", 1, 1, 5, 0, false);
+        let mut s = State::default();
+        assert!(s.apply(&b));
+        s.save(&p).unwrap();
+        let mut s = State::load_or_default(&p).unwrap();
+        assert!(!s.apply(&b));
+        assert_eq!(stone(&s), 5);
+        std::fs::remove_file(&p).unwrap();
     }
 }
