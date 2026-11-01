@@ -171,8 +171,8 @@ fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
 
 fn hero_move(h: &mut Hero, mt: &Mountain, d: Dir) {
     h.pending_move = None;
-    if mt.can_move(h.pos, d) {
-        h.pos = h.pos.step(d);
+    if let Some(to) = mt.move_dest(h.pos, d) {
+        h.pos = to;
         h.move_cooldown = MOVE_COOLDOWN;
         h.dig = None;
     }
@@ -376,9 +376,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             if !task.path.is_empty() {
                 if tick.is_multiple_of(2) {
                     let next = task.path[0];
-                    let step_ok = ALL_DIRS
-                        .iter()
-                        .any(|&d| pos.step(d) == next && m.can_move(pos, d));
+                    let step_ok = ALL_DIRS.iter().any(|&d| m.move_dest(pos, d) == Some(next));
                     if step_ok {
                         task.path.remove(0);
                         f.dwarves[i].pos = next;

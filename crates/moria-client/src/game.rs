@@ -189,11 +189,12 @@ impl Game {
         if Dir::HORIZONTAL.contains(&dir) {
             self.last_dir = dir;
         }
-        if now - self.last_move < MOVE_COOLDOWN || !self.mountain.can_move(self.hero.pos, dir) {
+        if now - self.last_move < MOVE_COOLDOWN {
             return None;
         }
+        let to = self.mountain.move_dest(self.hero.pos, dir)?;
         self.last_move = now;
-        self.hero.pos = self.hero.pos.step(dir);
+        self.hero.pos = to;
         self.pending.push_back((self.hero.pos, self.ticks));
         if matches!(dir, Dir::Up | Dir::Down) {
             self.browse_z = None;
