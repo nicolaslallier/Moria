@@ -5,11 +5,12 @@
 //! `MORIA_MAX_PER_IP=16` (all bots share one IP) and without `MORIA_INVITE` (bots send no
 //! invite code), e.g. `MORIA_MAX_PER_IP=16 MORIA_DATA=/tmp/w.bin cargo run -p moria-server`.
 //! Exits non-zero if any bot's tick p99 >= 150 ms, it saw fewer than secs*5 intervals,
-//! or dug 0 tiles. Needs a freshly generated world (fresh volume): on a re-run the
-//! designated tiles are already floor, so dug = 0 and the run fails.
+//! or chopped 0 trees. Needs a freshly generated world (fresh volume): on a re-run the
+//! trees are already chopped, so dug = 0 and the run fails.
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, encode, read_frame};
 use moria_core::srd::{Class, Race};
-use moria_core::{DesignationKind, Dir, Tile, TilePos};
+use moria_core::world::{ENTRANCE_X, ENTRANCE_Y};
+use moria_core::{DesignationKind, Dir, GROUND_Z, Tile, TilePos};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
@@ -53,17 +54,29 @@ fn bot(i: usize, addr: String, secs: u64, st: Arc<Mutex<Stats>>) -> anyhow::Resu
         }
         m => anyhow::bail!("bot{i}: {m:?}"),
     }
-    loop {
-        if let ServerMsg::Snapshot(_) = read_frame(&mut s)? {
-            break;
+    let m = loop {
+        if let ServerMsg::Snapshot(v) = read_frame(&mut s)? {
+            break v.mountain;
         }
+    };
+    // Chop the nearest trees: a band of rows around the entrance, grown west from its
+    // door until it holds at least 40 trees.
+    let p = |x, y| TilePos::new(x, y, GROUND_Z);
+    let (y0, y1) = (ENTRANCE_Y.start - 16, ENTRANCE_Y.end + 12);
+    let door = ENTRANCE_X.start - 1;
+    let mut trees = 0;
+    let mut x0 = door + 1;
+    while trees < 40 && x0 > 0 {
+        x0 -= 1;
+        trees += (y0..y1)
+            .filter(|&y| m.get(p(x0, y)) == Some(Tile::Tree))
+            .count();
     }
-    // 10x4 = 40 rock tiles next to the open entrance floor.
-    let p = |x, y| TilePos { x, y, z: 0 };
+    anyhow::ensure!(trees >= 40, "bot{i}: only {trees} trees to chop");
     s.write_all(&encode(&ClientMsg::Designate {
-        a: p(6, 20),
-        b: p(15, 23),
-        kind: DesignationKind::Dig,
+        a: p(x0, y0),
+        b: p(door, y1 - 1),
+        kind: DesignationKind::Chop,
     }))?;
     // Mover: 5 moves/s, xorshift for direction.
     let mut w = s.try_clone()?;
@@ -88,7 +101,7 @@ fn bot(i: usize, addr: String, secs: u64, st: Arc<Mutex<Stats>>) -> anyhow::Resu
             if let Some(l) = last {
                 g.intervals_ms.push((now - l).as_secs_f64() * 1000.0);
             }
-            g.dug += d.tiles.iter().filter(|(_, t)| *t == Tile::Floor).count();
+            g.dug += d.tiles.iter().filter(|(_, t)| *t == Tile::Grass).count();
             last = Some(now);
         }
     }

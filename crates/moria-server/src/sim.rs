@@ -446,11 +446,13 @@ mod tests {
     use std::time::Instant;
 
     const M: MountainId = MountainId(0);
+    /// Offset from the entrance room's north-west corner (z 0 = `GROUND_Z`).
     fn p(x: i16, y: i16, z: u8) -> TilePos {
-        TilePos::new(x, y, z)
+        let e = moria_core::world::entrance_tiles().next().unwrap();
+        TilePos::new(e.x + x, e.y + y, e.z + z)
     }
 
-    /// One claimed mountain with a hero at (2,23,0) and an all-Floor surface strip.
+    /// One claimed mountain with a hero at p(2, 1, 0) and an all-Floor surface strip.
     fn setup() -> World {
         let mut w = generate(1);
         claim_mountain(&mut w, PlayerId(1)).unwrap();
@@ -459,7 +461,7 @@ mod tests {
             race: Race::Dwarf,
             class: Class::Fighter,
             abilities: roll_abilities(Race::Dwarf, Class::Fighter),
-            pos: p(2, 23, 0),
+            pos: p(2, 1, 0),
             dig: None,
             move_cooldown: 0,
             pending_move: None,
@@ -492,13 +494,13 @@ mod tests {
         let mut w = setup();
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Move(Dir::E));
-        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        assert_eq!(hero(&w).pos, p(3, 1, 0));
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::E));
-        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        assert_eq!(hero(&w).pos, p(3, 1, 0));
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::E));
-        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        assert_eq!(hero(&w).pos, p(4, 1, 0));
     }
 
     #[test]
@@ -508,54 +510,54 @@ mod tests {
         // Two moves during the cooldown: only the latest is kept.
         apply_command(&mut w, M, Command::Move(Dir::W));
         apply_command(&mut w, M, Command::Move(Dir::E));
-        assert_eq!(hero(&w).pos, p(3, 23, 0));
+        assert_eq!(hero(&w).pos, p(3, 1, 0));
         let d = step(&mut w);
-        assert_eq!(hero(&w).pos, p(3, 23, 0));
-        assert_eq!(d[&M].hero_pos, p(3, 23, 0));
+        assert_eq!(hero(&w).pos, p(3, 1, 0));
+        assert_eq!(d[&M].hero_pos, p(3, 1, 0));
         let d = step(&mut w);
-        assert_eq!(hero(&w).pos, p(4, 23, 0));
-        assert_eq!(d[&M].hero_pos, p(4, 23, 0));
+        assert_eq!(hero(&w).pos, p(4, 1, 0));
+        assert_eq!(d[&M].hero_pos, p(4, 1, 0));
         assert_eq!(hero(&w).pending_move, None);
         step(&mut w);
         step(&mut w);
-        assert_eq!(hero(&w).pos, p(4, 23, 0)); // applied once only
+        assert_eq!(hero(&w).pos, p(4, 1, 0)); // applied once only
         // A Dig applies the buffered move first, then nothing is left pending.
         apply_command(&mut w, M, Command::Move(Dir::W));
         step(&mut w);
         apply_command(&mut w, M, Command::Move(Dir::W));
         apply_command(&mut w, M, Command::Dig(Dir::N));
-        assert_eq!(hero(&w).pos, p(3, 23, 0)); // no move before the cooldown ends
+        assert_eq!(hero(&w).pos, p(3, 1, 0)); // no move before the cooldown ends
         step(&mut w);
         step(&mut w);
-        assert_eq!(hero(&w).pos, p(2, 23, 0));
+        assert_eq!(hero(&w).pos, p(2, 1, 0));
         assert_eq!((hero(&w).pending_move, hero(&w).pending_dig), (None, None));
     }
 
     #[test]
     fn dig_after_buffered_move_digs_from_new_position() {
         let mut w = setup();
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(3, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(3, 1, 0);
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Move(Dir::E)); // buffered (cooldown)
         apply_command(&mut w, M, Command::Dig(Dir::E)); // buffered behind the move
-        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        assert_eq!(hero(&w).pos, p(4, 1, 0));
         assert!(hero(&w).dig.is_none());
         step(&mut w);
-        assert_eq!(hero(&w).pos, p(4, 23, 0));
+        assert_eq!(hero(&w).pos, p(4, 1, 0));
         step(&mut w); // cooldown over: move, then dig from the new position
-        assert_eq!(hero(&w).pos, p(5, 23, 0));
-        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
+        assert_eq!(hero(&w).pos, p(5, 1, 0));
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 1, 0)));
         assert_eq!((hero(&w).pending_move, hero(&w).pending_dig), (None, None));
         // A buffered move into rock is still refused; the dig starts from where the hero is.
         let mut w = setup();
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(4, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(4, 1, 0);
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Move(Dir::E));
         apply_command(&mut w, M, Command::Dig(Dir::E));
         step(&mut w);
         step(&mut w);
-        assert_eq!(hero(&w).pos, p(5, 23, 0));
-        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 23, 0)));
+        assert_eq!(hero(&w).pos, p(5, 1, 0));
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(6, 1, 0)));
     }
 
     #[test]
@@ -564,7 +566,7 @@ mod tests {
             let mut w = setup();
             let m = w.mountains.get_mut(&M).unwrap();
             for x in 0..40 {
-                m.set(p(x, 23, 0), Tile::Floor);
+                m.set(p(x, 1, 0), Tile::Floor);
             }
             for _ in 0..20 {
                 apply_command(&mut w, M, Command::Move(Dir::E));
@@ -573,7 +575,7 @@ mod tests {
                 }
                 step(&mut w);
             }
-            hero(&w).pos.x - 2
+            hero(&w).pos.x - p(2, 1, 0).x
         };
         // One immediate move, then one per 2-tick cooldown: 1 + 20 / 2.
         let moved = run(true);
@@ -586,10 +588,10 @@ mod tests {
         let mut w = setup();
         apply_command(&mut w, M, Command::Move(Dir::Up));
         apply_command(&mut w, M, Command::Move(Dir::Down));
-        assert_eq!(hero(&w).pos, p(2, 23, 0));
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        assert_eq!(hero(&w).pos, p(2, 1, 0));
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
         apply_command(&mut w, M, Command::Move(Dir::E));
-        assert_eq!(hero(&w).pos, p(5, 23, 0));
+        assert_eq!(hero(&w).pos, p(5, 1, 0));
         assert_eq!(hero(&w).move_cooldown, 0);
     }
 
@@ -598,8 +600,8 @@ mod tests {
         let mut w = setup();
         set_str(&mut w, 17);
         // (6,23,0) is rock east of the entrance strip.
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
-        let t = p(6, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
+        let t = p(6, 1, 0);
         assert_eq!(tile(&w, t), Tile::Rock);
         apply_command(&mut w, M, Command::Dig(Dir::E));
         for _ in 0..6 {
@@ -616,7 +618,7 @@ mod tests {
     #[test]
     fn move_cancels_dig() {
         let mut w = setup();
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
         apply_command(&mut w, M, Command::Dig(Dir::E));
         step(&mut w);
         assert!(hero(&w).dig.is_some());
@@ -627,7 +629,7 @@ mod tests {
     #[test]
     fn dwarf_walks_digs_and_frees_itself() {
         let mut w = setup();
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         designate(&mut w, t, DesignationKind::Dig);
         let id = w.fortresses[&M].dwarves[0].id;
         apply_assignments(
@@ -655,7 +657,7 @@ mod tests {
     #[test]
     fn task_dropped_when_target_already_dug() {
         let mut w = setup();
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         designate(&mut w, t, DesignationKind::Dig);
         let id = w.fortresses[&M].dwarves[0].id;
         apply_assignments(
@@ -692,7 +694,7 @@ mod tests {
         );
         assert!(w.fortresses[&M].dwarves[0].task.is_none());
         // Occupant arrives mid-task: the task is dropped and the designation stays.
-        let t = p(3, 24, 0);
+        let t = p(3, 2, 0);
         designate(&mut w, t, DesignationKind::Stairs);
         apply_assignments(
             &mut w,
@@ -714,7 +716,7 @@ mod tests {
             Some(&DesignationKind::Stairs)
         );
         // Once free, it can be reassigned and dug.
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(2, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(2, 1, 0);
         apply_assignments(
             &mut w,
             &Assignments {
@@ -732,7 +734,7 @@ mod tests {
     #[test]
     fn hero_builds_wall_with_stone() {
         let mut w = setup();
-        let t = p(3, 23, 0);
+        let t = p(3, 1, 0);
         // No stone: nothing starts.
         apply_command(&mut w, M, Command::Build(Dir::E, DesignationKind::Wall));
         assert!(hero(&w).dig.is_none());
@@ -744,7 +746,7 @@ mod tests {
         );
         // With its one stone reserved, the hero may still switch to another tile.
         apply_command(&mut w, M, Command::Build(Dir::S, DesignationKind::Wall));
-        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(2, 24, 0)));
+        assert_eq!(hero(&w).dig.as_ref().map(|j| j.target), Some(p(2, 2, 0)));
         apply_command(&mut w, M, Command::Build(Dir::E, DesignationKind::Wall));
         // A dwarf crossing the tile pauses the build, it doesn't cancel it; an idle one
         // standing there is stepped aside.
@@ -777,7 +779,7 @@ mod tests {
         assert_eq!(k(DesignationKind::Stairs), None);
         assert_eq!(k(DesignationKind::Dig), None);
         let mut w = setup();
-        let t = p(3, 23, 0);
+        let t = p(3, 1, 0);
         w.fortresses.get_mut(&M).unwrap().resources.stone = 1;
         apply_command(&mut w, M, k(DesignationKind::Bed).unwrap());
         for _ in 0..30 {
@@ -794,7 +796,7 @@ mod tests {
         let f = w.fortresses.get_mut(&M).unwrap();
         f.resources.stone = 1;
         f.dwarves[0].task = Some(DwarfTask {
-            target: p(5, 25, 0),
+            target: p(5, 3, 0),
             kind: DesignationKind::Wall,
             path: vec![],
             progress: 0,
@@ -809,7 +811,7 @@ mod tests {
     #[test]
     fn dwarf_builds_wall_with_stone() {
         let mut w = setup();
-        let t = p(5, 24, 0);
+        let t = p(5, 2, 0);
         designate(&mut w, t, DesignationKind::Wall);
         let id = w.fortresses[&M].dwarves[0].id;
         let assign = |w: &mut World| {
@@ -829,7 +831,7 @@ mod tests {
         assign(&mut w);
         assert_eq!(spare_stone(&w.fortresses[&M]), 0, "the stone is reserved");
         // One stone, one wall: a second wall is not handed out on the same stone.
-        let t2 = p(5, 22, 0);
+        let t2 = p(5, 0, 0);
         designate(&mut w, t2, DesignationKind::Wall);
         let id2 = w.fortresses[&M].dwarves[2].id;
         apply_assignments(
@@ -853,12 +855,12 @@ mod tests {
     #[test]
     fn idle_dwarf_steps_off_designated_tile() {
         let mut w = setup();
-        let t = p(1, 22, 0);
+        let t = p(1, 0, 0);
         assert_eq!(w.fortresses[&M].dwarves[1].pos, t);
         designate(&mut w, t, DesignationKind::Stairs);
         step(&mut w);
         // N of t is rock: first walkable, undesignated HORIZONTAL neighbour is S.
-        assert_eq!(w.fortresses[&M].dwarves[1].pos, p(1, 23, 0));
+        assert_eq!(w.fortresses[&M].dwarves[1].pos, p(1, 1, 0));
         let id = w.fortresses[&M].dwarves[0].id;
         apply_assignments(
             &mut w,
@@ -878,7 +880,7 @@ mod tests {
     #[test]
     fn designate_after_cancel_same_tick_stays_designated() {
         let mut w = setup();
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         let mut ch = Changes::default();
         ch.then(apply_command(
             &mut w,
@@ -923,9 +925,9 @@ mod tests {
     #[test]
     fn hero_dig_of_stairs_designation_keeps_stairs_intent() {
         let mut w = setup();
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
         set_str(&mut w, 30);
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         designate(&mut w, t, DesignationKind::Stairs);
         apply_command(&mut w, M, Command::Dig(Dir::E));
         let mut last = None;
@@ -948,9 +950,9 @@ mod tests {
     #[test]
     fn stairs_dig_reports_removed_designation_below() {
         let mut w = setup();
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 23, 0);
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
         set_str(&mut w, 30);
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         let below = t.step(Dir::Down);
         designate(&mut w, below, DesignationKind::Dig);
         assert!(w.mountains[&M].designations.contains_key(&below));
@@ -971,7 +973,7 @@ mod tests {
     #[test]
     fn invalid_head_entries_do_not_starve_valid_ones() {
         let mut w = setup();
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         designate(&mut w, t, DesignationKind::Dig);
         let ids: Vec<_> = w.fortresses[&M].dwarves.iter().map(|d| d.id).collect();
         let mut list = vec![(ids[0], p(40, 40, 0)); 5];
@@ -990,7 +992,7 @@ mod tests {
     #[test]
     fn invalid_assignments_ignored() {
         let mut w = setup();
-        let (a, b) = (p(6, 23, 0), p(6, 24, 0));
+        let (a, b) = (p(6, 1, 0), p(6, 2, 0));
         designate(&mut w, a, DesignationKind::Dig);
         let ids: Vec<_> = w.fortresses[&M].dwarves.iter().map(|d| d.id).collect();
         let asg = |list| Assignments {
@@ -1023,7 +1025,7 @@ mod tests {
     #[test]
     fn without_assignments_dwarves_finish_then_idle() {
         let mut w = setup();
-        let (a, b) = (p(6, 23, 0), p(6, 24, 0));
+        let (a, b) = (p(6, 1, 0), p(6, 2, 0));
         designate(&mut w, a, DesignationKind::Dig);
         designate(&mut w, b, DesignationKind::Dig);
         let id = w.fortresses[&M].dwarves[0].id;
@@ -1047,7 +1049,7 @@ mod tests {
     fn all_mountains_simulate_without_owner_connected() {
         let mut w = setup();
         claim_mountain(&mut w, PlayerId(2)).unwrap(); // no hero: owner never connected
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         let m1 = MountainId(1);
         w.mountains
             .get_mut(&m1)
@@ -1075,7 +1077,7 @@ mod tests {
     #[test]
     fn commands_stay_on_their_mountain() {
         let mut w = setup();
-        let t = p(6, 23, 0);
+        let t = p(6, 1, 0);
         let c = apply_command(
             &mut w,
             M,
@@ -1133,7 +1135,7 @@ mod tests {
                 race: Race::Dwarf,
                 class: Class::Fighter,
                 abilities: roll_abilities(Race::Dwarf, Class::Fighter),
-                pos: p(2, 23, 0),
+                pos: p(2, 1, 0),
                 dig: None,
                 move_cooldown: 0,
                 pending_move: None,
@@ -1141,7 +1143,7 @@ mod tests {
             });
             let m = w.mountains.get_mut(&id).unwrap();
             for k in 0..50 {
-                let q = p(6 + k / 4, 22 + k % 4, 0);
+                let q = p(6 + k / 4, k % 4, 0);
                 m.designate(
                     q,
                     q,
@@ -1153,7 +1155,7 @@ mod tests {
                 );
             }
             // Plenty more rock to keep every dwarf busy for the whole run.
-            m.designate(p(10, 22, 0), p(47, 47, 0), DesignationKind::Dig);
+            m.designate(p(10, 0, 0), p(47, 47, 0), DesignationKind::Dig);
         }
         let mut total = std::time::Duration::ZERO;
         let mut busy = 0usize;

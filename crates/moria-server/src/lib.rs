@@ -521,13 +521,11 @@ impl State {
     }
 }
 
-/// First walkable surface tile, row by row: the entrance strip.
+/// The entrance room's first tile, where a new hero appears.
 fn entrance(w: &World, m: MountainId) -> Option<TilePos> {
-    let mt = w.mountains.get(&m)?;
-    let (wd, ht, _) = mt.size();
-    (0..ht)
-        .flat_map(|y| (0..wd).map(move |x| TilePos::new(x, y, 0)))
-        .find(|&p| mt.walkable(p))
+    w.mountains
+        .contains_key(&m)
+        .then(|| world::entrance_tiles().next())?
 }
 
 #[cfg(test)]
@@ -570,8 +568,9 @@ mod tests {
         (s, cmd_tx)
     }
 
+    /// A tile of the mountain's rock, `x` tiles east of its foot.
     fn designate(x: i16, y: i16) -> Command {
-        let t = TilePos::new(x, y, 0);
+        let t = TilePos::new(world::ENTRANCE_X.start + x, y, moria_core::GROUND_Z);
         Command::Designate {
             a: t,
             b: t,
