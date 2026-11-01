@@ -192,14 +192,14 @@ fn sync_marks(
     for (e, mark, mut t, mut v) in &mut marks {
         let (pos, depth) = match mark {
             Mark::Hero => (Some(g.hero.pos), 2.0),
-            Mark::Dwarf => (ds.next().map(|&(_, p)| p), 1.0),
+            Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), 1.0),
         };
         match pos {
             Some(p) => place(&mut t, &mut v, p, z, depth),
             None => commands.entity(e).despawn(),
         }
     }
-    for &(_, p) in ds {
+    for &(_, p, _) in ds {
         let mut t = Transform::default();
         let mut v = Visibility::default();
         place(&mut t, &mut v, p, z, 1.0);
@@ -269,7 +269,7 @@ fn draw_relief(
             }
         }
     }
-    for &(_, p) in &g.dwarves {
+    for &(_, p, _) in &g.dwarves {
         if p.z == z {
             gizmos.circle_2d(
                 to_world(p.x, p.y),

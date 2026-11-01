@@ -2,7 +2,9 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{ACTIONS, BUILDS, Game, Screen, Session, build_text, level_label, mode_label};
+use crate::game::{
+    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, level_label, mode_label,
+};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -44,7 +46,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (hud, action_bar, build_menu).run_if(in_state(Screen::Playing)),
+                (hud, action_bar, build_menu, status).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -306,6 +308,62 @@ fn action_buttons(ui: &mut egui::Ui, g: &mut Game) {
     }
 }
 
+/// Status page (key C): the hero's sheet and what every dwarf is doing.
+fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if !g.status {
+        return Ok(());
+    }
+    let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(g.hero.race).id()));
+    status_window(ctx.ctx_mut()?, g, portrait);
+    Ok(())
+}
+
+/// No title bar: its collapse and close buttons could hold focus, and Space digs.
+fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
+    let rows = g.dwarf_rows();
+    let h = &g.hero;
+    egui::Window::new("Statut")
+        .title_bar(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.heading(format!("Statut — {}", h.name));
+            ui.horizontal(|ui| {
+                ui.image(egui::load::SizedTexture::new(portrait, [96.0, 96.0]));
+                ui.vertical(|ui| {
+                    ui.label(format!("{} {}", h.race.label_fr(), h.class.label_fr()));
+                    ui.label(level_label(h.pos.z));
+                    egui::Grid::new("abilities").show(ui, |ui| {
+                        for (name, score, m) in ability_rows(h.abilities) {
+                            ui.label(name);
+                            ui.label(score.to_string());
+                            ui.label(m);
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+            ui.separator();
+            ui.strong(format!("Nains ({})", rows.len()));
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("dwarves").striped(true).show(ui, |ui| {
+                        for (name, level, job) in rows {
+                            ui.label(name);
+                            ui.label(level);
+                            ui.label(job);
+                            ui.end_row();
+                        }
+                    });
+                });
+            ui.small("C ou Échap : fermer · manette : Select ou B/○");
+        });
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -335,11 +393,11 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             ui.label(mode_label(g.mode));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · glisser clic gauche : désigner · clic droit : annuler",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
-                 · bouton gauche (X/□) : menu construire");
+                 · bouton gauche (X/□) : menu construire · Select : statut");
         });
     Ok(())
 }
@@ -383,6 +441,39 @@ mod tests {
         }
         assert_eq!(g.mode, moria_core::DesignationKind::Chop);
         assert!(!g.build_menu);
+    }
+
+    /// Space digs: no status-window control may hold focus and take it as a click.
+    #[test]
+    fn status_window_never_takes_focus() {
+        let mut g = crate::game::tests::game();
+        g.status = true;
+        let ctx = egui::Context::default();
+        let key = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for k in [
+            egui::Key::Tab,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Space,
+        ] {
+            let input = egui::RawInput {
+                events: vec![key(k)],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                status_window(ui.ctx(), &mut g, egui::TextureId::default())
+            })
+            .textures_delta
+            .clear();
+            assert_eq!(ctx.memory(|m| m.focused()), None);
+        }
+        assert!(g.status);
     }
 
     #[test]

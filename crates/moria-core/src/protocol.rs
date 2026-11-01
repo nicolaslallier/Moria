@@ -8,7 +8,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -66,11 +66,21 @@ pub struct HeroView {
     pub pos: TilePos,
 }
 
+/// What a busy dwarf is doing; `working` is false while it walks to the work spot.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DwarfJob {
+    pub kind: DesignationKind,
+    pub working: bool,
+}
+
+/// A dwarf as clients see it; `None` is idle.
+pub type DwarfState = (DwarfId, TilePos, Option<DwarfJob>);
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FortressView {
     pub mountain: Mountain,
     pub hero: HeroView,
-    pub dwarves: Vec<(DwarfId, TilePos)>,
+    pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
 }
 
@@ -78,7 +88,7 @@ pub struct FortressView {
 pub struct TickDelta {
     pub tick: u64,
     pub hero_pos: TilePos,
-    pub dwarves: Vec<(DwarfId, TilePos)>,
+    pub dwarves: Vec<DwarfState>,
     pub tiles: Vec<(TilePos, Tile)>,
     pub designations_added: Vec<(TilePos, DesignationKind)>,
     pub designations_removed: Vec<TilePos>,

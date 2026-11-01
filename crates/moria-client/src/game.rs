@@ -4,8 +4,11 @@
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
-use moria_core::protocol::{ClientMsg, FortressView, HeroView, Reject, ServerMsg, TickDelta};
-use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, TilePos};
+use moria_core::protocol::{
+    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
+};
+use moria_core::srd::{Abilities, modifier};
+use moria_core::{DesignationKind, Dir, Mountain, Resources, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
@@ -26,7 +29,7 @@ fn valid_view(v: &FortressView) -> bool {
         && (1..=64).contains(&d)
         && v.mountain.in_bounds(v.hero.pos)
         && v.dwarves.len() <= 1024
-        && v.dwarves.iter().all(|(_, p)| v.mountain.in_bounds(*p))
+        && v.dwarves.iter().all(|(_, p, _)| v.mountain.in_bounds(*p))
 }
 
 #[derive(States, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -108,11 +111,48 @@ pub fn mode_label(k: DesignationKind) -> String {
     }
 }
 
+/// Status-page activity of a dwarf; `None` is idle.
+pub fn job_label(job: Option<DwarfJob>) -> String {
+    use DesignationKind::*;
+    let Some(DwarfJob { kind, working }) = job else {
+        return "Inactif".into();
+    };
+    let what = match kind {
+        Dig => "Creuse".into(),
+        Stairs => "Taille un escalier".into(),
+        Chop => "Coupe du bois".into(),
+        Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair => {
+            let label = BUILDS.iter().find(|b| b.0 == kind).map_or("?", |b| b.1);
+            format!("Construit : {label}")
+        }
+    };
+    if working {
+        what
+    } else {
+        format!("En route : {what}")
+    }
+}
+
+/// Status-page rows: ability name, score, signed modifier.
+pub fn ability_rows(a: Abilities) -> [(&'static str, u8, String); 6] {
+    [
+        ("Force", a.str),
+        ("Dextérité", a.dex),
+        ("Constitution", a.con),
+        ("Intelligence", a.int),
+        ("Sagesse", a.wis),
+        ("Charisme", a.cha),
+    ]
+    .map(|(n, s)| (n, s, format!("{:+}", modifier(s))))
+}
+
 pub struct Game {
     pub mountain: Mountain,
     pub hero: HeroView,
-    pub dwarves: Vec<(DwarfId, TilePos)>,
+    pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
+    /// Status page (key C) open.
+    pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
     pub last_dir: Dir,
     pub mode: DesignationKind,
@@ -196,6 +236,7 @@ impl Game {
             hero: v.hero,
             dwarves: v.dwarves,
             resources: v.resources,
+            status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
             build_menu: false,
@@ -205,6 +246,14 @@ impl Game {
             pending: VecDeque::new(),
             ticks: 0,
         }
+    }
+
+    /// Status-page row per dwarf: name, level, activity.
+    pub fn dwarf_rows(&self) -> Vec<(String, String, String)> {
+        self.dwarves
+            .iter()
+            .map(|&(id, p, job)| (format!("Nain n°{}", id.0), level_label(p.z), job_label(job)))
+            .collect()
     }
 
     pub fn current_z(&self) -> u8 {
@@ -232,7 +281,7 @@ impl Game {
         self.dwarves.clear();
         let m = &self.mountain;
         self.dwarves
-            .extend(d.dwarves.iter().filter(|(_, p)| m.in_bounds(*p)));
+            .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -377,8 +426,8 @@ impl Session {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use moria_core::srd::{Class, Race, roll_abilities};
-    use moria_core::{MountainId, Tile};
+    use moria_core::srd::{Abilities, Class, Race, roll_abilities};
+    use moria_core::{DwarfId, MountainId, Tile};
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)
@@ -541,7 +590,10 @@ pub(crate) mod tests {
     fn tick_ignores_out_of_bounds_positions() {
         let mut g = game();
         let mut d = tick(p(99, 1, 0));
-        d.dwarves = vec![(DwarfId(1), p(3, 1, 0)), (DwarfId(2), p(-1, 0, 0))];
+        d.dwarves = vec![
+            (DwarfId(1), p(3, 1, 0), None),
+            (DwarfId(2), p(-1, 0, 0), None),
+        ];
         d.designations_added = vec![(p(-5, 0, 0), DesignationKind::Dig)];
         g.mountain
             .designations
@@ -549,7 +601,7 @@ pub(crate) mod tests {
         d.designations_removed = vec![p(100, 0, 0)];
         g.apply_tick(&d);
         assert_eq!(g.hero.pos, p(2, 1, 0));
-        assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0))]);
+        assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0), None)]);
         assert!(!g.mountain.designations.contains_key(&p(-5, 0, 0)));
         // Removes are ignored too: nothing out of bounds is touched.
         assert!(g.mountain.designations.contains_key(&p(100, 0, 0)));
@@ -597,11 +649,11 @@ pub(crate) mod tests {
         let NetEvent::Msg(ServerMsg::Snapshot(mut v)) = view(game().mountain) else {
             unreachable!()
         };
-        v.dwarves = vec![(DwarfId(0), p(2, 1, 0)); 1025];
+        v.dwarves = vec![(DwarfId(0), p(2, 1, 0), None); 1025];
         assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v.clone()))));
         assert_eq!(s.screen, Screen::Disconnected);
         let mut s = Session::default();
-        v.dwarves = vec![(DwarfId(0), p(6, 1, 0))];
+        v.dwarves = vec![(DwarfId(0), p(6, 1, 0), None)];
         assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v))));
         assert_eq!(s.screen, Screen::Disconnected);
     }
@@ -697,7 +749,7 @@ pub(crate) mod tests {
         d.tiles = vec![(p(4, 1, 0), Tile::Floor)];
         d.designations_added = vec![(p(5, 1, 0), DesignationKind::Stairs)];
         d.designations_removed = vec![p(0, 0, 0)];
-        d.dwarves = vec![(DwarfId(1), p(3, 1, 0))];
+        d.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
         d.resources.stone = 4;
         g.apply_tick(&d);
         assert_eq!(g.mountain.get(p(4, 1, 0)), Some(Tile::Floor));
@@ -705,7 +757,7 @@ pub(crate) mod tests {
             g.mountain.designations.iter().collect::<Vec<_>>(),
             vec![(&p(5, 1, 0), &DesignationKind::Stairs)]
         );
-        assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0))]);
+        assert_eq!(g.dwarves, vec![(DwarfId(1), p(3, 1, 0), None)]);
         assert_eq!(g.resources.stone, 4);
         assert_eq!(g.hero.pos, p(3, 1, 0));
     }
@@ -735,6 +787,80 @@ pub(crate) mod tests {
         );
         assert_eq!(g.hero.pos, p(1, 1, 1));
         assert_eq!(g.current_z(), 1);
+    }
+
+    #[test]
+    fn tick_keeps_dwarf_jobs_for_the_status_page() {
+        let mut g = game();
+        let mut d = tick(p(2, 1, 0));
+        let job = |kind, working| Some(DwarfJob { kind, working });
+        d.dwarves = vec![
+            (DwarfId(1), p(3, 1, 0), None),
+            (DwarfId(2), p(1, 1, 0), job(DesignationKind::Chop, true)),
+            (DwarfId(3), p(1, 1, 1), job(DesignationKind::Dig, false)),
+        ];
+        g.apply_tick(&d);
+        assert_eq!(
+            g.dwarf_rows(),
+            vec![
+                ("Nain n°1".into(), level_label(0), "Inactif".into()),
+                ("Nain n°2".into(), level_label(0), "Coupe du bois".into()),
+                (
+                    "Nain n°3".into(),
+                    level_label(1),
+                    "En route : Creuse".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn job_labels() {
+        let at = |kind| {
+            Some(DwarfJob {
+                kind,
+                working: true,
+            })
+        };
+        assert_eq!(job_label(None), "Inactif");
+        assert_eq!(job_label(at(DesignationKind::Dig)), "Creuse");
+        assert_eq!(job_label(at(DesignationKind::Stairs)), "Taille un escalier");
+        assert_eq!(
+            job_label(at(DesignationKind::WoodBed)),
+            "Construit : Lit en bois"
+        );
+        let walking = Some(DwarfJob {
+            kind: DesignationKind::Wall,
+            working: false,
+        });
+        assert_eq!(job_label(walking), "En route : Construit : Mur");
+    }
+
+    #[test]
+    fn ability_rows_show_modifiers() {
+        let a = roll_abilities(Race::Dwarf, Class::Fighter);
+        let rows = ability_rows(a);
+        assert_eq!(
+            rows[0],
+            (
+                "Force",
+                a.str,
+                format!("{:+}", moria_core::srd::modifier(a.str))
+            )
+        );
+        assert_eq!(
+            rows.map(|r| r.0),
+            [
+                "Force",
+                "Dextérité",
+                "Constitution",
+                "Intelligence",
+                "Sagesse",
+                "Charisme"
+            ]
+        );
+        assert_eq!(ability_rows(Abilities { str: 8, ..a })[0].2, "-1");
+        assert_eq!(ability_rows(Abilities { str: 15, ..a })[0].2, "+2");
     }
 
     #[test]
@@ -900,7 +1026,11 @@ pub(crate) mod tests {
                 pos: at.next().unwrap(),
                 ..game().hero
             },
-            dwarves: at.take(3).zip(0..).map(|(p, i)| (DwarfId(i), p)).collect(),
+            dwarves: at
+                .take(3)
+                .zip(0..)
+                .map(|(p, i)| (DwarfId(i), p, None))
+                .collect(),
             resources: Resources::default(),
         };
         let mut s = Session::default();

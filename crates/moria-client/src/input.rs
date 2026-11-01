@@ -47,6 +47,7 @@ struct Intent {
     mode: Option<DesignationKind>,
     build_menu: bool,
     close_menu: bool,
+    status: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -72,6 +73,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         },
         build_menu: keys.just_pressed(KeyCode::Digit3),
         close_menu: keys.just_pressed(KeyCode::Escape),
+        status: keys.just_pressed(KeyCode::KeyC),
     }
 }
 
@@ -133,6 +135,7 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         toggle: any(GamepadButton::North),
         build_menu: any(GamepadButton::West),
         close_menu: any(GamepadButton::East),
+        status: any(GamepadButton::Select),
         ..default()
     }
 }
@@ -164,6 +167,10 @@ fn play(
         g.pick_action(None);
     } else if k.close_menu || p.close_menu {
         g.build_menu = false;
+        g.status = false;
+    }
+    if k.status || p.status {
+        g.status = !g.status;
     }
     // Open menu: moves and the action button drive the menu, not the hero.
     let walk = k.walk.or(p.walk);
@@ -254,6 +261,13 @@ mod tests {
         keys.press(KeyCode::Digit4);
         let i = keyboard_intent(&keys, &ButtonInput::default());
         assert_eq!(i.mode, Some(DesignationKind::Chop));
+    }
+
+    #[test]
+    fn key_c_toggles_status() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyC);
+        assert!(keyboard_intent(&keys, &ButtonInput::default()).status);
     }
 
     #[test]

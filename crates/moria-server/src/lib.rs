@@ -475,7 +475,7 @@ impl State {
                 abilities: h.abilities,
                 pos: h.pos,
             },
-            dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
+            dwarves: f.dwarves.iter().map(sim::dwarf_view).collect(),
             resources: f.resources,
         };
         self.send(player, ServerMsg::Snapshot(Box::new(v)));
