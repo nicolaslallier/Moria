@@ -151,6 +151,8 @@ pub struct Game {
     pub hero: HeroView,
     pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
+    /// World tick, drives the day/night cycle.
+    pub tick: u64,
     /// Status page (key C) open.
     pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
@@ -236,6 +238,7 @@ impl Game {
             hero: v.hero,
             dwarves: v.dwarves,
             resources: v.resources,
+            tick: v.tick,
             status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
@@ -283,6 +286,7 @@ impl Game {
         self.dwarves
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
+        self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
         if !self.mountain.in_bounds(s) {
@@ -456,6 +460,7 @@ pub(crate) mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 100,
         })
     }
 
@@ -616,6 +621,7 @@ pub(crate) mod tests {
                 hero: g.hero,
                 dwarves: vec![],
                 resources: Resources::default(),
+                tick: 0,
             })))
         };
         // Tile vec not matching the dimensions (only possible via deserialization).
@@ -737,6 +743,16 @@ pub(crate) mod tests {
                 b: p(5, 3, 4)
             }
         );
+    }
+
+    #[test]
+    fn game_follows_the_world_tick() {
+        let mut g = game();
+        assert_eq!(g.tick, 100);
+        let mut d = tick(g.hero.pos);
+        d.tick = 4_242;
+        g.apply_tick(&d);
+        assert_eq!(g.tick, 4_242);
     }
 
     #[test]
@@ -878,6 +894,7 @@ pub(crate) mod tests {
             hero: g.hero,
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 0,
         };
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert_eq!(s.screen, Screen::Playing);
@@ -1032,6 +1049,7 @@ pub(crate) mod tests {
                 .map(|(p, i)| (DwarfId(i), p, None))
                 .collect(),
             resources: Resources::default(),
+            tick: 0,
         };
         let mut s = Session::default();
         assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));

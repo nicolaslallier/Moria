@@ -136,6 +136,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 0,
         };
         s.write_all(&encode(&ServerMsg::Snapshot(Box::new(v))))
             .unwrap();
