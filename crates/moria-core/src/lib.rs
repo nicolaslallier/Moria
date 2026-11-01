@@ -1,5 +1,6 @@
 pub mod geo;
 pub mod inventory;
+pub mod inventory_cache;
 pub mod light;
 pub mod mountain;
 pub mod tile;
