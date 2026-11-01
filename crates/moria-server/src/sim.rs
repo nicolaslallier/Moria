@@ -434,6 +434,11 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 tick: w.tick,
                 hero_pos: h.pos,
                 dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
+                dwarf_jobs: f
+                    .dwarves
+                    .iter()
+                    .filter_map(|d| Some((d.id, d.task.as_ref()?.kind)))
+                    .collect(),
                 tiles,
                 designations_added: vec![],
                 designations_removed: vec![],
@@ -815,6 +820,27 @@ mod tests {
         step(&mut w);
         step(&mut w);
         assert!(hero(&w).dig.is_none(), "the dwarf's stone is not taken");
+    }
+
+    /// The status page shows what each busy dwarf is doing.
+    #[test]
+    fn tick_reports_dwarf_jobs() {
+        let mut w = setup();
+        let t = p(5, 2, 0);
+        designate(&mut w, t, DesignationKind::Wall);
+        w.fortresses.get_mut(&M).unwrap().resources.stone = 1;
+        let id = w.fortresses[&M].dwarves[0].id;
+        let list = vec![(id, t)];
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list,
+            },
+        );
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(d.dwarf_jobs, vec![(id, DesignationKind::Wall)]);
     }
 
     #[test]

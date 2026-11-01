@@ -2,7 +2,9 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{ACTIONS, BUILDS, Game, Screen, Session, build_text, level_label, mode_label};
+use crate::game::{
+    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, level_label, mode_label,
+};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -44,7 +46,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (hud, action_bar, build_menu).run_if(in_state(Screen::Playing)),
+                (hud, action_bar, build_menu, status).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -306,6 +308,57 @@ fn action_buttons(ui: &mut egui::Ui, g: &mut Game) {
     }
 }
 
+/// Status page (key C): the hero's sheet and what every dwarf is doing.
+fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if !g.status {
+        return Ok(());
+    }
+    let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(g.hero.race).id()));
+    let rows = g.dwarf_rows();
+    let h = &g.hero;
+    egui::Window::new("Statut")
+        .open(&mut g.status)
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+        .resizable(false)
+        .show(ctx.ctx_mut()?, |ui| {
+            ui.heading(&h.name);
+            ui.horizontal(|ui| {
+                ui.image(egui::load::SizedTexture::new(portrait, [96.0, 96.0]));
+                ui.vertical(|ui| {
+                    ui.label(format!("{} {}", h.race.label_fr(), h.class.label_fr()));
+                    ui.label(level_label(h.pos.z));
+                    egui::Grid::new("abilities").show(ui, |ui| {
+                        for (name, score, m) in ability_rows(h.abilities) {
+                            ui.label(name);
+                            ui.label(score.to_string());
+                            ui.label(m);
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+            ui.separator();
+            ui.strong(format!("Nains ({})", rows.len()));
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("dwarves").striped(true).show(ui, |ui| {
+                        for (name, level, job) in rows {
+                            ui.label(name);
+                            ui.label(level);
+                            ui.label(job);
+                            ui.end_row();
+                        }
+                    });
+                });
+            ui.small("C ou Échap : fermer · manette : Select");
+        });
+    Ok(())
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -335,11 +388,11 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             ui.label(mode_label(g.mode));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · glisser clic gauche : désigner · clic droit : annuler",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
-                 · bouton gauche (X/□) : menu construire");
+                 · bouton gauche (X/□) : menu construire · Select : statut");
         });
     Ok(())
 }

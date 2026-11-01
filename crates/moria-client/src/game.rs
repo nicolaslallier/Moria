@@ -5,6 +5,7 @@ use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
 use moria_core::protocol::{ClientMsg, FortressView, HeroView, Reject, ServerMsg, TickDelta};
+use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -108,11 +109,42 @@ pub fn mode_label(k: DesignationKind) -> String {
     }
 }
 
+/// Status-page activity of a dwarf; `None` is idle.
+pub fn job_label(k: Option<DesignationKind>) -> String {
+    match k {
+        None => "Inactif".into(),
+        Some(DesignationKind::Dig) => "Creuse".into(),
+        Some(DesignationKind::Stairs) => "Taille un escalier".into(),
+        Some(DesignationKind::Chop) => "Coupe du bois".into(),
+        Some(k) => match BUILDS.iter().find(|b| b.0 == k) {
+            Some((_, l)) => format!("Construit : {l}"),
+            None => "Construit".into(),
+        },
+    }
+}
+
+/// Status-page rows: ability name, score, signed modifier.
+pub fn ability_rows(a: Abilities) -> [(&'static str, u8, String); 6] {
+    [
+        ("Force", a.str),
+        ("Dextérité", a.dex),
+        ("Constitution", a.con),
+        ("Intelligence", a.int),
+        ("Sagesse", a.wis),
+        ("Charisme", a.cha),
+    ]
+    .map(|(n, s)| (n, s, format!("{:+}", modifier(s))))
+}
+
 pub struct Game {
     pub mountain: Mountain,
     pub hero: HeroView,
     pub dwarves: Vec<(DwarfId, TilePos)>,
+    /// From the last tick: what each busy dwarf is doing.
+    pub dwarf_jobs: Vec<(DwarfId, DesignationKind)>,
     pub resources: Resources,
+    /// Status page (key C) open.
+    pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
     pub last_dir: Dir,
     pub mode: DesignationKind,
@@ -195,7 +227,9 @@ impl Game {
             mountain: v.mountain,
             hero: v.hero,
             dwarves: v.dwarves,
+            dwarf_jobs: vec![],
             resources: v.resources,
+            status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
             build_menu: false,
@@ -205,6 +239,17 @@ impl Game {
             pending: VecDeque::new(),
             ticks: 0,
         }
+    }
+
+    /// Status-page row per dwarf: name, level, activity.
+    pub fn dwarf_rows(&self) -> Vec<(String, String, String)> {
+        self.dwarves
+            .iter()
+            .map(|&(id, p)| {
+                let job = self.dwarf_jobs.iter().find(|j| j.0 == id).map(|j| j.1);
+                (format!("Nain n°{}", id.0), level_label(p.z), job_label(job))
+            })
+            .collect()
     }
 
     pub fn current_z(&self) -> u8 {
@@ -233,6 +278,7 @@ impl Game {
         let m = &self.mountain;
         self.dwarves
             .extend(d.dwarves.iter().filter(|(_, p)| m.in_bounds(*p)));
+        self.dwarf_jobs.clone_from(&d.dwarf_jobs);
         self.resources = d.resources;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -377,7 +423,7 @@ impl Session {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use moria_core::srd::{Class, Race, roll_abilities};
+    use moria_core::srd::{Abilities, Class, Race, roll_abilities};
     use moria_core::{MountainId, Tile};
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
@@ -418,6 +464,7 @@ pub(crate) mod tests {
             tiles: vec![],
             designations_added: vec![],
             designations_removed: vec![],
+            dwarf_jobs: vec![],
             resources: Resources::default(),
         }
     }
@@ -735,6 +782,63 @@ pub(crate) mod tests {
         );
         assert_eq!(g.hero.pos, p(1, 1, 1));
         assert_eq!(g.current_z(), 1);
+    }
+
+    #[test]
+    fn tick_keeps_dwarf_jobs_for_the_status_page() {
+        let mut g = game();
+        let mut d = tick(p(2, 1, 0));
+        d.dwarves = vec![(DwarfId(1), p(3, 1, 0)), (DwarfId(2), p(1, 1, 0))];
+        d.dwarf_jobs = vec![(DwarfId(2), DesignationKind::Chop)];
+        g.apply_tick(&d);
+        assert_eq!(
+            g.dwarf_rows(),
+            vec![
+                ("Nain n°1".into(), level_label(0), "Inactif".into()),
+                ("Nain n°2".into(), level_label(0), "Coupe du bois".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn job_labels() {
+        assert_eq!(job_label(None), "Inactif");
+        assert_eq!(job_label(Some(DesignationKind::Dig)), "Creuse");
+        assert_eq!(
+            job_label(Some(DesignationKind::Stairs)),
+            "Taille un escalier"
+        );
+        assert_eq!(
+            job_label(Some(DesignationKind::WoodBed)),
+            "Construit : Lit en bois"
+        );
+    }
+
+    #[test]
+    fn ability_rows_show_modifiers() {
+        let a = roll_abilities(Race::Dwarf, Class::Fighter);
+        let rows = ability_rows(a);
+        assert_eq!(
+            rows[0],
+            (
+                "Force",
+                a.str,
+                format!("{:+}", moria_core::srd::modifier(a.str))
+            )
+        );
+        assert_eq!(
+            rows.map(|r| r.0),
+            [
+                "Force",
+                "Dextérité",
+                "Constitution",
+                "Intelligence",
+                "Sagesse",
+                "Charisme"
+            ]
+        );
+        assert_eq!(ability_rows(Abilities { str: 8, ..a })[0].2, "-1");
+        assert_eq!(ability_rows(Abilities { str: 15, ..a })[0].2, "+2");
     }
 
     #[test]
