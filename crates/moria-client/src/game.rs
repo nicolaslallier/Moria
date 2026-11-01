@@ -375,7 +375,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use moria_core::srd::{Class, Race, roll_abilities};
     use moria_core::{MountainId, Tile};
@@ -385,7 +385,7 @@ mod tests {
     }
 
     /// 6×6×3 rock; floor at (1..=3, 1, 0); stairs at (1,1,0)-(1,1,1).
-    fn game() -> Game {
+    pub(crate) fn game() -> Game {
         let mut m = Mountain::new(MountainId(0), 6, 6, 3, Tile::Rock);
         for x in 1..=3 {
             m.set(p(x, 1, 0), Tile::Floor);

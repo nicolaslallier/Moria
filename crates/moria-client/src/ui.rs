@@ -2,7 +2,7 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{ACTIONS, BUILDS, Screen, Session, build_text, level_label, mode_label};
+use crate::game::{ACTIONS, BUILDS, Game, Screen, Session, build_text, level_label, mode_label};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -288,17 +288,22 @@ fn action_bar(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
         .resizable(false)
         .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -8.0])
         .show(ctx.ctx_mut()?, |ui| {
-            ui.horizontal(|ui| {
-                for &(label, a) in ACTIONS {
-                    let b = egui::Button::new(egui::RichText::new(label).heading())
-                        .selected(g.action_active(a));
-                    if ui.add(b).clicked() {
-                        g.pick_action(a);
-                    }
-                }
-            });
+            ui.horizontal(|ui| action_buttons(ui, g));
         });
     Ok(())
+}
+
+fn action_buttons(ui: &mut egui::Ui, g: &mut Game) {
+    for &(label, a) in ACTIONS {
+        let b =
+            egui::Button::new(egui::RichText::new(label).heading()).selected(g.action_active(a));
+        let r = ui.add(b);
+        // Space digs: a focused button would also take it as a click.
+        r.surrender_focus();
+        if r.clicked() {
+            g.pick_action(a);
+        }
+    }
 }
 
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
@@ -353,6 +358,32 @@ fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Space digs; it must never also press a bar button that holds focus.
+    #[test]
+    fn space_does_not_press_bar_buttons() {
+        let mut g = crate::game::tests::game();
+        g.mode = moria_core::DesignationKind::Chop;
+        let ctx = egui::Context::default();
+        let key = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for k in [egui::Key::Tab, egui::Key::Space, egui::Key::Space] {
+            let input = egui::RawInput {
+                events: vec![key(k)],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| action_buttons(ui, &mut g))
+                .textures_delta
+                .clear();
+        }
+        assert_eq!(g.mode, moria_core::DesignationKind::Chop);
+        assert!(!g.build_menu);
+    }
 
     #[test]
     fn prefs_never_store_secrets() {
