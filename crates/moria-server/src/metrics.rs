@@ -6,6 +6,7 @@
 use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -135,10 +136,17 @@ pub async fn serve(bind: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!("metriques sur http://{bind}/metrics");
     loop {
-        let Ok((mut s, _)) = listener.accept().await else {
-            continue;
+        let mut s = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                // EMFILE and friends: back off instead of spinning on accept.
+                tracing::warn!("metriques : accept echoue : {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
-        tokio::spawn(async move {
+        // A silent or slow client is dropped instead of pinning a task forever.
+        tokio::spawn(tokio::time::timeout(Duration::from_secs(5), async move {
             let mut buf = [0u8; 1024];
             let _ = s.read(&mut buf).await; // request ignored: one resource
             let body = render(&M);
@@ -148,7 +156,7 @@ pub async fn serve(bind: SocketAddr) -> anyhow::Result<()> {
             );
             let _ = s.write_all(head.as_bytes()).await;
             let _ = s.write_all(body.as_bytes()).await;
-        });
+        }));
     }
 }
 
@@ -167,5 +175,22 @@ mod tests {
         assert!(out.contains("moria_ticks_total 1\n"));
         assert!(out.contains("moria_tick_seconds_total 0.25\n"));
         assert_eq!(out.matches("# TYPE ").count(), 13);
+    }
+
+    #[tokio::test]
+    async fn serve_answers_http_despite_a_silent_client() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        tokio::spawn(serve(addr));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(out.contains("# TYPE moria_sessions gauge"));
     }
 }
