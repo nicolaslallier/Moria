@@ -1379,6 +1379,12 @@ mod tests {
             K::WoodBed,
             K::WoodTable,
             K::WoodChair,
+            K::Candle,
+            K::Torch,
+            K::Lamp,
+            K::Campfire,
+            K::Hearth,
+            K::Stove,
         ];
         for kind in kinds {
             let cost = kind.cost();

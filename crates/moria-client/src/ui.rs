@@ -3,8 +3,10 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, level_label, mode_label,
+    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, clock_label, level_label,
+    mode_label,
 };
+use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -41,6 +43,7 @@ pub fn plugin(app: &mut App) {
         .add_systems(OnEnter(Screen::CreateHero), |mut f: ResMut<HeroForm>| {
             f.sent = false;
         })
+        .add_systems(Last, memory_sync)
         .add_systems(
             EguiPrimaryContextPass,
             (
@@ -69,6 +72,30 @@ fn fallback_prefs_path() -> Option<PathBuf> {
         PathBuf::from(std::env::var_os("HOME")?).join(".config")
     };
     Some(dir.join("moria").join("prefs"))
+}
+
+/// Loads the explored memory when a game starts, saves it every 30 s, when the game ends and on app exit.
+fn memory_sync(
+    mut client: ResMut<Client>,
+    form: Res<LoginForm>,
+    time: Res<Time>,
+    mut sync: Local<MemorySync>,
+    mut dirs: Local<Option<Vec<PathBuf>>>,
+    mut exit: MessageReader<AppExit>,
+) {
+    // Closing the window ends the game too: save what is running (this system runs in `Last`).
+    let exit = exit.read().count() > 0;
+    // The one or two candidate folders, resolved once.
+    let dirs = dirs.get_or_insert_with(|| {
+        [prefs_path(), fallback_prefs_path()]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.parent().map(PathBuf::from))
+            .collect()
+    });
+    sync.step(time.delta_secs(), exit, &mut client.session, |m| {
+        memory_files(dirs, &form.addr, &form.name, m)
+    });
 }
 
 fn load_prefs() -> LoginForm {
@@ -259,8 +286,8 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let r = g.resources;
     centered("Construire").show(ctx.ctx_mut()?, |ui| {
         ui.label(format!(
-            "Pierre disponible : {} · Bois disponible : {}",
-            r.stone, r.wood
+            "Pierre disponible : {} · Bois disponible : {} · Or disponible : {}",
+            r.stone, r.wood, r.gold
         ));
         ui.separator();
         let mut picked = None;
@@ -391,6 +418,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 g.hero.class.label_fr()
             ));
             ui.label(mode_label(g.mode));
+            ui.label(clock_label(g.tick));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
                  · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · glisser clic gauche : désigner · clic droit : annuler",

@@ -1,9 +1,11 @@
 //! Client-side model, free of Bevy systems: session flow, local fortress copy,
 //! prediction and input rules. The Bevy systems in the other modules only call this.
 
+use crate::light::{Explored, SEEN_AT};
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
+use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
@@ -11,6 +13,7 @@ use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
 // ponytail: fixed margin; measure real RTT jitter if moves still get dropped server-side.
@@ -72,6 +75,17 @@ pub fn drag_msg(
     }
 }
 
+/// HUD clock: the game hour and the phase of the day.
+pub fn clock_label(tick: u64) -> String {
+    let name = match phase(tick) {
+        DayPhase::Day => "Jour",
+        DayPhase::Dusk => "Crépuscule",
+        DayPhase::Night => "Nuit",
+        DayPhase::Dawn => "Aube",
+    };
+    format!("{} h — {name}", hour(tick))
+}
+
 /// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
 pub fn level_label(z: u8) -> String {
     match z.cmp(&GROUND_Z) {
@@ -83,7 +97,7 @@ pub fn level_label(z: u8) -> String {
 
 /// "1 pierre", "3 bois".
 fn cost_fr(r: Resources) -> String {
-    [(r.stone, "pierre"), (r.wood, "bois")]
+    [(r.stone, "pierre"), (r.wood, "bois"), (r.gold, "or")]
         .iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, what)| format!("{n} {what}"))
@@ -121,7 +135,8 @@ pub fn job_label(job: Option<DwarfJob>) -> String {
         Dig => "Creuse".into(),
         Stairs => "Taille un escalier".into(),
         Chop => "Coupe du bois".into(),
-        Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair => {
+        Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair | Candle | Torch | Lamp
+        | Campfire | Hearth | Stove => {
             let label = BUILDS.iter().find(|b| b.0 == kind).map_or("?", |b| b.1);
             format!("Construit : {label}")
         }
@@ -151,6 +166,14 @@ pub struct Game {
     pub hero: HeroView,
     pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
+    /// World tick, drives the day/night cycle.
+    pub tick: u64,
+    /// Tiles the hero has seen lit.
+    pub explored: Explored,
+    /// Files `explored` was loaded from and is saved to; `None` until loaded.
+    pub memory: Option<Vec<PathBuf>>,
+    /// Bumped (wrapping) by every tick that changes tiles; a cache key for the light map.
+    pub map_rev: u32,
     /// Status page (key C) open.
     pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
@@ -179,6 +202,12 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
     (DesignationKind::WoodBed, "Lit en bois"),
     (DesignationKind::WoodTable, "Table en bois"),
     (DesignationKind::WoodChair, "Chaise en bois"),
+    (DesignationKind::Candle, "Chandelle"),
+    (DesignationKind::Torch, "Torche"),
+    (DesignationKind::Lamp, "Lampe"),
+    (DesignationKind::Campfire, "Feu de bois"),
+    (DesignationKind::Hearth, "Foyer"),
+    (DesignationKind::Stove, "Poêle"),
 ];
 
 /// Bottom-bar buttons with their key; `None` is the build menu.
@@ -230,12 +259,17 @@ impl Game {
     }
 
     pub fn new(v: FortressView) -> Self {
+        let (w, h, d) = v.mountain.size();
         Self {
             confirmed: v.hero.pos,
             mountain: v.mountain,
             hero: v.hero,
             dwarves: v.dwarves,
             resources: v.resources,
+            tick: v.tick,
+            explored: Explored::new(w, h, d),
+            memory: None,
+            map_rev: 0,
             status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
@@ -256,6 +290,27 @@ impl Game {
             .collect()
     }
 
+    /// Light sources on level `z` as `(x, y, radius)`: the hero and every dwarf.
+    pub fn light_sources(&self, z: u8) -> Vec<(i16, i16, u8)> {
+        let hero = std::iter::once(self.hero.pos);
+        let dwarves = self.dwarves.iter().map(|d| d.1);
+        hero.chain(dwarves)
+            .filter(|p| p.z == z)
+            .map(|p| (p.x, p.y, BODY_LIGHT))
+            .collect()
+    }
+
+    /// Marks as explored every tile of `area` on level `z` lit at least `SEEN_AT`.
+    pub fn mark_visible(&mut self, z: u8, area: Area, light: &LightMap) {
+        for y in area.y0..=area.y1 {
+            for x in area.x0..=area.x1 {
+                if light.get(x, y) >= SEEN_AT {
+                    self.explored.mark(TilePos::new(x, y, z));
+                }
+            }
+        }
+    }
+
     pub fn current_z(&self) -> u8 {
         self.browse_z.unwrap_or(self.hero.pos.z)
     }
@@ -266,6 +321,9 @@ impl Game {
     pub fn apply_tick(&mut self, d: &TickDelta) {
         for &(p, t) in &d.tiles {
             self.mountain.set(p, t);
+        }
+        if !d.tiles.is_empty() {
+            self.map_rev = self.map_rev.wrapping_add(1);
         }
         // Out-of-bounds entries are ignored so a hostile server cannot grow the map.
         for p in &d.designations_removed {
@@ -283,6 +341,7 @@ impl Game {
         self.dwarves
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
+        self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
         if !self.mountain.in_bounds(s) {
@@ -359,6 +418,18 @@ impl Game {
     }
 }
 
+/// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
+pub fn outlined(
+    designations: &std::collections::BTreeMap<TilePos, DesignationKind>,
+    z: u8,
+) -> Vec<(TilePos, DesignationKind)> {
+    designations
+        .iter()
+        .filter(|(p, _)| p.z == z)
+        .map(|(&p, &k)| (p, k))
+        .collect()
+}
+
 /// What the client shows, driven by network events.
 #[derive(Default)]
 pub struct Session {
@@ -368,6 +439,8 @@ pub struct Session {
     pub game: Option<Game>,
     /// Bumped on every accepted snapshot so the renderer rebuilds the map.
     pub snapshots: u32,
+    /// Games dropped by a disconnect or a new mountain, queued until each is saved to its own files.
+    pub left: Vec<Game>,
 }
 
 impl Session {
@@ -394,7 +467,18 @@ impl Session {
             }
             NetEvent::Msg(ServerMsg::Snapshot(v)) => {
                 self.snapshots += 1;
-                self.game = Some(Game::new(*v));
+                let mut g = Game::new(*v);
+                // A new snapshot of the same mountain keeps what the hero has explored.
+                if let Some(old) = self.game.take() {
+                    if old.mountain.id == g.mountain.id && old.mountain.size() == g.mountain.size()
+                    {
+                        g.explored = old.explored;
+                        g.memory = old.memory;
+                    } else {
+                        self.left.push(old);
+                    }
+                }
+                self.game = Some(g);
                 self.screen = Screen::Playing;
                 false
             }
@@ -419,7 +503,7 @@ impl Session {
     fn end(&mut self, screen: Screen, msg: String) {
         self.screen = screen;
         self.error = Some(msg);
-        self.game = None;
+        self.left.extend(self.game.take());
     }
 }
 
@@ -444,6 +528,41 @@ pub(crate) mod tests {
         game_on(m, p(2, 1, 0))
     }
 
+    #[test]
+    fn only_lit_tiles_become_explored() {
+        let mut g = game();
+        let area = Area {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 5,
+        };
+        // Night on z = 1 (underground): only the source at (2, 1) lights anything.
+        let light = moria_core::light::light_map(&g.mountain, 1, area, &[(2, 1, 4)], 20_000);
+        g.mark_visible(1, area, &light);
+        assert!(g.explored.seen(p(2, 1, 1)));
+        assert!(!g.explored.seen(p(5, 5, 1)));
+        assert!(!g.explored.seen(p(2, 1, 0)));
+    }
+
+    #[test]
+    fn clock_names_the_phase() {
+        assert_eq!(clock_label(0), "6 h — Jour");
+        assert_eq!(clock_label(16_500), "17 h — Crépuscule");
+        assert_eq!(clock_label(27_000), "0 h — Nuit");
+        assert_eq!(clock_label(34_500), "5 h — Aube");
+    }
+
+    #[test]
+    fn hero_lights_only_his_own_level() {
+        let mut g = game(); // hero on z = 0
+        g.dwarves = vec![(DwarfId(1), p(2, 1, 1), None)];
+        assert_eq!(g.light_sources(0), vec![(2, 1, BODY_LIGHT)]);
+        assert_eq!(g.light_sources(1), vec![(2, 1, BODY_LIGHT)]); // the dwarf only
+        g.dwarves.clear();
+        assert!(g.light_sources(1).is_empty());
+    }
+
     fn game_on(mountain: Mountain, pos: TilePos) -> Game {
         Game::new(FortressView {
             mountain,
@@ -456,6 +575,7 @@ pub(crate) mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 100,
         })
     }
 
@@ -616,6 +736,7 @@ pub(crate) mod tests {
                 hero: g.hero,
                 dwarves: vec![],
                 resources: Resources::default(),
+                tick: 0,
             })))
         };
         // Tile vec not matching the dimensions (only possible via deserialization).
@@ -656,6 +777,36 @@ pub(crate) mod tests {
         v.dwarves = vec![(DwarfId(0), p(6, 1, 0), None)];
         assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v))));
         assert_eq!(s.screen, Screen::Disconnected);
+    }
+
+    #[test]
+    fn a_pending_left_game_survives_a_later_disconnect() {
+        let snap = |id: u16| {
+            let g = game();
+            let mut m = g.mountain;
+            m.id = MountainId(id);
+            NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+                mountain: m,
+                hero: g.hero,
+                dwarves: vec![],
+                resources: Resources::default(),
+                tick: 0,
+            })))
+        };
+        let mut s = Session::default();
+        s.handle(snap(1));
+        s.handle(snap(2)); // old mountain 1 is now pending in `left`
+        s.handle(NetEvent::Disconnected("perdu".into()));
+        let ids: Vec<_> = s.left.iter().map(|g| g.mountain.id).collect();
+        assert_eq!(ids, [MountainId(1), MountainId(2)]); // both queued, none lost
+    }
+
+    #[test]
+    fn designations_are_outlined_on_their_level_even_in_the_dark() {
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(p(5, 5, 0), DesignationKind::Dig); // never-seen rock
+        d.insert(p(1, 1, 1), DesignationKind::Dig);
+        assert_eq!(outlined(&d, 0), vec![(p(5, 5, 0), DesignationKind::Dig)]);
     }
 
     #[test]
@@ -740,6 +891,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn game_follows_the_world_tick() {
+        let mut g = game();
+        assert_eq!(g.tick, 100);
+        let mut d = tick(g.hero.pos);
+        d.tick = 4_242;
+        g.apply_tick(&d);
+        assert_eq!(g.tick, 4_242);
+    }
+
+    #[test]
     fn apply_tick_updates_mountain() {
         let mut g = game();
         g.mountain
@@ -752,6 +913,7 @@ pub(crate) mod tests {
         d.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
         d.resources.stone = 4;
         g.apply_tick(&d);
+        assert_eq!(g.map_rev, 1);
         assert_eq!(g.mountain.get(p(4, 1, 0)), Some(Tile::Floor));
         assert_eq!(
             g.mountain.designations.iter().collect::<Vec<_>>(),
@@ -878,6 +1040,7 @@ pub(crate) mod tests {
             hero: g.hero,
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 0,
         };
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert_eq!(s.screen, Screen::Playing);
@@ -979,6 +1142,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lights_are_in_the_build_menu() {
+        for (k, l) in [
+            (DesignationKind::Torch, "Torche"),
+            (DesignationKind::Stove, "Poêle"),
+        ] {
+            assert!(BUILDS.contains(&(k, l)));
+        }
+        let mut g = game();
+        g.resources.gold = 0;
+        g.resources.stone = 5;
+        let lamp = BUILDS
+            .iter()
+            .position(|b| b.0 == DesignationKind::Lamp)
+            .unwrap();
+        g.pick_build(lamp);
+        assert_ne!(g.mode, DesignationKind::Lamp); // no gold, no lamp
+    }
+
+    #[test]
     fn build_menu_lists_wood() {
         let rows: Vec<String> = BUILDS.iter().map(|&(k, l)| build_text(k, l)).collect();
         assert_eq!(
@@ -991,6 +1173,12 @@ pub(crate) mod tests {
                 "Lit en bois (3 bois)",
                 "Table en bois (4 bois)",
                 "Chaise en bois (2 bois)",
+                "Chandelle (1 bois)",
+                "Torche (1 bois)",
+                "Lampe (1 pierre + 1 or)",
+                "Feu de bois (3 bois)",
+                "Foyer (4 pierre)",
+                "Poêle (3 pierre + 2 bois)",
             ]
         );
         assert_eq!(
@@ -1032,9 +1220,27 @@ pub(crate) mod tests {
                 .map(|(p, i)| (DwarfId(i), p, None))
                 .collect(),
             resources: Resources::default(),
+            tick: 0,
         };
         let mut s = Session::default();
         assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));
         assert_eq!(s.screen, Screen::Playing);
+    }
+
+    #[test]
+    fn new_snapshot_keeps_explored() {
+        let g = game();
+        let view = FortressView {
+            mountain: g.mountain.clone(),
+            hero: g.hero.clone(),
+            dwarves: vec![],
+            resources: Resources::default(),
+            tick: 0,
+        };
+        let mut s = Session::default();
+        s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view.clone()))));
+        s.game.as_mut().unwrap().explored.mark(p(2, 1, 0));
+        s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
+        assert!(s.game.unwrap().explored.seen(p(2, 1, 0)));
     }
 }

@@ -373,6 +373,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 0,
         };
         let n = encode(&view).len();
         assert!(n < MAX_FRAME, "{n} >= {MAX_FRAME}");
@@ -547,6 +548,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            tick: 0,
         };
         let n = encode(&v).len();
         assert!(n < MAX_FRAME / 2, "{n}");

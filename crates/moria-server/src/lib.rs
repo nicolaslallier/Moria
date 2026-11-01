@@ -477,6 +477,7 @@ impl State {
             },
             dwarves: f.dwarves.iter().map(sim::dwarf_view).collect(),
             resources: f.resources,
+            tick: self.w.tick,
         };
         self.send(player, ServerMsg::Snapshot(Box::new(v)));
     }
