@@ -2,10 +2,12 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::Screen;
+use crate::game::{Game, Screen};
 use crate::input::Drag;
+use crate::light::{dwarf_visible, shown};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use moria_core::light::{Area, LightMap, light_map};
 use moria_core::{DesignationKind, Tile, TilePos};
 
 pub const TILE: f32 = 48.0;
@@ -24,7 +26,8 @@ pub fn to_tile(w: Vec2) -> (i16, i16) {
 struct TileSprite {
     dx: i16,
     dy: i16,
-    shown: Option<(TilePos, Option<Tile>, bool)>,
+    /// Tile, on grass, brightness in 1/32 steps.
+    shown: Option<(TilePos, Option<Tile>, bool, u8)>,
 }
 
 /// Tiles from the hero to the window edge, plus a margin of 2.
@@ -50,13 +53,18 @@ enum Mark {
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<Built>()
-        .add_systems(OnExit(Screen::Playing), |mut b: ResMut<Built>| {
-            *b = Built::default()
-        })
+        .add_systems(
+            OnExit(Screen::Playing),
+            |mut b: ResMut<Built>, mut commands: Commands| {
+                *b = Built::default();
+                commands.remove_resource::<Lighting>();
+            },
+        )
         .add_systems(
             Update,
             (
                 spawn_map,
+                compute_light,
                 (
                     sync_tiles,
                     sync_marks,
@@ -129,12 +137,70 @@ fn spawn_map(
     commands.spawn((head(art.head(g.hero.race)), Mark::Hero));
 }
 
+/// Light of the viewed level around the hero; only `compute_light` writes it.
+#[derive(Resource)]
+struct Lighting(LightMap);
+
+/// What the light map depends on: hour step, hero, level, dwarves, snapshot, map, view.
+type LightKey = (u64, TilePos, u8, Vec<TilePos>, u32, u32, (i16, i16));
+
+/// Recomputes the light map when its key changes, and explores what it lights.
+fn compute_light(
+    mut commands: Commands,
+    mut client: ResMut<Client>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    lighting: Option<Res<Lighting>>,
+    mut key: Local<Option<LightKey>>,
+) {
+    let snapshots = client.session.snapshots;
+    let Some(g) = &mut client.session.game else {
+        return;
+    };
+    let (rx, ry) = view_radius(window.width(), window.height());
+    let z = g.current_z();
+    let want = (
+        g.tick / 150,
+        g.hero.pos,
+        z,
+        g.dwarves.iter().map(|d| d.1).collect(),
+        snapshots,
+        g.map_rev,
+        (rx, ry),
+    );
+    if lighting.is_some() && key.as_ref() == Some(&want) {
+        return;
+    }
+    *key = Some(want);
+    let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
+    let area = Area {
+        x0: hx - rx,
+        y0: hy - ry,
+        x1: hx + rx,
+        y1: hy + ry,
+    };
+    let map = light_map(&g.mountain, z, area, &g.light_sources(z), g.tick);
+    g.mark_visible(z, area, &map);
+    commands.insert_resource(Lighting(map));
+}
+
+/// Brightness drawn at `(x, y)` of the viewed level `z`.
+fn brightness(g: &Game, l: &Lighting, x: i16, y: i16, z: u8) -> f32 {
+    shown(l.0.get(x, y), g.explored.seen(TilePos::new(x, y, z)))
+}
+
+/// `c` darkened by brightness `b`, alpha kept.
+fn dim(c: Color, b: f32) -> Color {
+    let c = c.to_srgba();
+    Color::srgba(c.red * b, c.green * b, c.blue * b, c.alpha)
+}
+
 fn sync_tiles(
     client: Res<Client>,
     art: Res<Art>,
+    lighting: Option<Res<Lighting>>,
     mut q: Query<(&mut TileSprite, &mut Sprite, &mut Transform)>,
 ) {
-    let Some(g) = &client.session.game else {
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
         return;
     };
     let z = g.current_z();
@@ -144,20 +210,22 @@ fn sync_tiles(
         let tile = g.mountain.get(at);
         let on_grass =
             tile.is_some_and(Tile::is_furniture) && g.mountain.ground_at(at) == Tile::Grass;
-        let key = Some((at, tile, on_grass));
+        let steps = (brightness(g, &l, at.x, at.y, z) * 32.0).round() as u8;
+        let key = Some((at, tile, on_grass, steps));
         if t.shown == key {
             continue;
         }
         t.shown = key;
+        let b = f32::from(steps) / 32.0;
         tr.translation = to_world(at.x, at.y).extend(0.0);
         (s.image, s.color) = match tile {
-            Some(t) => (art.tile(t, on_grass), Color::WHITE),
+            Some(t) => (art.tile(t, on_grass), Color::srgb(b, b, b)),
             None => (Handle::default(), Color::BLACK),
         };
         // Slopes keep their orientation, stairs are the user's art, sky stays flat.
         if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky)) {
             let variation = ((i32::from(at.x) * 37 + i32::from(at.y) * 61).rem_euclid(11)) as f32;
-            let light = 0.88 + variation * 0.012;
+            let light = (0.88 + variation * 0.012) * b;
             s.color = Color::srgb(light, light, light);
             s.flip_x = (at.x + at.y) % 2 == 0;
             s.flip_y = at.x % 3 == 0;
@@ -168,10 +236,10 @@ fn sync_tiles(
     }
 }
 
-/// `depth` keeps the hero drawn above a dwarf sharing its tile.
-fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32) {
+/// `depth` keeps the hero drawn above a dwarf sharing its tile; `lit` false hides it.
+fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32, lit: bool) {
     t.translation = to_world(p.x, p.y).extend(depth);
-    *v = if p.z == z {
+    *v = if p.z == z && lit {
         Visibility::Inherited
     } else {
         Visibility::Hidden
@@ -182,27 +250,32 @@ fn sync_marks(
     mut commands: Commands,
     client: Res<Client>,
     art: Res<Art>,
+    lighting: Option<Res<Lighting>>,
     mut marks: Query<(Entity, &Mark, &mut Transform, &mut Visibility)>,
 ) {
-    let Some(g) = &client.session.game else {
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
         return;
     };
     let z = g.current_z();
+    let lit = |p: TilePos| dwarf_visible(l.0.get(p.x, p.y));
     let mut ds = g.dwarves.iter();
     for (e, mark, mut t, mut v) in &mut marks {
-        let (pos, depth) = match mark {
-            Mark::Hero => (Some(g.hero.pos), 2.0),
-            Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), 1.0),
+        let (pos, depth, visible) = match mark {
+            Mark::Hero => (Some(g.hero.pos), 2.0, true),
+            Mark::Dwarf => {
+                let p = ds.next().map(|&(_, p, _)| p);
+                (p, 1.0, p.is_some_and(lit))
+            }
         };
         match pos {
-            Some(p) => place(&mut t, &mut v, p, z, depth),
+            Some(p) => place(&mut t, &mut v, p, z, depth, visible),
             None => commands.entity(e).despawn(),
         }
     }
     for &(_, p, _) in ds {
         let mut t = Transform::default();
         let mut v = Visibility::default();
-        place(&mut t, &mut v, p, z, 1.0);
+        place(&mut t, &mut v, p, z, 1.0, lit(p));
         commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
     }
 }
@@ -224,9 +297,10 @@ fn follow_camera(client: Res<Client>, mut cam: Query<&mut Transform, With<Camera
 fn draw_relief(
     client: Res<Client>,
     window: Single<&Window, With<PrimaryWindow>>,
+    lighting: Option<Res<Lighting>>,
     mut gizmos: Gizmos,
 ) {
-    let Some(g) = &client.session.game else {
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
         return;
     };
     let z = g.current_z();
@@ -243,6 +317,10 @@ fn draw_relief(
             {
                 continue;
             }
+            let b = brightness(g, &l, x, y, z);
+            if b == 0.0 {
+                continue;
+            }
             let center = to_world(x, y);
             for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
                 if !g.mountain.walkable(TilePos::new(x + dx, y + dy, z)) {
@@ -254,34 +332,54 @@ fn draw_relief(
                 // A dark face on the stone and a soft, stepped shadow on the floor.
                 for offset in 0..7 {
                     let at = edge - normal * offset as f32;
-                    gizmos.line_2d(at - tangent, at + tangent, Color::srgb(0.10, 0.12, 0.16));
+                    gizmos.line_2d(
+                        at - tangent,
+                        at + tangent,
+                        dim(Color::srgb(0.10, 0.12, 0.16), b),
+                    );
                 }
                 let rim = edge - normal * 7.0;
-                gizmos.line_2d(rim - tangent, rim + tangent, Color::srgb(0.39, 0.43, 0.48));
+                gizmos.line_2d(
+                    rim - tangent,
+                    rim + tangent,
+                    dim(Color::srgb(0.39, 0.43, 0.48), b),
+                );
                 for offset in 1..6 {
                     let at = edge + normal * offset as f32;
                     gizmos.line_2d(
                         at - tangent,
                         at + tangent,
-                        Color::srgba(0.02, 0.025, 0.04, 0.36 - offset as f32 * 0.045),
+                        dim(
+                            Color::srgba(0.02, 0.025, 0.04, 0.36 - offset as f32 * 0.045),
+                            b,
+                        ),
                     );
                 }
             }
         }
     }
+    // Circles follow the heads: a remembered but dark tile does not reveal its dwarf.
     for &(_, p, _) in &g.dwarves {
-        if p.z == z {
+        if p.z == z && dwarf_visible(l.0.get(p.x, p.y)) {
             gizmos.circle_2d(
                 to_world(p.x, p.y),
                 TILE * 0.47,
-                Color::srgba(0.61, 0.69, 0.70, 0.6),
+                dim(
+                    Color::srgba(0.61, 0.69, 0.70, 0.6),
+                    brightness(g, &l, p.x, p.y, z),
+                ),
             );
         }
     }
 }
 
-fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
-    let Some(g) = &client.session.game else {
+fn draw_outlines(
+    client: Res<Client>,
+    drag: Res<Drag>,
+    lighting: Option<Res<Lighting>>,
+    mut gizmos: Gizmos,
+) {
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
         return;
     };
     let z = g.current_z();
@@ -291,7 +389,9 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
         gizmos.circle_2d(at, TILE * 0.49, Color::srgba(0.94, 0.73, 0.35, 0.3));
     }
     // TilePos orders by x first, so a z-range is not contiguous; a scan of all designations.
-    for (p, k) in g.mountain.designations.iter().filter(|(p, _)| p.z == z) {
+    // Only on tiles lit or explored: the dark keeps its secrets.
+    let known = |p: &TilePos| p.z == z && brightness(g, &l, p.x, p.y, z) > 0.0;
+    for (p, k) in g.mountain.designations.iter().filter(|(p, _)| known(p)) {
         let color = match k {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),

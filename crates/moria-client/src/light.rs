@@ -1,9 +1,6 @@
 //! Client-side light model: what the hero has explored and how bright a tile is shown.
 //! Bevy-free, like `game.rs`.
 
-// ponytail: consumed by the renderer in Task 5; drop this allow then.
-#![allow(dead_code)]
-
 use moria_core::TilePos;
 
 /// A tile at or above this brightness becomes explored (moonlight alone does not explore).
@@ -74,9 +71,16 @@ pub fn shown(light: f32, seen: bool) -> f32 {
     light.max(if seen { MEMORY } else { 0.0 })
 }
 
+/// A dwarf is drawn only where the light is brighter than a memory and enough to explore:
+/// `MEMORY` (0.3) is above `SEEN_AT` (0.25), so a remembered dark tile never shows one.
+pub fn dwarf_visible(light: f32) -> bool {
+    light > MEMORY.max(SEEN_AT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moria_core::light::MOONLIGHT;
 
     #[test]
     fn explored_round_trips_and_marks() {
@@ -94,6 +98,13 @@ mod tests {
         let e = Explored::new(10, 10, 2);
         assert!(Explored::from_bytes(20, 10, 2, &e.to_bytes()).is_none());
         assert!(Explored::from_bytes(10, 10, 2, &[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn dwarf_is_visible_only_where_lit() {
+        assert!(!dwarf_visible(shown(0.0, true))); // remembered but dark
+        assert!(!dwarf_visible(MOONLIGHT));
+        assert!(dwarf_visible(0.5)); // a dwarf's own fade edge still counts
     }
 
     #[test]

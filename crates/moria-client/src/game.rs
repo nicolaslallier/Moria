@@ -1,11 +1,11 @@
 //! Client-side model, free of Bevy systems: session flow, local fortress copy,
 //! prediction and input rules. The Bevy systems in the other modules only call this.
 
-use crate::light::Explored;
+use crate::light::{Explored, SEEN_AT};
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
-use moria_core::light::BODY_LIGHT;
+use moria_core::light::{Area, BODY_LIGHT, LightMap, hour};
 use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
@@ -75,6 +75,18 @@ pub fn drag_msg(
 }
 
 /// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
+/// HUD clock: the game hour and the phase of the day.
+pub fn clock_label(tick: u64) -> String {
+    let h = hour(tick);
+    let phase = match h {
+        6..16 => "Jour",
+        16..18 => "Crépuscule",
+        4..6 => "Aube",
+        _ => "Nuit",
+    };
+    format!("{h} h — {phase}")
+}
+
 pub fn level_label(z: u8) -> String {
     match z.cmp(&GROUND_Z) {
         Ordering::Equal => "Niveau 0 (sol)".into(),
@@ -157,6 +169,8 @@ pub struct Game {
     pub tick: u64,
     /// Tiles the hero has seen lit.
     pub explored: Explored,
+    /// Bumped (wrapping) by every tick that changes tiles; a cache key for the light map.
+    pub map_rev: u32,
     /// Status page (key C) open.
     pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
@@ -245,6 +259,7 @@ impl Game {
             resources: v.resources,
             tick: v.tick,
             explored: Explored::new(w, h, d),
+            map_rev: 0,
             status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
@@ -275,6 +290,17 @@ impl Game {
             .collect()
     }
 
+    /// Marks as explored every tile of `area` on level `z` lit at least `SEEN_AT`.
+    pub fn mark_visible(&mut self, z: u8, area: Area, light: &LightMap) {
+        for y in area.y0..=area.y1 {
+            for x in area.x0..=area.x1 {
+                if light.get(x, y) >= SEEN_AT {
+                    self.explored.mark(TilePos::new(x, y, z));
+                }
+            }
+        }
+    }
+
     pub fn current_z(&self) -> u8 {
         self.browse_z.unwrap_or(self.hero.pos.z)
     }
@@ -285,6 +311,9 @@ impl Game {
     pub fn apply_tick(&mut self, d: &TickDelta) {
         for &(p, t) in &d.tiles {
             self.mountain.set(p, t);
+        }
+        if !d.tiles.is_empty() {
+            self.map_rev = self.map_rev.wrapping_add(1);
         }
         // Out-of-bounds entries are ignored so a hostile server cannot grow the map.
         for p in &d.designations_removed {
@@ -462,6 +491,31 @@ pub(crate) mod tests {
         m.set(p(1, 1, 0), Tile::Stair);
         m.set(p(1, 1, 1), Tile::Stair);
         game_on(m, p(2, 1, 0))
+    }
+
+    #[test]
+    fn only_lit_tiles_become_explored() {
+        let mut g = game();
+        let area = Area {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 5,
+        };
+        // Night on z = 1 (underground): only the source at (2, 1) lights anything.
+        let light = moria_core::light::light_map(&g.mountain, 1, area, &[(2, 1, 4)], 20_000);
+        g.mark_visible(1, area, &light);
+        assert!(g.explored.seen(p(2, 1, 1)));
+        assert!(!g.explored.seen(p(5, 5, 1)));
+        assert!(!g.explored.seen(p(2, 1, 0)));
+    }
+
+    #[test]
+    fn clock_names_the_phase() {
+        assert_eq!(clock_label(0), "6 h — Jour");
+        assert_eq!(clock_label(16_500), "17 h — Crépuscule");
+        assert_eq!(clock_label(27_000), "0 h — Nuit");
+        assert_eq!(clock_label(34_500), "5 h — Aube");
     }
 
     #[test]
@@ -794,6 +848,7 @@ pub(crate) mod tests {
         d.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
         d.resources.stone = 4;
         g.apply_tick(&d);
+        assert_eq!(g.map_rev, 1);
         assert_eq!(g.mountain.get(p(4, 1, 0)), Some(Tile::Floor));
         assert_eq!(
             g.mountain.designations.iter().collect::<Vec<_>>(),

@@ -3,7 +3,8 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, level_label, mode_label,
+    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, clock_label, level_label,
+    mode_label,
 };
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
@@ -391,6 +392,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 g.hero.class.label_fr()
             ));
             ui.label(mode_label(g.mode));
+            ui.label(clock_label(g.tick));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
                  · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · glisser clic gauche : désigner · clic droit : annuler",
