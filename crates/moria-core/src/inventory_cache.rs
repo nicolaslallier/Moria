@@ -54,7 +54,11 @@ impl Cache {
 
     pub fn view(&self, st: &State, m: MountainId) -> Resources {
         let mut r = st.totals.get(&m).copied().unwrap_or_default();
-        for b in self.pending.iter().filter(|b| b.mountain == m) {
+        for b in self
+            .pending
+            .iter()
+            .filter(|b| b.mountain == m && !(b.seed && st.seeded.contains(&m)))
+        {
             r.add(b.add);
             r.take(&b.take);
         }
@@ -86,6 +90,16 @@ mod tests {
             s.acks.insert("srv".into(), a);
         }
         s
+    }
+
+    #[test]
+    fn view_ignores_pending_seed_for_already_seeded_mountain() {
+        let mut c = Cache::new("srv", 1);
+        c.push(M, res(12), res(0), true);
+        let mut st = state(7, None);
+        st.seeded.insert(M);
+        assert_eq!(c.view(&st, M).stone, 7);
+        assert_eq!(c.view(&state(7, None), M).stone, 19);
     }
 
     #[test]

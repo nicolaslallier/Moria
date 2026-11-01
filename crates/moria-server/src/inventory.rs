@@ -30,6 +30,9 @@ impl InvSync {
     }
 
     /// Seeds new mountains once, then loads the inventory view into every fortress.
+    /// Contract: EVERY change to `Fortress.resources` must happen between `begin_tick` and
+    /// `end_tick` (anything outside is overwritten by the view or never batched). Task 9's
+    /// order: begin_tick -> requests/commands -> sim::step -> end_tick.
     pub fn begin_tick(&mut self, w: &mut World) {
         for (&m, f) in &w.fortresses {
             if self.seeded.insert(m) {
@@ -45,6 +48,7 @@ impl InvSync {
     }
 
     /// Seed batches first, then one batch per fortress whose resources changed this tick.
+    /// See `begin_tick` for the contract on when `Fortress.resources` may change.
     // ponytail: net diff per tick, so add-then-take inside one tick clamps on the net; fine unless a tick both exhausts and refills a resource
     pub fn end_tick(&mut self, w: &World) -> Vec<Batch> {
         let mut out = std::mem::take(&mut self.outbox);
@@ -161,6 +165,26 @@ mod tests {
         st.totals.insert(M, food(7));
         st.seeded.insert(M);
         feed(&mut inv, &mut st, &bs);
+        inv.begin_tick(&mut w);
+        assert_eq!(res(&w), food(7));
+        assert!(inv.end_tick(&w).is_empty()); // the 12 -> 7 jump is not a take
+    }
+
+    #[test]
+    fn restart_window_does_not_double_count_stale_world_resources() {
+        let mut w = world(food(12));
+        let mut inv = InvSync::new("s", 1);
+        inv.begin_tick(&mut w);
+        let seed = inv.end_tick(&w);
+        // A state from before our seed arrived: the mountain is already known, no ack of ours.
+        let mut st = State::default();
+        st.totals.insert(M, food(7));
+        st.seeded.insert(M);
+        inv.on_state(st.clone());
+        inv.begin_tick(&mut w);
+        assert_eq!(res(&w), food(7));
+        inv.end_tick(&w);
+        feed(&mut inv, &mut st, &seed); // now the seed is applied (ignored) and acked
         inv.begin_tick(&mut w);
         assert_eq!(res(&w), food(7));
     }
