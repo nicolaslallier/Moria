@@ -9,8 +9,14 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use moria_core::light::{Area, LightMap, light_map};
 use moria_core::{DesignationKind, Tile, TilePos};
+use std::collections::BTreeMap;
 
 pub const TILE: f32 = 48.0;
+
+/// Draw depths: dwarves, then the hero above them; counts sit between.
+const DWARF_DEPTH: f32 = 1.0;
+const COUNT_DEPTH: f32 = 1.5;
+const HERO_DEPTH: f32 = 2.0;
 
 pub fn to_world(x: i16, y: i16) -> Vec2 {
     Vec2::new(f32::from(x) * TILE, -f32::from(y) * TILE)
@@ -68,6 +74,7 @@ pub fn plugin(app: &mut App) {
                 (
                     sync_tiles,
                     sync_marks,
+                    sync_order_counts,
                     follow_camera,
                     draw_outlines,
                     draw_relief,
@@ -267,8 +274,8 @@ fn sync_marks(
     let mut ds = g.dwarves.iter();
     for (e, mark, mut t, mut v) in &mut marks {
         let (pos, depth) = match mark {
-            Mark::Hero => (Some(g.hero.pos), 2.0),
-            Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), 1.0),
+            Mark::Hero => (Some(g.hero.pos), HERO_DEPTH),
+            Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), DWARF_DEPTH),
         };
         match pos {
             Some(p) => place(&mut t, &mut v, p, z, depth),
@@ -278,8 +285,70 @@ fn sync_marks(
     for &(_, p, _) in ds {
         let mut t = Transform::default();
         let mut v = Visibility::default();
-        place(&mut t, &mut v, p, z, 1.0);
+        place(&mut t, &mut v, p, z, DWARF_DEPTH);
         commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
+    }
+}
+
+/// The order count of the workshop at `.0`; `.1` is the (count, brightness steps) drawn.
+#[derive(Component)]
+struct OrderCount(TilePos, Option<(u8, u8)>);
+
+/// Orders of the viewed level `z`, as `(workshop, count)`.
+fn visible_orders(g: &Game, z: u8) -> BTreeMap<TilePos, u8> {
+    g.mountain
+        .orders
+        .iter()
+        .filter(|(p, _)| p.z == z)
+        .map(|(&p, &n)| (p, n))
+        .collect()
+}
+
+/// One entity per ordered workshop, rewritten only when its count or light changes.
+fn sync_order_counts(
+    mut commands: Commands,
+    client: Res<Client>,
+    lighting: Option<Res<Lighting>>,
+    mut counts: Query<(
+        Entity,
+        &mut OrderCount,
+        &mut Text2d,
+        &mut TextColor,
+        &mut Visibility,
+    )>,
+) {
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
+        return;
+    };
+    let z = g.current_z();
+    let mut orders = visible_orders(g, z);
+    for (e, mut c, mut text, mut color, mut v) in &mut counts {
+        let Some(n) = orders.remove(&c.0) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        let steps = (brightness(g, &l, c.0.x, c.0.y, z) * 32.0).round() as u8;
+        if c.1 != Some((n, steps)) {
+            c.1 = Some((n, steps));
+            text.0 = n.to_string();
+            color.0 = dim(Color::WHITE, f32::from(steps) / 32.0);
+            *v = if steps == 0 {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
+        }
+    }
+    for p in orders.into_keys() {
+        commands.spawn((
+            Text2d::default(),
+            TextFont::from_font_size(TILE * 0.4),
+            TextColor::default(),
+            Visibility::Hidden,
+            Transform::from_translation(to_world(p.x, p.y).extend(COUNT_DEPTH)),
+            DespawnOnExit(Screen::Playing),
+            OrderCount(p, None),
+        ));
     }
 }
 
@@ -404,7 +473,14 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
             | DesignationKind::Lamp
             | DesignationKind::Campfire
             | DesignationKind::Hearth
-            | DesignationKind::Stove => Color::srgb(0.7, 0.45, 1.0),
+            | DesignationKind::Stove
+            | DesignationKind::Forge
+            | DesignationKind::Anvil
+            | DesignationKind::WoodDoor
+            | DesignationKind::StoneDoor
+            | DesignationKind::IronDoor
+            | DesignationKind::Smelt
+            | DesignationKind::Smith => Color::srgb(0.7, 0.45, 1.0),
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }
@@ -431,5 +507,20 @@ mod tests {
         assert_eq!(n, 45 * 27);
         assert!(n < 176 * 96 / 10);
         assert!(cells(rx, ry).any(|c| c == (-rx, -ry)) && cells(rx, ry).any(|c| c == (rx, ry)));
+    }
+
+    #[test]
+    fn order_counts_are_the_viewed_levels_orders() {
+        let mut g = crate::game::tests::game();
+        let (a, b, up) = (
+            TilePos::new(2, 1, 0),
+            TilePos::new(3, 1, 0),
+            TilePos::new(2, 2, 1),
+        );
+        g.mountain.orders.extend([(a, 5), (b, 2), (up, 7)]);
+        assert_eq!(visible_orders(&g, 0), BTreeMap::from([(a, 5), (b, 2)]));
+        assert_eq!(visible_orders(&g, 1), BTreeMap::from([(up, 7)]));
+        g.mountain.orders.remove(&a);
+        assert_eq!(visible_orders(&g, 0), BTreeMap::from([(b, 2)]));
     }
 }

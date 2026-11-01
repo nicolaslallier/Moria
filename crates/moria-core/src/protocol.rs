@@ -8,7 +8,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -39,6 +39,13 @@ pub enum ClientMsg {
     },
     /// Hero builds `kind` (wall or furniture) on the floor tile toward `Dir`, for 1 stone.
     Build(Dir, DesignationKind),
+    /// Hero acts on the tile toward `Dir` (a door: lock or unlock).
+    Use(Dir),
+    /// Orders `add` more units at the workshop toward `dir`; `add == 0` cancels.
+    Order {
+        dir: Dir,
+        add: u8,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -95,6 +102,8 @@ pub struct TickDelta {
     pub designations_added: Vec<(TilePos, DesignationKind)>,
     pub designations_removed: Vec<TilePos>,
     pub resources: Resources,
+    /// Changed order counts per workshop; `0` = order gone.
+    pub orders: Vec<(TilePos, u8)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

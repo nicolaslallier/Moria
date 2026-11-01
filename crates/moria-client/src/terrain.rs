@@ -62,15 +62,19 @@ fn pixels(tile: Tile, on_grass: bool) -> Vec<u8> {
                 [65, 73, 83]
             };
             let mut rgb = base.map(|c| (c + shade).clamp(0, 255) as u8);
-            if matches!(tile, Tile::Gold | Tile::Mithril) {
+            if matches!(
+                tile,
+                Tile::Gold | Tile::Mithril | Tile::IronOre | Tile::Coal
+            ) {
                 let vein = 44 + ((y as f32 * 0.11).sin() * 14.0) as i32;
                 let branch = 22 + y / 2;
                 let distance = (x - vein).abs().min((x - branch).abs());
                 if distance < 4 && (x + y * 3) % 17 < 14 {
-                    let ore = if tile == Tile::Gold {
-                        [213, 158, 54]
-                    } else {
-                        [102, 194, 219]
+                    let ore = match tile {
+                        Tile::Gold => [213, 158, 54],
+                        Tile::IronOre => [168, 112, 90],
+                        Tile::Coal => [28, 28, 32],
+                        _ => [102, 194, 219],
                     };
                     let glint = if distance < 2 { 30 } else { -28 };
                     rgb = ore.map(|c| (c + noise + glint).clamp(0, 255) as u8);
@@ -159,6 +163,40 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
             (16, 24, 80, 66, top),
             (40, 36, 56, 52, [190, 150, 70]), // tankard
         ],
+        Tile::Forge => &[
+            (10, 14, 86, 82, [104, 98, 88]), // stone body
+            (16, 20, 80, 76, [128, 120, 106]),
+            (28, 34, 68, 68, [28, 24, 22]), // mouth
+            (32, 44, 64, 66, [214, 82, 24]),
+            (40, 50, 56, 64, [255, 170, 48]),
+        ],
+        Tile::Anvil => &[
+            (30, 52, 66, 84, [96, 60, 32]), // stump
+            (14, 22, 82, 54, [40, 40, 46]), // iron block
+            (20, 26, 76, 40, [72, 72, 82]), // face
+            (62, 30, 90, 40, [40, 40, 46]), // horn
+        ],
+        Tile::WoodDoor | Tile::WoodDoorLocked => &[
+            (12, 8, 84, 88, [96, 60, 32]),
+            (16, 12, 44, 84, [156, 104, 58]), // planks
+            (48, 12, 80, 84, [146, 96, 52]),
+            (68, 44, 76, 52, [210, 190, 90]), // handle
+        ],
+        Tile::StoneDoor | Tile::StoneDoorLocked => &[
+            (12, 8, 84, 88, [88, 84, 78]),
+            (16, 12, 80, 84, [146, 142, 134]), // slab
+            (22, 20, 74, 76, [132, 128, 120]),
+            (68, 44, 76, 52, [60, 58, 54]), // ring
+        ],
+        Tile::IronDoor | Tile::IronDoorLocked => &[
+            (12, 8, 84, 88, [30, 30, 36]),
+            (16, 12, 80, 84, [76, 78, 90]),    // plate
+            (22, 18, 28, 24, [150, 152, 164]), // rivets
+            (68, 18, 74, 24, [150, 152, 164]),
+            (22, 72, 28, 78, [150, 152, 164]),
+            (68, 72, 74, 78, [150, 152, 164]),
+            (68, 44, 76, 52, [150, 152, 164]),
+        ],
         Tile::Chair | Tile::WoodChair => &[
             (28, 22, 68, 72, dark),
             (32, 34, 64, 68, top), // seat; the dark strip above is the back
@@ -200,9 +238,17 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
         ],
         _ => &[],
     };
-    boxes
-        .iter()
-        .rev()
+    let bar: &[(i32, i32, i32, i32, [i32; 3])] = &[(8, 40, 88, 54, [24, 22, 22])];
+    let bar = if matches!(
+        tile,
+        Tile::WoodDoorLocked | Tile::StoneDoorLocked | Tile::IronDoorLocked
+    ) {
+        bar
+    } else {
+        &[]
+    };
+    bar.iter()
+        .chain(boxes.iter().rev())
         .find(|&&(x0, y0, x1, y1, _)| (x0..x1).contains(&x) && (y0..y1).contains(&y))
         .map(|b| b.4)
 }
@@ -266,6 +312,16 @@ mod tests {
             Tile::WoodBed,
             Tile::WoodTable,
             Tile::WoodChair,
+            Tile::IronOre,
+            Tile::Coal,
+            Tile::Forge,
+            Tile::Anvil,
+            Tile::WoodDoor,
+            Tile::StoneDoor,
+            Tile::IronDoor,
+            Tile::WoodDoorLocked,
+            Tile::StoneDoorLocked,
+            Tile::IronDoorLocked,
         ];
         for t in new {
             let data = pixels(t, false);
@@ -292,6 +348,17 @@ mod tests {
             (Tile::WoodChair, Tile::Chair),
         ] {
             assert!(warmth(wood) > warmth(stone) + 96 * 96 * 10, "{wood:?}");
+        }
+    }
+
+    #[test]
+    fn a_locked_door_has_a_bar_across() {
+        for (open, locked) in [
+            (Tile::WoodDoor, Tile::WoodDoorLocked),
+            (Tile::StoneDoor, Tile::StoneDoorLocked),
+            (Tile::IronDoor, Tile::IronDoorLocked),
+        ] {
+            assert_ne!(pixels(open, false), pixels(locked, false), "{open:?}");
         }
     }
 

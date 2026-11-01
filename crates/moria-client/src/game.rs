@@ -10,7 +10,7 @@ use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
-use moria_core::{DesignationKind, Dir, Mountain, Resources, TilePos};
+use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -95,14 +95,47 @@ pub fn level_label(z: u8) -> String {
     }
 }
 
+/// Each resource with its French name.
+fn named(r: Resources) -> [(u32, &'static str); 7] {
+    [
+        (r.stone, "pierre"),
+        (r.wood, "bois"),
+        (r.gold, "or"),
+        (r.iron_ore, "minerai de fer"),
+        (r.coal, "charbon"),
+        (r.iron, "lingots"),
+        (r.iron_door, "porte en fer forgée"),
+    ]
+}
+
 /// "1 pierre", "3 bois".
 fn cost_fr(r: Resources) -> String {
-    [(r.stone, "pierre"), (r.wood, "bois"), (r.gold, "or")]
+    named(r)
         .iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, what)| format!("{n} {what}"))
         .collect::<Vec<_>>()
         .join(" + ")
+}
+
+/// Workshop stock line: how much of each input of `k` is spare, "En réserve : 1 lingots".
+pub fn stock_text(k: DesignationKind, spare: Resources) -> String {
+    let have = named(spare)
+        .iter()
+        .zip(named(k.cost()))
+        .filter(|(_, (cost, _))| *cost > 0)
+        .map(|((n, what), _)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("En réserve : {have}")
+}
+
+/// A workshop's name, from the build menu.
+pub fn workshop_label(t: Tile) -> &'static str {
+    BUILDS
+        .iter()
+        .find(|b| b.0.builds() == Some(t))
+        .map_or("?", |b| b.1)
 }
 
 /// Build-menu row: "Lit en bois (3 bois)".
@@ -135,8 +168,10 @@ pub fn job_label(job: Option<DwarfJob>) -> String {
         Dig => "Creuse".into(),
         Stairs => "Taille un escalier".into(),
         Chop => "Coupe du bois".into(),
+        Smelt => "Fond du fer".into(),
+        Smith => "Forge une porte".into(),
         Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair | Candle | Torch | Lamp
-        | Campfire | Hearth | Stove => {
+        | Campfire | Hearth | Stove | Forge | Anvil | WoodDoor | StoneDoor | IronDoor => {
             let label = BUILDS.iter().find(|b| b.0 == kind).map_or("?", |b| b.1);
             format!("Construit : {label}")
         }
@@ -183,6 +218,10 @@ pub struct Game {
     pub build_menu: bool,
     /// Highlighted row of the build menu, for keyboard and gamepad.
     pub build_sel: usize,
+    /// Workshop order menu, open toward this direction.
+    pub order_menu: Option<Dir>,
+    /// Highlighted row of the order menu.
+    pub order_sel: usize,
     /// `Some` while the player browses another level than the hero's.
     pub browse_z: Option<u8>,
     last_move: f64,
@@ -208,7 +247,24 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
     (DesignationKind::Campfire, "Feu de bois"),
     (DesignationKind::Hearth, "Foyer"),
     (DesignationKind::Stove, "Poêle"),
+    (DesignationKind::Forge, "Forge"),
+    (DesignationKind::Anvil, "Enclume"),
+    (DesignationKind::WoodDoor, "Porte en bois"),
+    (DesignationKind::StoneDoor, "Porte en pierre"),
+    (DesignationKind::IronDoor, "Porte en fer"),
 ];
+
+/// Order-menu rows: label and quantity to add (0 cancels the order).
+pub const ORDER_ROWS: [(&str, u8); 3] = [("+1", 1), ("+5", 5), ("Annuler la commande", 0)];
+
+/// What a workshop makes.
+pub fn recipe_label(k: DesignationKind) -> &'static str {
+    match k {
+        DesignationKind::Smelt => "Lingot de fer",
+        DesignationKind::Smith => "Porte en fer",
+        _ => "?",
+    }
+}
 
 /// Bottom-bar buttons with their key; `None` is the build menu.
 pub const ACTIONS: &[(&str, Option<DesignationKind>)] = &[
@@ -229,6 +285,7 @@ impl Game {
             None => {
                 self.build_menu = !self.build_menu;
                 self.build_sel = 0;
+                self.order_menu = None;
             }
         }
     }
@@ -275,11 +332,22 @@ impl Game {
             mode: DesignationKind::Dig,
             build_menu: false,
             build_sel: 0,
+            order_menu: None,
+            order_sel: 0,
             browse_z: None,
             last_move: f64::NEG_INFINITY,
             pending: VecDeque::new(),
             ticks: 0,
         }
+    }
+
+    /// Resources not promised to the dwarves' current jobs, as the server counts them.
+    pub fn spare(&self) -> Resources {
+        let mut r = self.resources;
+        for job in self.dwarves.iter().filter_map(|d| d.2) {
+            r.take(&job.kind.cost());
+        }
+        r
     }
 
     /// Status-page row per dwarf: name, level, activity.
@@ -331,6 +399,15 @@ impl Game {
                 self.mountain.designations.remove(p);
             }
         }
+        for &(p, n) in &d.orders {
+            if self.mountain.in_bounds(p) {
+                if n == 0 {
+                    self.mountain.orders.remove(&p);
+                } else {
+                    self.mountain.orders.insert(p, n);
+                }
+            }
+        }
         for &(p, k) in &d.designations_added {
             if self.mountain.in_bounds(p) {
                 self.mountain.designations.insert(p, k);
@@ -375,7 +452,7 @@ impl Game {
         if now - self.last_move < MOVE_COOLDOWN {
             return None;
         }
-        let to = self.mountain.move_dest(self.hero.pos, dir)?;
+        let to = self.mountain.hero_move_dest(self.hero.pos, dir)?;
         self.last_move = now;
         // Stairs or a slope: the view follows the hero to its new level.
         if to.z != self.hero.pos.z {
@@ -399,6 +476,29 @@ impl Game {
         };
         self.browse_z = (z != self.hero.pos.z).then_some(z);
         None
+    }
+
+    /// Hero "use" toward the last move direction: opens a workshop's order menu, or
+    /// toggles a door's lock.
+    pub fn use_(&mut self) -> Option<ClientMsg> {
+        let t = self.mountain.get(self.hero.pos.step(self.last_dir))?;
+        if t.recipe().is_some() {
+            self.order_menu = Some(self.last_dir);
+            self.order_sel = 0;
+            None
+        } else {
+            t.is_door().then_some(ClientMsg::Use(self.last_dir))
+        }
+    }
+
+    /// Picks order row `i`; only the cancel row closes the menu.
+    pub fn pick_order(&mut self, i: usize) -> Option<ClientMsg> {
+        let dir = self.order_menu?;
+        let &(_, add) = ORDER_ROWS.get(i)?;
+        if add == 0 {
+            self.order_menu = None;
+        }
+        Some(ClientMsg::Order { dir, add })
     }
 
     /// Hero action toward the last move direction: in a build mode build on floor or grass
@@ -588,6 +688,7 @@ pub(crate) mod tests {
             designations_added: vec![],
             designations_removed: vec![],
             resources: Resources::default(),
+            orders: vec![],
         }
     }
 
@@ -1179,6 +1280,11 @@ pub(crate) mod tests {
                 "Feu de bois (3 bois)",
                 "Foyer (4 pierre)",
                 "Poêle (3 pierre + 2 bois)",
+                "Forge (6 pierre)",
+                "Enclume (3 lingots)",
+                "Porte en bois (3 bois)",
+                "Porte en pierre (3 pierre)",
+                "Porte en fer (1 porte en fer forgée)",
             ]
         );
         assert_eq!(
@@ -1242,5 +1348,72 @@ pub(crate) mod tests {
         s.game.as_mut().unwrap().explored.mark(p(2, 1, 0));
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert!(s.game.unwrap().explored.seen(p(2, 1, 0)));
+    }
+
+    #[test]
+    fn opening_the_build_menu_closes_the_order_menu() {
+        let mut g = game();
+        g.order_menu = Some(Dir::E);
+        g.pick_action(None);
+        assert!(g.build_menu);
+        assert_eq!(g.order_menu, None);
+    }
+
+    #[test]
+    fn use_opens_the_forge_menu_and_toggles_doors() {
+        let mut g = game();
+        g.last_dir = Dir::E;
+        let e = g.hero.pos.step(Dir::E);
+        g.mountain.set(e, Tile::Forge);
+        assert_eq!(g.use_(), None);
+        assert_eq!(g.order_menu, Some(Dir::E));
+        assert_eq!(
+            g.pick_order(1),
+            Some(ClientMsg::Order {
+                dir: Dir::E,
+                add: 5
+            })
+        );
+        assert_eq!(g.order_menu, Some(Dir::E));
+        assert_eq!(
+            g.pick_order(2),
+            Some(ClientMsg::Order {
+                dir: Dir::E,
+                add: 0
+            })
+        );
+        assert_eq!(g.order_menu, None);
+        g.mountain.set(e, Tile::WoodDoorLocked);
+        assert_eq!(g.use_(), Some(ClientMsg::Use(Dir::E)));
+    }
+
+    #[test]
+    fn ticks_carry_orders_and_the_hero_crosses_locked_doors() {
+        let mut g = game();
+        let e = p(3, 1, 0);
+        let mut d = tick(g.hero.pos);
+        d.orders = vec![(e, 4)];
+        g.apply_tick(&d);
+        assert_eq!(g.mountain.orders.get(&e), Some(&4));
+        d.orders = vec![(e, 0)];
+        g.apply_tick(&d);
+        assert!(g.mountain.orders.is_empty());
+        g.mountain.set(e, Tile::WoodDoorLocked);
+        assert!(g.try_move(Dir::E, 10.0).is_some());
+        assert_eq!(g.hero.pos, e);
+    }
+
+    #[test]
+    fn new_builds_are_in_the_menu() {
+        for (k, l) in [
+            (DesignationKind::Forge, "Forge"),
+            (DesignationKind::IronDoor, "Porte en fer"),
+        ] {
+            assert!(BUILDS.contains(&(k, l)));
+        }
+        assert_eq!(
+            build_text(DesignationKind::Anvil, "Enclume"),
+            "Enclume (3 lingots)"
+        );
     }
 }

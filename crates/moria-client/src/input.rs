@@ -1,12 +1,13 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Screen, drag_msg};
+use crate::game::{Game, ORDER_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::input::EguiWantsInput;
+use moria_core::protocol::ClientMsg;
 use moria_core::{DesignationKind, Dir};
 
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
@@ -48,6 +49,7 @@ struct Intent {
     build_menu: bool,
     close_menu: bool,
     status: bool,
+    use_: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -74,6 +76,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         build_menu: keys.just_pressed(KeyCode::Digit3),
         close_menu: keys.just_pressed(KeyCode::Escape),
         status: keys.just_pressed(KeyCode::KeyC),
+        use_: keys.just_pressed(KeyCode::KeyF),
     }
 }
 
@@ -136,8 +139,57 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         build_menu: any(GamepadButton::West),
         close_menu: any(GamepadButton::East),
         status: any(GamepadButton::Select),
+        use_: any(GamepadButton::RightTrigger2),
         ..default()
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum OrderNav {
+    Step(bool),
+    Close,
+    Keep,
+}
+
+/// Order menu navigation: only a new direction press acts (N/S step, E/W close).
+fn order_nav(prev: Option<Dir>, walk: Option<Dir>) -> OrderNav {
+    match walk {
+        Some(d) if walk != prev => match d {
+            Dir::N | Dir::S => OrderNav::Step(d == Dir::S),
+            Dir::E | Dir::W => OrderNav::Close,
+            _ => OrderNav::Keep,
+        },
+        _ => OrderNav::Keep,
+    }
+}
+
+/// The order menu's share of a frame: `Some(messages)` when the menu consumed it.
+fn order_frame(
+    g: &mut Game,
+    menu_dir: &mut Option<Dir>,
+    walk: Option<Dir>,
+    dig: bool,
+) -> Option<Vec<ClientMsg>> {
+    g.order_menu?;
+    let nav = order_nav(*menu_dir, walk);
+    *menu_dir = walk;
+    match nav {
+        OrderNav::Step(down) => {
+            let n = ORDER_ROWS.len();
+            g.order_sel = (g.order_sel + if down { 1 } else { n - 1 }) % n;
+        }
+        // Closing consumes the press: it does not also walk the hero.
+        OrderNav::Close => {
+            g.order_menu = None;
+            return Some(vec![]);
+        }
+        OrderNav::Keep => {}
+    }
+    Some(if dig {
+        g.pick_order(g.order_sel).into_iter().collect()
+    } else {
+        vec![]
+    })
 }
 
 fn play(
@@ -167,6 +219,7 @@ fn play(
         g.pick_action(None);
     } else if k.close_menu || p.close_menu {
         g.build_menu = false;
+        g.order_menu = None;
         g.status = false;
     }
     if k.status || p.status {
@@ -188,8 +241,25 @@ fn play(
         }
         return;
     }
-    *menu_dir = None;
+    if let Some(out) = order_frame(g, menu_dir, walk, k.dig || p.dig) {
+        for m in out {
+            client.send(m);
+        }
+        return;
+    }
     let mut out = vec![];
+    *menu_dir = None;
+    if k.use_ || p.use_ {
+        out.extend(g.use_());
+        if g.order_menu.is_some() {
+            // Just opened: the held direction is not a new press; do nothing else.
+            *menu_dir = walk;
+            for m in out {
+                client.send(m);
+            }
+            return;
+        }
+    }
     if let Some(d) = walk {
         out.extend(g.try_move(d, now));
     }
@@ -261,6 +331,42 @@ mod tests {
         keys.press(KeyCode::Digit4);
         let i = keyboard_intent(&keys, &ButtonInput::default());
         assert_eq!(i.mode, Some(DesignationKind::Chop));
+    }
+
+    #[test]
+    fn key_f_is_use() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyF);
+        assert!(keyboard_intent(&keys, &ButtonInput::default()).use_);
+    }
+
+    #[test]
+    fn order_menu_closes_only_on_a_new_sideways_press() {
+        // Held toward the workshop (the press that opened it): stays open.
+        assert_eq!(order_nav(Some(Dir::E), Some(Dir::E)), OrderNav::Keep);
+        assert_eq!(order_nav(Some(Dir::W), Some(Dir::W)), OrderNav::Keep);
+        // A fresh press closes it, even straight from another held direction.
+        assert_eq!(order_nav(None, Some(Dir::W)), OrderNav::Close);
+        assert_eq!(order_nav(Some(Dir::N), Some(Dir::E)), OrderNav::Close);
+        // N/S step only on a new press.
+        assert_eq!(order_nav(None, Some(Dir::S)), OrderNav::Step(true));
+        assert_eq!(order_nav(Some(Dir::S), Some(Dir::S)), OrderNav::Keep);
+        assert_eq!(order_nav(None, Some(Dir::N)), OrderNav::Step(false));
+        assert_eq!(order_nav(Some(Dir::E), None), OrderNav::Keep);
+    }
+
+    #[test]
+    fn closing_the_order_menu_consumes_the_press() {
+        let mut g = crate::game::tests::game();
+        g.order_menu = Some(Dir::E);
+        let mut menu_dir = None;
+        // A new E press closes the menu; the frame must not also walk the hero.
+        assert_eq!(
+            order_frame(&mut g, &mut menu_dir, Some(Dir::E), false),
+            Some(vec![])
+        );
+        assert_eq!(g.order_menu, None);
+        assert_eq!(menu_dir, Some(Dir::E));
     }
 
     #[test]

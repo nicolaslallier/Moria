@@ -137,6 +137,9 @@ pub async fn run_with_listener(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    if let Some(bak) = world::reset_if_outdated(&cfg.data, 0)? {
+        tracing::warn!("ancien monde mis de côté : {}", bak.display());
+    }
     let w = match world::load(&cfg.data) {
         Ok(w) => w,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
@@ -583,10 +586,14 @@ mod tests {
         }
         tx.try_send((PlayerId(1), designate(6, 23))).unwrap();
         let ch = s.commands();
-        assert_eq!(ch[&MountainId(1)].0.len(), 1, "player 1 served this tick");
-        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+        assert_eq!(
+            ch[&MountainId(1)].designations.len(),
+            1,
+            "player 1 served this tick"
+        );
+        assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
-        assert_eq!(ch[&MountainId(0)].0.len(), MAX_CMDS_PER_PLAYER);
+        assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
     }
 }

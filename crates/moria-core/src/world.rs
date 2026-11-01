@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 2;
+pub const SAVE_VERSION: u32 = 3;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -260,7 +260,7 @@ fn vein(m: &mut Mountain, rng: &mut ChaCha8Rng, xs: std::ops::Range<i16>, z: u8,
     }
 }
 
-pub fn generate(seed: u64) -> World {
+fn generate_base(seed: u64) -> World {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut w = World {
         seed,
@@ -282,6 +282,81 @@ pub fn generate(seed: u64) -> World {
         w.mountains.insert(id, gen_mountain(id, &mut rng));
     }
     w
+}
+
+pub fn generate(seed: u64) -> World {
+    let mut w = generate_base(seed);
+    add_iron_and_coal(&mut w);
+    w
+}
+
+/// Iron and coal veins, from their own RNG so the base generation stays untouched.
+fn add_iron_and_coal(w: &mut World) {
+    let mut rng = ChaCha8Rng::seed_from_u64(w.seed ^ 0x1f0e_c0a1);
+    let foot = ENTRANCE_X.start;
+    for m in w.mountains.values_mut() {
+        for z in GROUND_Z..MOUNTAIN_D {
+            for _ in 0..8 {
+                vein(m, &mut rng, foot..MOUNTAIN_W, z, Tile::IronOre);
+            }
+            for _ in 0..10 {
+                vein(m, &mut rng, foot..MOUNTAIN_W, z, Tile::Coal);
+            }
+            if z > GROUND_Z + 2 {
+                for _ in 0..4 {
+                    vein(m, &mut rng, 0..foot, z, Tile::IronOre);
+                }
+                for _ in 0..5 {
+                    vein(m, &mut rng, 0..foot, z, Tile::Coal);
+                }
+            }
+        }
+    }
+}
+
+/// The version header of a save file; `None` if the file does not exist.
+/// `Some(0)` means no readable version (file shorter than 4 bytes); `SAVE_VERSION` is never 0.
+pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
+    use std::io::Read;
+    let mut b = [0u8; 4];
+    match std::fs::File::open(path) {
+        Ok(mut f) => match f.read_exact(&mut b) {
+            Ok(()) => Ok(Some(u32::from_le_bytes(b))),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Some(0)),
+            Err(e) => Err(e),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Sets an outdated save aside as `<path>.v<n>.bak` and writes a fresh world; returns the backup path.
+/// `None` if the file is missing or already current. A newer save is an error: never wiped.
+/// The fresh world keeps the old one's seed (the body starts with `World.seed`), else `fallback_seed`.
+pub fn reset_if_outdated(path: &Path, fallback_seed: u64) -> io::Result<Option<PathBuf>> {
+    match save_version(path)? {
+        None => Ok(None),
+        Some(v) if v == SAVE_VERSION => Ok(None),
+        Some(v) if v > SAVE_VERSION => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "monde v{v} plus récent que ce programme (v{SAVE_VERSION}) : refus de l'écraser"
+            ),
+        )),
+        Some(v) => {
+            let mut bak = path.as_os_str().to_owned();
+            bak.push(format!(".v{v}.bak"));
+            let bak = PathBuf::from(bak);
+            let bytes = std::fs::read(path)?;
+            let seed = bytes
+                .get(4..)
+                .and_then(|body| postcard::take_from_bytes::<u64>(body).ok())
+                .map_or(fallback_seed, |(s, _)| s);
+            std::fs::rename(path, &bak)?;
+            save(&generate(seed), path)?;
+            Ok(Some(bak))
+        }
+    }
 }
 
 pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
@@ -383,6 +458,77 @@ mod tests {
         let d = std::env::temp_dir().join(format!("moria-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn iron_and_coal_veins_only_replace_rock() {
+        let (base, w) = (generate_base(1), generate(1));
+        for (id, m) in &w.mountains {
+            let mut n = (0, 0);
+            for ((p, t), (_, b)) in tiles(m).zip(tiles(&base.mountains[id])) {
+                match t {
+                    Tile::IronOre => n.0 += 1,
+                    Tile::Coal => n.1 += 1,
+                    _ => assert_eq!(t, b, "{p:?}"),
+                }
+                if matches!(t, Tile::IronOre | Tile::Coal) {
+                    assert_eq!(b, Tile::Rock, "{p:?}");
+                    assert!(p.x >= ENTRANCE_X.start || p.z > GROUND_Z + 2, "{p:?}");
+                }
+            }
+            assert!(n.0 > 0 && n.1 > 0, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn save_version_reads_the_header() {
+        let p = tmpdir("save-version").join("w.bin");
+        assert_eq!(save_version(&p).unwrap(), None);
+        std::fs::write(&p, 2u32.to_le_bytes()).unwrap();
+        assert_eq!(save_version(&p).unwrap(), Some(2));
+        std::fs::write(&p, [2u8, 0]).unwrap();
+        assert_eq!(save_version(&p).unwrap(), Some(0));
+        std::fs::write(&p, []).unwrap();
+        assert_eq!(save_version(&p).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn reset_if_outdated_sets_old_worlds_aside() {
+        let d = tmpdir("reset");
+        let p = d.join("w.bin");
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        std::fs::write(&p, 2u32.to_le_bytes()).unwrap();
+        let bak = reset_if_outdated(&p, 0).unwrap().unwrap();
+        assert_eq!(bak, d.join("w.bin.v2.bak"));
+        assert!(bak.exists());
+        assert_eq!(save_version(&p).unwrap(), Some(SAVE_VERSION));
+        load(&p).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        std::fs::write(&p, [1u8]).unwrap();
+        assert_eq!(
+            reset_if_outdated(&p, 0).unwrap().unwrap(),
+            d.join("w.bin.v0.bak")
+        );
+        let newer = (SAVE_VERSION + 1).to_le_bytes();
+        std::fs::write(&p, newer).unwrap();
+        let e = reset_if_outdated(&p, 0).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&p).unwrap(), newer);
+    }
+
+    #[test]
+    fn reset_keeps_the_old_worlds_seed() {
+        let d = tmpdir("reset-seed");
+        let p = d.join("w.bin");
+        let mut old = 2u32.to_le_bytes().to_vec();
+        old.extend(postcard::to_allocvec(&42u64).unwrap());
+        std::fs::write(&p, old).unwrap();
+        reset_if_outdated(&p, 0).unwrap().unwrap();
+        let w = load(&p).unwrap();
+        assert_eq!(w.seed, 42);
+        assert_eq!(encode(&w), encode(&generate(42)));
     }
 
     #[test]
@@ -601,12 +747,12 @@ mod tests {
         save(&generate(3), &p).unwrap();
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(bytes[..4], SAVE_VERSION.to_le_bytes());
-        let mut other = 3u32.to_le_bytes().to_vec();
+        let mut other = 2u32.to_le_bytes().to_vec();
         other.extend(&bytes[4..]);
         std::fs::write(&p, other).unwrap();
         let e = load(&p).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(e.to_string(), "format de sauvegarde v3 non supporté");
+        assert_eq!(e.to_string(), "format de sauvegarde v2 non supporté");
         std::fs::write(&p, [1u8, 0]).unwrap(); // too short for a version
         assert!(load(&p).is_err());
     }
