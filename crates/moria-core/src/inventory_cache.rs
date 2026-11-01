@@ -147,6 +147,25 @@ mod tests {
     }
 
     #[test]
+    fn view_ignores_other_mountains() {
+        let other = MountainId(1);
+        let mut c = Cache::new("srv", 1);
+        c.push(M, res(2), res(0), false);
+        c.push(other, res(4), res(0), false);
+        let mut st = state(10, None);
+        st.totals.insert(other, res(100));
+        assert_eq!(c.view(&st, M).stone, 12);
+        assert_eq!(c.view(&st, other).stone, 104);
+    }
+
+    #[test]
+    fn view_applies_add_before_take() {
+        let mut c = Cache::new("srv", 1);
+        c.push(M, res(5), res(3), false);
+        assert_eq!(c.view(&State::default(), M).stone, 2);
+    }
+
+    #[test]
     fn view_clamps_at_zero() {
         let mut c = Cache::new("srv", 1);
         c.push(M, res(0), res(9), false);
