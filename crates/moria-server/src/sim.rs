@@ -94,7 +94,7 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         }
         Command::Dig(d) | Command::Build(d, _) => {
             let kind = hero_kind(&c);
-            if kind == DesignationKind::Dig || hero_stone(f) > 0 {
+            if hero_spare(f).covers(&kind.cost()) {
                 start_dig(f.hero.as_mut().unwrap(), mt, d, kind);
             }
         }
@@ -129,33 +129,45 @@ fn hero_kind(c: &Command) -> DesignationKind {
     }
 }
 
-fn dwarf_walls(f: &Fortress) -> u32 {
-    let n = f
-        .dwarves
-        .iter()
-        .filter(|d| d.task.as_ref().is_some_and(|t| t.kind.builds().is_some()));
-    n.count() as u32
+/// Resources not yet promised to a build in progress (by dwarves or the hero).
+pub fn spare(f: &Fortress) -> Resources {
+    let mut r = hero_spare(f);
+    if let Some(j) = f.hero.as_ref().and_then(|h| h.dig.as_ref()) {
+        r.take(&j.kind.cost());
+    }
+    r
 }
 
-/// Stone not yet promised to a wall under construction (by dwarves or the hero).
-pub fn spare_stone(f: &Fortress) -> u32 {
-    let hero = f.hero.as_ref().and_then(|h| h.dig.as_ref());
-    let hero = hero.is_some_and(|j| j.kind.builds().is_some()) as u32;
-    hero_stone(f).saturating_sub(hero)
+/// Resources the hero may build with: its own current build doesn't count, since a new
+/// one replaces it.
+fn hero_spare(f: &Fortress) -> Resources {
+    let mut r = f.resources;
+    for t in f.dwarves.iter().filter_map(|d| d.task.as_ref()) {
+        r.take(&t.kind.cost());
+    }
+    r
 }
 
-/// Stone the hero may build with: its own current build doesn't count, since a new one
-/// replaces it.
-fn hero_stone(f: &Fortress) -> u32 {
-    f.resources.stone.saturating_sub(dwarf_walls(f))
+/// The mountain as the dwarf AI sees it: builds the spare resources can't pay are hidden.
+pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
+    let spare = spare(f);
+    let mut m = mt.clone();
+    // ponytail: per-designation check; with spare wood for one table the AI may still pick
+    // several (the server keeps one). Send the spare in AiView if that ever matters.
+    m.designations.retain(|_, k| spare.covers(&k.cost()));
+    m
 }
 
-/// Starts digging (`Dig`) or building (`Wall`) the tile toward `d`.
+/// Starts digging (`Dig`, a tree is chopped) or building the tile toward `d`.
 fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
     if matches!(d, Dir::Up | Dir::Down) {
         return;
     }
     let t = h.pos.step(d);
+    let kind = match kind {
+        DesignationKind::Dig if mt.get(t) == Some(Tile::Tree) => DesignationKind::Chop,
+        k => k,
+    };
     if mt.diggable(t, kind)
         && h.dig
             .as_ref()
@@ -229,8 +241,7 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
         let under_occupant = kind != DesignationKind::Dig
             && (f.hero.as_ref().is_some_and(|h| h.pos == target)
                 || f.dwarves.iter().any(|d| d.pos == target));
-        let no_stone = kind.builds().is_some() && spare_stone(f) == 0;
-        if taken || under_occupant || no_stone {
+        if taken || under_occupant || !spare(f).covers(&kind.cost()) {
             continue;
         }
         let Some(d) = f
@@ -293,7 +304,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         // Designation changes of this step; the last write on a tile wins.
         let (mut tiles, mut ch) = (vec![], Changes::default());
 
-        let hero_stone = hero_stone(f);
+        let hero_spare = hero_spare(f);
         if let Some(h) = f.hero.as_mut() {
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
             // A Move that arrived during the cooldown (network jitter) is not lost.
@@ -302,16 +313,17 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             {
                 hero_move(h, m, d);
                 if let Some((dd, kind)) = h.pending_dig.take()
-                    && (kind == DesignationKind::Dig || hero_stone > 0)
+                    && hero_spare.covers(&kind.cost())
                 {
                     start_dig(h, m, dd, kind);
                 }
             }
             if let Some(j) = h.dig.as_mut() {
                 let wall = j.kind.builds().is_some();
-                // A dwarf standing on the target, or no stone, pauses a build.
-                let blocked =
-                    wall && (f.resources.stone == 0 || f.dwarves.iter().any(|d| d.pos == j.target));
+                // A dwarf standing on the target, or an unpaid cost, pauses a build.
+                let blocked = wall
+                    && (!f.resources.covers(&j.kind.cost())
+                        || f.dwarves.iter().any(|d| d.pos == j.target));
                 match m.get(j.target).filter(|_| m.diggable(j.target, j.kind)) {
                     None => h.dig = None,
                     Some(_) if blocked => {}
@@ -328,9 +340,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                             let was = m.designations.get(&target).copied();
                             if let Some(r) = dig_at(m, target, kind, &mut tiles, &mut ch) {
                                 f.resources.add(r);
-                                if wall {
-                                    f.resources.stone -= 1;
-                                }
+                                f.resources.take(&kind.cost());
                                 // Digging a Stairs-designated tile keeps the stairs intent.
                                 if !wall
                                     && was == Some(DesignationKind::Stairs)
@@ -394,25 +404,22 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 task.progress = task.progress.saturating_add(1);
                 let base = m.get(task.target).map_or(0, Tile::dig_ticks);
                 let needed = match task.kind {
-                    DesignationKind::Dig => base,
+                    DesignationKind::Dig | DesignationKind::Chop => base,
                     DesignationKind::Stairs => base.saturating_add(STAIRS_EXTRA_TICKS),
                     _ => WALL_BUILD_TICKS, // builds
                 };
                 if task.progress >= needed {
-                    let wall = task.kind.builds().is_some();
                     let blocked = task.kind != DesignationKind::Dig
                         && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
                             || f.dwarves.iter().any(|d| d.pos == task.target))
-                        || (wall && f.resources.stone == 0);
+                        || !f.resources.covers(&task.kind.cost());
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked
                         && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
-                        if wall {
-                            f.resources.stone -= 1;
-                        }
+                        f.resources.take(&task.kind.cost());
                     }
                     continue;
                 }
@@ -452,7 +459,7 @@ mod tests {
         TilePos::new(e.x + x, e.y + y, e.z + z)
     }
 
-    /// One claimed mountain with a hero at p(2, 1, 0) and an all-Floor surface strip.
+    /// One claimed mountain with a hero at p(2, 1, 0), in the entrance room.
     fn setup() -> World {
         let mut w = generate(1);
         claim_mountain(&mut w, PlayerId(1)).unwrap();
@@ -599,7 +606,7 @@ mod tests {
     fn strong_hero_digs_rock_in_7_ticks() {
         let mut w = setup();
         set_str(&mut w, 17);
-        // (6,23,0) is rock east of the entrance strip.
+        // p(6, 1, 0) is rock east of the entrance room.
         w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = p(5, 1, 0);
         let t = p(6, 1, 0);
         assert_eq!(tile(&w, t), Tile::Rock);
@@ -829,7 +836,7 @@ mod tests {
         assert!(w.fortresses[&M].dwarves[0].task.is_none());
         w.fortresses.get_mut(&M).unwrap().resources.stone = 1;
         assign(&mut w);
-        assert_eq!(spare_stone(&w.fortresses[&M]), 0, "the stone is reserved");
+        assert_eq!(spare(&w.fortresses[&M]).stone, 0, "the stone is reserved");
         // One stone, one wall: a second wall is not handed out on the same stone.
         let t2 = p(5, 0, 0);
         designate(&mut w, t2, DesignationKind::Wall);
@@ -1123,6 +1130,229 @@ mod tests {
         assert_eq!(w, before);
     }
 
+    fn assign(w: &mut World, i: usize, t: TilePos) {
+        let id = w.fortresses[&M].dwarves[i].id;
+        apply_assignments(
+            w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(id, t)],
+            },
+        );
+    }
+    fn res(w: &mut World) -> &mut Resources {
+        &mut w.fortresses.get_mut(&M).unwrap().resources
+    }
+    fn wood(n: u32) -> Resources {
+        Resources {
+            wood: n,
+            ..Default::default()
+        }
+    }
+    fn in_view(w: &World, t: TilePos) -> bool {
+        view_mountain(&w.mountains[&M], &w.fortresses[&M])
+            .designations
+            .contains_key(&t)
+    }
+
+    #[test]
+    fn dwarf_chops_designated_tree() {
+        let mut w = setup();
+        let t = p(4, 0, 0);
+        w.mountains.get_mut(&M).unwrap().set(t, Tile::Tree);
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = p(3, 0, 0);
+        designate(&mut w, t, DesignationKind::Chop);
+        assert_eq!(
+            w.mountains[&M].designations.get(&t),
+            Some(&DesignationKind::Chop)
+        );
+        assign(&mut w, 0, t);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+        // Already at a work spot: one tick of work per step, 20 for a tree.
+        for _ in 0..19 {
+            step(&mut w);
+            assert_eq!(tile(&w, t), Tile::Tree);
+        }
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(tile(&w, t), Tile::Grass);
+        assert_eq!(w.fortresses[&M].resources, wood(3));
+        assert!(!w.mountains[&M].designations.contains_key(&t));
+        assert_eq!(d.tiles, vec![(t, Tile::Grass)]);
+        assert_eq!(d.designations_removed, vec![t]);
+        assert_eq!(d.resources, wood(3));
+    }
+
+    #[test]
+    fn hero_chops_tree() {
+        let mut w = setup();
+        set_str(&mut w, 10);
+        let t = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(t, Tile::Tree);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert_eq!(
+            hero(&w).dig.as_ref().map(|j| j.kind),
+            Some(DesignationKind::Chop)
+        );
+        let n = hero_dig_ticks(Tile::Tree.dig_ticks(), &hero(&w).abilities);
+        for _ in 1..n {
+            step(&mut w);
+            assert_eq!(tile(&w, t), Tile::Tree);
+        }
+        step(&mut w);
+        assert_eq!(tile(&w, t), Tile::Grass);
+        assert_eq!(w.fortresses[&M].resources, wood(3));
+    }
+
+    #[test]
+    fn wood_build_waits_without_wood() {
+        let mut w = setup();
+        let t = p(4, 2, 0);
+        designate(&mut w, t, DesignationKind::WoodTable);
+        *res(&mut w) = wood(3);
+        assign(&mut w, 0, t);
+        assert!(w.fortresses[&M].dwarves[0].task.is_none());
+        assert!(!in_view(&w, t));
+        *res(&mut w) = wood(4);
+        assert!(in_view(&w, t));
+        assign(&mut w, 0, t);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+        assert_eq!(spare(&w.fortresses[&M]), Resources::default());
+        for _ in 0..80 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, t), Tile::WoodTable);
+        assert_eq!(w.fortresses[&M].resources, Resources::default());
+    }
+
+    #[test]
+    fn costs_are_per_resource() {
+        let mut w = setup();
+        let (wb, sb) = (p(4, 2, 0), p(4, 3, 0));
+        designate(&mut w, wb, DesignationKind::WoodBed);
+        designate(&mut w, sb, DesignationKind::Bed);
+        *res(&mut w) = wood(9);
+        assert!(in_view(&w, wb) && !in_view(&w, sb));
+        assign(&mut w, 0, wb);
+        assign(&mut w, 1, sb);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+        assert!(
+            w.fortresses[&M].dwarves[1].task.is_none(),
+            "stone bed waits"
+        );
+        // The hero can't build stone either, nor take the 3 reserved wood beyond 6.
+        apply_command(&mut w, M, Command::Build(Dir::E, DesignationKind::Bed));
+        assert!(hero(&w).dig.is_none());
+        for _ in 0..80 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, wb), Tile::WoodBed);
+        assert_eq!(tile(&w, sb), Tile::Floor);
+        assert_eq!(w.fortresses[&M].resources, wood(6), "no stone spent");
+        // Stone only: a wood build never takes stone.
+        *res(&mut w) = Resources {
+            stone: 5,
+            ..Default::default()
+        };
+        apply_command(
+            &mut w,
+            M,
+            Command::Build(Dir::E, DesignationKind::WoodChair),
+        );
+        assert!(hero(&w).dig.is_none());
+    }
+
+    #[test]
+    fn hero_builds_wood_chair() {
+        let mut w = setup();
+        let t = p(3, 1, 0);
+        *res(&mut w) = wood(1);
+        apply_command(
+            &mut w,
+            M,
+            Command::Build(Dir::E, DesignationKind::WoodChair),
+        );
+        assert!(hero(&w).dig.is_none());
+        *res(&mut w) = wood(2);
+        apply_command(
+            &mut w,
+            M,
+            Command::Build(Dir::E, DesignationKind::WoodChair),
+        );
+        for _ in 0..60 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, t), Tile::WoodChair);
+        assert_eq!(w.fortresses[&M].resources, Resources::default());
+    }
+
+    #[test]
+    fn dismantle_wood_furniture_returns_wood() {
+        let mut w = setup();
+        let t = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(t, Tile::WoodBed);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        for _ in 0..60 {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, t), Tile::Floor);
+        assert_eq!(w.fortresses[&M].resources, wood(3));
+    }
+
+    /// Security: building costs exactly `cost()` of the right resources and digging the
+    /// piece back returns exactly that, by hero and by dwarf.
+    #[test]
+    fn build_then_dismantle_never_gains() {
+        use DesignationKind as K;
+        let kinds = [
+            K::Wall,
+            K::Bed,
+            K::Table,
+            K::Chair,
+            K::WoodBed,
+            K::WoodTable,
+            K::WoodChair,
+        ];
+        for kind in kinds {
+            let cost = kind.cost();
+            let built = kind.builds().unwrap();
+            // Hero.
+            let mut w = setup();
+            let t = p(3, 1, 0);
+            *res(&mut w) = cost;
+            apply_command(&mut w, M, Command::Build(Dir::E, kind));
+            for _ in 0..60 {
+                step(&mut w);
+            }
+            assert_eq!(tile(&w, t), built, "hero {kind:?}");
+            assert_eq!(w.fortresses[&M].resources, Resources::default(), "{kind:?}");
+            apply_command(&mut w, M, Command::Dig(Dir::E));
+            for _ in 0..60 {
+                step(&mut w);
+            }
+            assert_eq!(tile(&w, t), Tile::Floor, "hero {kind:?}");
+            assert_eq!(w.fortresses[&M].resources, cost, "hero {kind:?}");
+            // Dwarf.
+            let mut w = setup();
+            let t = p(4, 2, 0);
+            *res(&mut w) = cost;
+            designate(&mut w, t, kind);
+            assign(&mut w, 0, t);
+            for _ in 0..80 {
+                step(&mut w);
+            }
+            assert_eq!(tile(&w, t), built, "dwarf {kind:?}");
+            assert_eq!(w.fortresses[&M].resources, Resources::default(), "{kind:?}");
+            designate(&mut w, t, K::Dig);
+            assign(&mut w, 0, t);
+            for _ in 0..80 {
+                step(&mut w);
+            }
+            assert_eq!(tile(&w, t), Tile::Floor, "dwarf {kind:?}");
+            assert_eq!(w.fortresses[&M].resources, cost, "dwarf {kind:?}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn tick_budget_ten_full_fortresses() {
@@ -1156,6 +1386,15 @@ mod tests {
             }
             // Plenty more rock to keep every dwarf busy for the whole run.
             m.designate(p(10, 0, 0), p(47, 47, 0), DesignationKind::Dig);
+            // Outdoors: the forest west of the entrance, stairs on the grass, soil and rock
+            // underneath, and wood furniture paid by the chopping.
+            m.designate(p(-60, -40, 0), p(-1, 40, 0), DesignationKind::Chop);
+            for k in 1..6 {
+                let q = p(-6 * k, 1, 0);
+                m.designate(q, q, DesignationKind::Stairs);
+            }
+            m.designate(p(-40, -20, 1), p(5, 20, 1), DesignationKind::Dig);
+            m.designate(p(-10, 2, 0), p(-1, 2, 0), DesignationKind::WoodChair);
         }
         let mut total = std::time::Duration::ZERO;
         let mut busy = 0usize;
@@ -1164,7 +1403,7 @@ mod tests {
                 let ids: Vec<_> = w.fortresses.keys().copied().collect();
                 for id in ids {
                     let view = moria_core::ai::AiView {
-                        mountain: w.mountains[&id].clone(),
+                        mountain: view_mountain(&w.mountains[&id], &w.fortresses[&id]),
                         tick: w.tick,
                         dwarves: w.fortresses[&id]
                             .dwarves

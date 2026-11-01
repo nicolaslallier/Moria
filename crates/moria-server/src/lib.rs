@@ -496,14 +496,8 @@ impl State {
         let Some(mt) = self.w.mountains.get(&m) else {
             return;
         };
-        let mut mountain = mt.clone();
-        // ponytail: all-or-nothing; with 1 spare stone the AI may still pick several walls
-        // (the server keeps one). Send the spare count in AiView if that ever matters.
-        if sim::spare_stone(f) == 0 {
-            mountain.designations.retain(|_, k| k.builds().is_none());
-        }
         let view = AiView {
-            mountain,
+            mountain: sim::view_mountain(mt, f),
             tick: self.w.tick,
             dwarves: f
                 .dwarves
@@ -524,8 +518,8 @@ impl State {
 /// The entrance room's first tile, where a new hero appears.
 fn entrance(w: &World, m: MountainId) -> Option<TilePos> {
     w.mountains
-        .contains_key(&m)
-        .then(|| world::entrance_tiles().next())?
+        .get(&m)
+        .and_then(|_| world::entrance_tiles().next())
 }
 
 #[cfg(test)]
