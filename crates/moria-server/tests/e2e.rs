@@ -496,8 +496,8 @@ async fn inventory_outage_keeps_the_game_running() {
     rm(&data);
 }
 
-// Known gap: batches still unsent when the server stops are not covered (we wait for the
-// inventory to catch up before stopping).
+// Here we wait for the inventory to catch up before stopping; batches still unsent at stop
+// are covered by `server_stop_right_after_a_dig_loses_nothing`.
 #[tokio::test]
 #[ignore]
 async fn server_restart_does_not_drop_batches() {
@@ -557,6 +557,44 @@ async fn inventory_killed_without_final_save_loses_nothing() {
     c.ticks(10).await;
     assert_eq!(total(&s).stone, c.view.resources.stone);
     srv.stop().await;
+    inv.stop().await;
+    assert_eq!(
+        total(&State::load_or_default(&file).unwrap()).stone,
+        expected
+    );
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn server_stop_right_after_a_dig_loses_nothing() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-stop-now");
+    let file = inventory_file(&data);
+    let env = env().await;
+    let inv = start_inventory(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let mut expected = c.view.resources.stone;
+    expected += c.dig(12).await;
+    // Stop IMMEDIATELY: the last batches may still be in the bridge's channel or unsent.
+    drop(c);
+    srv.stop().await;
+    let mut rx = env.states.clone();
+    let got = timeout(Duration::from_secs(30), async {
+        loop {
+            if total(&rx.borrow_and_update()).stone == expected {
+                break;
+            }
+            rx.changed().await.expect("state forwarder ended");
+        }
+    })
+    .await;
+    assert!(
+        got.is_ok(),
+        "inventory never reached {expected}; last {:?}",
+        rx.borrow()
+    );
     inv.stop().await;
     assert_eq!(
         total(&State::load_or_default(&file).unwrap()).stone,

@@ -39,6 +39,8 @@ Le monde est régénéré (carte 176×96×12 avec forêt, rivière, lac et colli
   4. Vérifier la version : un Hello brut envoyé au port 7777 doit recevoir `00 00 00 03 01 00 04` (serveur en protocole v4). Par exemple : `printf '\x00\x00\x00\x02\x00\x01' | nc -w 2 192.168.2.10 7777 | xxd`
   5. Chaque joueur recrée son compte.
 
+**Remise à zéro de l'inventaire.** Supprimer `inventory.bin` pendant que l'inventaire tourne ne sert à rien : il réécrit son état en mémoire au lot suivant ou au SIGTERM. Marche à suivre : (1) arrêter le conteneur (`docker stop`, par ex. `docker stop moria-inventory-1`, ou « Stop » dans Portainer) ; (2) `docker run --rm -v moria-inventory:/data alpine rm -f /data/inventory.bin` ; (3) vérifier la file `inventory` dans RabbitMQ et la purger si elle contient des lots : une ancienne graine encore en file l'emporterait sur la nouvelle ; (4) redéployer. `make reset-world` et `docker compose down -v` suppriment déjà le volume `moria-inventory`.
+
 **Attention :** le volume du compose s'appelle `moria-data` globalement, quel que soit le nom du projet. `make reset-world`, `docker compose down -v` ou la suppression du volume `moria-data` détruit donc ce monde sur la machine, même depuis un autre projet Compose.
 
 Nouvelles commandes : Couper (X : creuser, escalier, couper, mur ; Espace vers un arbre le coupe), les pentes changent de niveau, et le menu de construction (touche 3) propose le mobilier en bois (lit 3, table 4, chaise 2).

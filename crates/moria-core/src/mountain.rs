@@ -7,7 +7,7 @@ pub const MOUNTAIN_H: i16 = 96;
 pub const MOUNTAIN_D: u8 = 12;
 /// Surface level: z below it is sky, z above it is underground (z grows downward).
 pub const GROUND_Z: u8 = 4;
-/// Most designations one mountain holds: bounds the AI view (NATS payload) and its solver.
+/// Most designations one mountain holds: bounds the AI view (bus message size) and its solver.
 pub const MAX_DESIGNATIONS: usize = 4096;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

@@ -81,7 +81,7 @@ pub fn render(m: &Metrics) -> String {
     put(
         "moria_nats_connected",
         "gauge",
-        "1 si le pont NATS est connecte.",
+        "1 si le bus est connecte ET que l'inventaire a publie un etat il y a moins de 5 s.",
         g(&m.nats_connected),
     );
     put(
