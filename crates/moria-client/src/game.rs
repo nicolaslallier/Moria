@@ -74,7 +74,6 @@ pub fn drag_msg(
     }
 }
 
-/// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
 /// HUD clock: the game hour and the phase of the day.
 pub fn clock_label(tick: u64) -> String {
     let h = hour(tick);
@@ -87,6 +86,7 @@ pub fn clock_label(tick: u64) -> String {
     format!("{h} h — {phase}")
 }
 
+/// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
 pub fn level_label(z: u8) -> String {
     match z.cmp(&GROUND_Z) {
         Ordering::Equal => "Niveau 0 (sol)".into(),
@@ -415,6 +415,18 @@ impl Game {
     }
 }
 
+/// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
+pub fn outlined(
+    designations: &std::collections::BTreeMap<TilePos, DesignationKind>,
+    z: u8,
+) -> Vec<(TilePos, DesignationKind)> {
+    designations
+        .iter()
+        .filter(|(p, _)| p.z == z)
+        .map(|(&p, &k)| (p, k))
+        .collect()
+}
+
 /// What the client shows, driven by network events.
 #[derive(Default)]
 pub struct Session {
@@ -487,7 +499,9 @@ impl Session {
     fn end(&mut self, screen: Screen, msg: String) {
         self.screen = screen;
         self.error = Some(msg);
-        self.left = self.game.take();
+        // Never overwrite a pending `left`: its memory is not saved yet.
+        let ended = self.game.take();
+        self.left = self.left.take().or(ended);
     }
 }
 
@@ -761,6 +775,35 @@ pub(crate) mod tests {
         v.dwarves = vec![(DwarfId(0), p(6, 1, 0), None)];
         assert!(s.handle(NetEvent::Msg(ServerMsg::Snapshot(v))));
         assert_eq!(s.screen, Screen::Disconnected);
+    }
+
+    #[test]
+    fn a_pending_left_game_survives_a_later_disconnect() {
+        let snap = |id: u16| {
+            let g = game();
+            let mut m = g.mountain;
+            m.id = MountainId(id);
+            NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+                mountain: m,
+                hero: g.hero,
+                dwarves: vec![],
+                resources: Resources::default(),
+                tick: 0,
+            })))
+        };
+        let mut s = Session::default();
+        s.handle(snap(1));
+        s.handle(snap(2)); // old mountain 1 is now pending in `left`
+        s.handle(NetEvent::Disconnected("perdu".into()));
+        assert_eq!(s.left.unwrap().mountain.id, MountainId(1));
+    }
+
+    #[test]
+    fn designations_are_outlined_on_their_level_even_in_the_dark() {
+        let mut d = std::collections::BTreeMap::new();
+        d.insert(p(5, 5, 0), DesignationKind::Dig); // never-seen rock
+        d.insert(p(1, 1, 1), DesignationKind::Dig);
+        assert_eq!(outlined(&d, 0), vec![(p(5, 5, 0), DesignationKind::Dig)]);
     }
 
     #[test]

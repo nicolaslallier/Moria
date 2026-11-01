@@ -2,7 +2,7 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{Game, Screen};
+use crate::game::{Game, Screen, outlined};
 use crate::input::Drag;
 use crate::light::{dwarf_visible, shown};
 use bevy::prelude::*;
@@ -373,13 +373,8 @@ fn draw_relief(
     }
 }
 
-fn draw_outlines(
-    client: Res<Client>,
-    drag: Res<Drag>,
-    lighting: Option<Res<Lighting>>,
-    mut gizmos: Gizmos,
-) {
-    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
+fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
+    let Some(g) = &client.session.game else {
         return;
     };
     let z = g.current_z();
@@ -389,9 +384,7 @@ fn draw_outlines(
         gizmos.circle_2d(at, TILE * 0.49, Color::srgba(0.94, 0.73, 0.35, 0.3));
     }
     // TilePos orders by x first, so a z-range is not contiguous; a scan of all designations.
-    // Only on tiles lit or explored: the dark keeps its secrets.
-    let known = |p: &TilePos| p.z == z && brightness(g, &l, p.x, p.y, z) > 0.0;
-    for (p, k) in g.mountain.designations.iter().filter(|(p, _)| known(p)) {
+    for (p, k) in outlined(&g.mountain.designations, z) {
         let color = match k {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),

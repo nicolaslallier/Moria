@@ -43,7 +43,7 @@ pub fn plugin(app: &mut App) {
         .add_systems(OnEnter(Screen::CreateHero), |mut f: ResMut<HeroForm>| {
             f.sent = false;
         })
-        .add_systems(Update, memory_sync)
+        .add_systems(Last, memory_sync)
         .add_systems(
             EguiPrimaryContextPass,
             (
@@ -74,14 +74,19 @@ fn fallback_prefs_path() -> Option<PathBuf> {
     Some(dir.join("moria").join("prefs"))
 }
 
-/// Loads the explored memory when a game starts, saves it every 30 s and when the game ends.
+/// Loads the explored memory when a game starts, saves it every 30 s, when the game ends and on app exit.
 fn memory_sync(
     mut client: ResMut<Client>,
     form: Res<LoginForm>,
     time: Res<Time>,
     mut sync: Local<MemorySync>,
+    mut exit: MessageReader<AppExit>,
 ) {
     let s = &mut client.session;
+    // Closing the window ends the game too: save what is running (this system runs in `Last`).
+    if exit.read().count() > 0 && s.left.is_none() {
+        s.left = s.game.take();
+    }
     let left = s.left.take();
     let id = s.game.as_ref().map(|g| g.mountain.id);
     sync.step(
@@ -288,8 +293,8 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let r = g.resources;
     centered("Construire").show(ctx.ctx_mut()?, |ui| {
         ui.label(format!(
-            "Pierre disponible : {} · Bois disponible : {}",
-            r.stone, r.wood
+            "Pierre disponible : {} · Bois disponible : {} · Or disponible : {}",
+            r.stone, r.wood, r.gold
         ));
         ui.separator();
         let mut picked = None;
