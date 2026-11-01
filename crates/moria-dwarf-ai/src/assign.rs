@@ -52,8 +52,8 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
         return vec![];
     }
     // Dwarves don't block each other: empty `blocked`.
-    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x 18k tiles); if that gets
-    // too slow, run a single multi-source BFS from the tasks' work spots instead.
+    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x walkable tiles: BFS over ~12k
+    // outdoor tiles on the 176x96x12 map plus whatever is dug); if that gets too slow, run a single multi-source BFS from the tasks' work spots instead.
     let no_block = HashSet::new();
     let dist: Vec<Vec<Option<u32>>> = dwarves
         .iter()
