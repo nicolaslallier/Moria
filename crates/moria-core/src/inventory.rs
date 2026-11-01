@@ -60,7 +60,21 @@ impl State {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // Les lots sont acquittes apres save : sans fsync du dossier, un crash de l'hote peut
+        // perdre le rename. Best effort : ouvrir un dossier echoue sur certaines plateformes.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
     }
 
     /// Missing file gives the empty state; anything unreadable is an error, never a silent reset.

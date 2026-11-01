@@ -132,3 +132,18 @@ async fn acked_delivery_is_not_redelivered() {
             .is_err()
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn queue_len_counts_ready_messages_and_purge_empties() {
+    let key = uniq("test.len");
+    let bus = Bus::connect(&url()).await.unwrap();
+    bus.declare(&key, Queue::Durable(&key)).await.unwrap();
+    assert_eq!(bus.queue_len(&key).await.unwrap(), 0);
+    bus.publish(&key, b"a".to_vec(), true).await.unwrap();
+    bus.publish(&key, b"b".to_vec(), true).await.unwrap();
+    assert_eq!(bus.queue_len(&key).await.unwrap(), 2);
+    bus.purge(&key).await.unwrap();
+    assert_eq!(bus.queue_len(&key).await.unwrap(), 0);
+    assert!(bus.queue_len(&uniq("test.absent")).await.is_err());
+}

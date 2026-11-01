@@ -5,6 +5,7 @@ use futures::{Stream, StreamExt};
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
     ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
+    QueuePurgeOptions,
 };
 use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
@@ -229,6 +230,32 @@ impl Bus {
     /// Declare et lie seulement, sans consommateur.
     pub async fn declare(&self, key: &str, q: Queue<'_>) -> anyhow::Result<()> {
         self.bind(key, q).await.map(|_| ())
+    }
+
+    /// Messages prets (non remis) d'une file existante ; erreur si elle n'existe pas.
+    pub async fn queue_len(&self, queue: &str) -> anyhow::Result<u32> {
+        let chan = self.conn.create_channel().await?;
+        let q = chan
+            .queue_declare(
+                queue.into(),
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+        let _ = chan.close(200, "fin".into()).await;
+        Ok(q.message_count())
+    }
+
+    /// Vide une file existante.
+    pub async fn purge(&self, queue: &str) -> anyhow::Result<()> {
+        let chan = self.conn.create_channel().await?;
+        chan.queue_purge(queue.into(), QueuePurgeOptions::default())
+            .await?;
+        let _ = chan.close(200, "fin".into()).await;
+        Ok(())
     }
 
     pub fn is_connected(&self) -> bool {

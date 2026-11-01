@@ -5,7 +5,7 @@ use futures::StreamExt;
 use moria_bus::{Bus, Queue, redact_url};
 use moria_core::inventory::{Batch, KEY_APPLY, KEY_STATE, STATE_EVERY, State};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Decode et applique un lot ; `false` si illisible, perime ou doublon.
@@ -17,6 +17,21 @@ pub fn handle(state: &mut State, payload: &[u8]) -> bool {
             false
         }
     }
+}
+
+/// Traite un message : `Ok(true)` lot applique ET sauvegarde, `Ok(false)` ignore (illisible,
+/// perime, doublon), `Err` sauvegarde impossible (`state` est alors revenu a sa valeur d'avant).
+pub fn step(state: &mut State, data: &Path, payload: &[u8]) -> Result<bool, std::io::Error> {
+    let prev = state.clone();
+    if !handle(state, payload) {
+        return Ok(false);
+    }
+    if let Err(e) = state.save(data) {
+        // La memoire ne doit pas devancer le disque.
+        *state = prev;
+        return Err(e);
+    }
+    Ok(true)
 }
 
 async fn publish_state(bus: &Bus, state: &State) {
@@ -44,6 +59,14 @@ pub async fn run(
             data.display()
         )
     })?;
+    // Sonde d'ecriture : un chemin inscriptible est requis, sinon chaque lot echouerait
+    // sans ack et bloquerait la file en silence.
+    state.save(&data).with_context(|| {
+        format!(
+            "ecriture impossible dans {}, refus de demarrer",
+            data.display()
+        )
+    })?;
     tracing::info!("inventaire charge, broker {}", redact_url(&amqp_url));
     tokio::pin!(shutdown);
     let mut tick = tokio::time::interval(STATE_EVERY);
@@ -52,51 +75,59 @@ pub async fn run(
             b = Bus::connect_forever(&amqp_url) => b,
             () = &mut shutdown => return save(&state, &data),
         };
-        let mut deliveries = match bus
+        let mut stop = false;
+        match bus
             .subscribe_acked(KEY_APPLY, Queue::Durable("inventory"))
             .await
         {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("abonnement impossible: {e:#}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        loop {
-            tokio::select! {
-                () = &mut shutdown => {
-                    bus.close().await;
-                    return save(&state, &data);
-                }
-                _ = tick.tick() => {
-                    if !bus.is_connected() { break; }
-                    publish_state(&bus, &state).await;
-                }
-                d = deliveries.next() => {
-                    let Some(d) = d else { break };
-                    let prev = state.clone();
-                    let applied = handle(&mut state, &d.body);
-                    if applied && let Err(e) = state.save(&data) {
-                        // La memoire ne doit pas devancer le disque ; sans ack, le broker
-                        // redistribue a la fermeture du canal.
-                        tracing::error!("sauvegarde impossible, lot non acquitte: {e}");
-                        state = prev;
+            Err(e) => tracing::warn!("abonnement impossible: {e:#}"),
+            Ok(mut deliveries) => loop {
+                tokio::select! {
+                    () = &mut shutdown => {
+                        stop = true;
                         break;
                     }
-                    if let Err(e) = d.ack().await {
-                        tracing::warn!("ack impossible: {e:#}");
-                        break;
-                    }
-                    if applied {
+                    _ = tick.tick() => {
+                        if !bus.is_connected() { break; }
                         publish_state(&bus, &state).await;
                     }
+                    d = deliveries.next() => {
+                        let Some(d) = d else { break };
+                        match step(&mut state, &data, &d.body) {
+                            // Sans ack, le broker redistribue a la fermeture du canal.
+                            Err(e) => {
+                                tracing::error!("sauvegarde impossible, lot non acquitte: {e}");
+                                break;
+                            }
+                            Ok(applied) => {
+                                if let Err(e) = d.ack().await {
+                                    tracing::warn!("ack impossible: {e:#}");
+                                    break;
+                                }
+                                if applied {
+                                    publish_state(&bus, &state).await;
+                                }
+                            }
+                        }
+                    }
                 }
-            }
+            },
         }
-        bus.close().await;
+        if stop {
+            // Sauvegarde d'abord : la fermeture du broker ne doit pas pouvoir la retarder.
+            let r = save(&state, &data);
+            let _ = tokio::time::timeout(Duration::from_secs(2), bus.close()).await;
+            return r;
+        }
+        tokio::select! {
+            () = bus.close() => {}
+            () = &mut shutdown => return save(&state, &data),
+        }
         tracing::warn!("flux interrompu, reconnexion");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(2)) => {}
+            () = &mut shutdown => return save(&state, &data),
+        }
     }
 }
 
@@ -138,5 +169,92 @@ mod tests {
         assert!(handle(&mut s, &bytes));
         assert_eq!(s.totals[&MountainId(0)].stone, 4);
         assert!(!handle(&mut s, &bytes), "doublon");
+    }
+
+    fn payload() -> Vec<u8> {
+        postcard::to_allocvec(&batch()).unwrap()
+    }
+
+    fn good_path(name: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("moria-inv-unit-{}-{name}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn bad_path() -> PathBuf {
+        std::env::temp_dir()
+            .join("moria-inv-absent-dir")
+            .join("x.bin")
+    }
+
+    #[test]
+    fn save_failure_reverts_memory() {
+        let mut s = State::default();
+        let before = s.clone();
+        assert!(step(&mut s, &bad_path(), &payload()).is_err());
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn redelivery_after_save_failure_applies_exactly_once() {
+        let mut s = State::default();
+        assert!(step(&mut s, &bad_path(), &payload()).is_err());
+        let ok = good_path("redeliver");
+        assert!(step(&mut s, &ok, &payload()).unwrap());
+        assert!(!step(&mut s, &ok, &payload()).unwrap());
+        assert_eq!(s.totals[&MountainId(0)].stone, 4);
+        assert_eq!(State::load_or_default(&ok).unwrap(), s);
+    }
+
+    #[test]
+    fn duplicate_payload_is_not_saved_again() {
+        let mut s = State::default();
+        let p = good_path("dup");
+        assert!(step(&mut s, &p, &payload()).unwrap());
+        std::fs::remove_file(&p).unwrap();
+        assert!(!step(&mut s, &p, &payload()).unwrap());
+        assert!(
+            !p.exists(),
+            "un doublon ne doit pas declencher de sauvegarde"
+        );
+    }
+
+    #[test]
+    fn garbage_payload_step_is_ok_false() {
+        let mut s = State::default();
+        let p = good_path("garbage");
+        assert!(!step(&mut s, &p, &[0xff; 7]).unwrap());
+        assert_eq!(s, State::default());
+        assert!(!p.exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_when_data_dir_is_missing() {
+        // Echoue avant toute connexion : l'URL n'est jamais jointe.
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            run(
+                "amqp://x:y@127.0.0.1:1/".into(),
+                bad_path(),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("run aurait du refuser de demarrer");
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_on_corrupt_file() {
+        let p = good_path("corrupt");
+        std::fs::write(&p, [0xffu8; 9]).unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            run("amqp://x:y@127.0.0.1:1/".into(), p, std::future::pending()),
+        )
+        .await
+        .expect("run aurait du refuser de demarrer");
+        assert!(r.is_err());
     }
 }

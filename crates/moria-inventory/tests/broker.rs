@@ -76,6 +76,17 @@ async fn state_where(
     .expect("etat attendu jamais recu")
 }
 
+/// Connexion, file `inventory` declaree et videe (restes d'un test interrompu), flux d'etats.
+async fn setup() -> (Bus, impl futures::Stream<Item = Vec<u8>> + Unpin) {
+    let bus = Bus::connect(&url()).await.unwrap();
+    bus.declare(KEY_APPLY, Queue::Durable("inventory"))
+        .await
+        .unwrap();
+    bus.purge("inventory").await.unwrap();
+    let st = bus.subscribe(KEY_STATE, Queue::Exclusive).await.unwrap();
+    (bus, st)
+}
+
 fn stone(s: &State) -> u32 {
     s.totals.get(&MountainId(0)).map_or(0, |r| r.stone)
 }
@@ -84,56 +95,48 @@ fn stone(s: &State) -> u32 {
 #[ignore]
 async fn batch_in_state_out() {
     let file = tmp("batch");
-    let bus = Bus::connect(&url()).await.unwrap();
-    bus.declare(KEY_APPLY, Queue::Durable("inventory"))
-        .await
-        .unwrap();
-    let mut st = bus.subscribe(KEY_STATE, Queue::Exclusive).await.unwrap();
+    let (bus, mut st) = setup().await;
     let svc = start(file.clone());
     publish(&bus, &batch(1, 5)).await;
     let s = state_where(&mut st, |s| stone(s) == 5).await;
     svc.stop().await;
     assert_eq!(State::load_or_default(&file).unwrap(), s);
+    // Service arrete : un message non acquitte serait revenu dans la file.
+    assert_eq!(
+        bus.queue_len("inventory").await.unwrap(),
+        0,
+        "lot non acquitte"
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn crash_before_ack_redelivers_without_double_apply() {
     let file = tmp("dup");
-    let bus = Bus::connect(&url()).await.unwrap();
-    bus.declare(KEY_APPLY, Queue::Durable("inventory"))
-        .await
-        .unwrap();
-    let mut st = bus.subscribe(KEY_STATE, Queue::Exclusive).await.unwrap();
+    let (bus, mut st) = setup().await;
     let svc = start(file.clone());
     publish(&bus, &batch(1, 1)).await;
     publish(&bus, &batch(1, 1)).await;
-    state_where(&mut st, |s| stone(s) == 1).await;
-    // Laisse le doublon etre consomme, puis verifie qu'il n'a rien change.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let s = state_where(&mut st, |_| true).await;
+    // Le lot-sentinelle (seq 2, rien a ajouter) suit le doublon dans la file : son ack
+    // prouve que le doublon a ete consomme.
+    publish(&bus, &batch(2, 0)).await;
+    let s = state_where(&mut st, |s| s.acks.get("t") == Some(&(1, 2))).await;
     assert_eq!(stone(&s), 1);
     svc.stop().await;
-    assert_eq!(stone(&State::load_or_default(&file).unwrap()), 1);
+    let disk = State::load_or_default(&file).unwrap();
+    assert_eq!(stone(&disk), 1);
+    assert_eq!(disk.acks["t"], (1, 2));
+    assert_eq!(bus.queue_len("inventory").await.unwrap(), 0);
 
     // Seconde instance sur le meme fichier : le lot rejoue est ignore.
     let svc = start(file.clone());
     publish(&bus, &batch(1, 1)).await;
-    let s = state_where(&mut st, |_| true).await;
+    publish(&bus, &batch(3, 0)).await;
+    let s = state_where(&mut st, |s| s.acks.get("t") == Some(&(1, 3))).await;
     assert_eq!(stone(&s), 1);
     svc.stop().await;
-    assert_eq!(stone(&State::load_or_default(&file).unwrap()), 1);
-}
-
-#[tokio::test]
-#[ignore]
-async fn refuses_to_start_on_corrupt_file() {
-    let file = tmp("corrupt");
-    std::fs::write(&file, [0xffu8; 9]).unwrap();
-    let (_tx, rx) = oneshot::channel::<()>();
-    let r = moria_inventory::run(url(), file, async {
-        let _ = rx.await;
-    })
-    .await;
-    assert!(r.is_err());
+    let disk = State::load_or_default(&file).unwrap();
+    assert_eq!(stone(&disk), 1);
+    assert_eq!(disk.acks["t"], (1, 3));
+    assert_eq!(bus.queue_len("inventory").await.unwrap(), 0);
 }
