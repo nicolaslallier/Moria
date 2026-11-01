@@ -40,10 +40,13 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
     let claimed: HashSet<TilePos> = view.claimed.iter().copied().collect();
     let occupied: HashSet<TilePos> = view.occupied.iter().copied().collect();
     // BTreeMap keys are already sorted by TilePos. The server rejects undiggable targets.
+    // Workshop work runs under an occupant; map changes wait for the tile to clear.
     let tasks: Vec<TilePos> = m
         .designations
         .iter()
-        .filter(|&(&t, &k)| m.diggable(t, k) && !claimed.contains(&t) && !occupied.contains(&t))
+        .filter(|&(&t, &k)| {
+            m.diggable(t, k) && !claimed.contains(&t) && (k.is_work() || !occupied.contains(&t))
+        })
         .map(|(&t, _)| t)
         .collect();
     let mut dwarves: Vec<_> = view.dwarves.iter().filter(|d| d.idle).collect();
@@ -362,6 +365,19 @@ mod tests {
         let mut m = corridor(10);
         let t = task(&mut m, 4);
         assert!(assign(&view(m, vec![dw(1, 1, true)], vec![], vec![t])).is_empty());
+    }
+
+    #[test]
+    fn workshop_order_assigned_even_under_an_occupant() {
+        let mut m = corridor(10);
+        let forge = p(5, 0);
+        m.set(forge, Tile::Forge);
+        m.designations.insert(forge, DesignationKind::Smelt);
+        // The hero stands on the forge: the server lets the work run anyway.
+        assert_eq!(
+            assign(&view(m, vec![dw(1, 1, true)], vec![], vec![forge])),
+            vec![(DwarfId(1), forge)]
+        );
     }
 
     #[test]

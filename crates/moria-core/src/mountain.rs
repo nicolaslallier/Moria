@@ -107,9 +107,11 @@ impl Mountain {
         if walkable(q) {
             return Some(q);
         }
+        // Doors are furniture, hence solid, but no one climbs over one.
+        let climbable = |p: TilePos| self.get(p).is_some_and(|t| t.is_solid() && !t.is_door());
         let up = from.step(Dir::Up);
         if self.get(from) == Some(Tile::Slope)
-            && self.get(q).is_some_and(Tile::is_solid)
+            && climbable(q)
             && up != from
             && self.get(up) == Some(Tile::Sky)
         {
@@ -117,9 +119,7 @@ impl Mountain {
             return walkable(q_up).then_some(q_up);
         }
         // Mirror of the climb: only descend where the slope leads straight back up here.
-        if self.get(q) == Some(Tile::Sky)
-            && self.get(from.step(Dir::Down)).is_some_and(Tile::is_solid)
-        {
+        if self.get(q) == Some(Tile::Sky) && climbable(from.step(Dir::Down)) {
             let q_down = q.step(Dir::Down);
             return (self.get(q_down) == Some(Tile::Slope)).then_some(q_down);
         }
@@ -519,6 +519,18 @@ mod tests {
     #[test]
     fn descend_hill_via_slope() {
         assert_eq!(hill().move_dest(p(6, 5, 1), Dir::W), Some(p(5, 5, 2)));
+    }
+
+    #[test]
+    fn no_climb_over_a_door() {
+        let mut m = hill();
+        m.set(p(6, 5, 2), Tile::WoodDoorLocked); // grass still on top at (6,5,1)
+        assert_eq!(m.move_dest(p(5, 5, 2), Dir::E), None);
+        assert_eq!(m.move_dest(p(6, 5, 1), Dir::W), None);
+        let top = p(6, 5, 1);
+        assert!(
+            crate::path::find_path(&m, p(5, 5, 2), |q| q == top, &Default::default()).is_none()
+        );
     }
 
     #[test]

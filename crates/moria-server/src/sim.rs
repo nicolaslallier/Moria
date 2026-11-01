@@ -151,10 +151,7 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         Command::Use(d) if !matches!(d, Dir::Up | Dir::Down) => {
             let t = h.pos.step(d);
             let free = f.dwarves.iter().all(|w| w.pos != t);
-            if free
-                && h.pos != t
-                && let Some(new) = mt.get(t).and_then(Tile::toggled_door)
-            {
+            if free && let Some(new) = mt.get(t).and_then(Tile::toggled_door) {
                 mt.set(t, new);
                 ch.tiles.push((t, new));
             }
@@ -218,15 +215,21 @@ pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
     // ponytail: a full clone (~200 KB of tiles, <= MAX_DESIGNATIONS entries) per view, i.e.
     // per tick; share an Arc<Mountain> with copy-on-write if it ever shows up in a profile.
     let mut m = mt.clone();
-    // Orders show as designations of their recipe, within the AI's cap.
+    // Orders show as designations of their recipe, within the AI's cap: when full, an
+    // order takes the place of the last plain designation.
     for (&p, &n) in &mt.orders {
-        if m.designations.len() >= MAX_DESIGNATIONS {
-            break;
-        }
         if n > 0
             && !mt.designations.contains_key(&p)
             && let Some(k) = mt.get(p).and_then(Tile::recipe)
+            && spare.covers(&k.cost())
         {
+            if m.designations.len() >= MAX_DESIGNATIONS {
+                let Some(last) = m.designations.iter().rev().find(|(_, k)| !k.is_work()) else {
+                    break;
+                };
+                let last = *last.0;
+                m.designations.remove(&last);
+            }
             m.designations.insert(p, k);
         }
     }
@@ -1844,6 +1847,23 @@ mod tests {
         res(&mut w).add(ore(1, 1));
         let view = view_mountain(&w.mountains[&M], &w.fortresses[&M]);
         assert_eq!(view.designations.get(&forge), Some(&DesignationKind::Smelt));
+    }
+
+    #[test]
+    fn orders_reach_the_ai_even_when_designations_are_full() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 1);
+        *res(&mut w) = ore(2, 1);
+        let mt = w.mountains.get_mut(&M).unwrap();
+        let (mw, _, d) = mt.size();
+        // A forged full list (`designate` caps it), far below the forge.
+        for i in 0..MAX_DESIGNATIONS as i16 {
+            let q = TilePos::new(i % mw, i / mw, d - 1);
+            mt.designations.insert(q, DesignationKind::Dig);
+        }
+        let view = view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert_eq!(view.designations.get(&forge), Some(&DesignationKind::Smelt));
+        assert!(view.designations.len() <= MAX_DESIGNATIONS);
     }
 
     #[test]

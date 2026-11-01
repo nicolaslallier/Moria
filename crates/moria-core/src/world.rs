@@ -332,7 +332,8 @@ pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
 
 /// Sets an outdated save aside as `<path>.v<n>.bak` and writes a fresh world; returns the backup path.
 /// `None` if the file is missing or already current. A newer save is an error: never wiped.
-pub fn reset_if_outdated(path: &Path, seed: u64) -> io::Result<Option<PathBuf>> {
+/// The fresh world keeps the old one's seed (the body starts with `World.seed`), else `fallback_seed`.
+pub fn reset_if_outdated(path: &Path, fallback_seed: u64) -> io::Result<Option<PathBuf>> {
     match save_version(path)? {
         None => Ok(None),
         Some(v) if v == SAVE_VERSION => Ok(None),
@@ -346,6 +347,11 @@ pub fn reset_if_outdated(path: &Path, seed: u64) -> io::Result<Option<PathBuf>> 
             let mut bak = path.as_os_str().to_owned();
             bak.push(format!(".v{v}.bak"));
             let bak = PathBuf::from(bak);
+            let bytes = std::fs::read(path)?;
+            let seed = bytes
+                .get(4..)
+                .and_then(|body| postcard::take_from_bytes::<u64>(body).ok())
+                .map_or(fallback_seed, |(s, _)| s);
             std::fs::rename(path, &bak)?;
             save(&generate(seed), path)?;
             Ok(Some(bak))
@@ -510,6 +516,19 @@ mod tests {
         let e = reset_if_outdated(&p, 0).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(std::fs::read(&p).unwrap(), newer);
+    }
+
+    #[test]
+    fn reset_keeps_the_old_worlds_seed() {
+        let d = tmpdir("reset-seed");
+        let p = d.join("w.bin");
+        let mut old = 2u32.to_le_bytes().to_vec();
+        old.extend(postcard::to_allocvec(&42u64).unwrap());
+        std::fs::write(&p, old).unwrap();
+        reset_if_outdated(&p, 0).unwrap().unwrap();
+        let w = load(&p).unwrap();
+        assert_eq!(w.seed, 42);
+        assert_eq!(encode(&w), encode(&generate(42)));
     }
 
     #[test]
