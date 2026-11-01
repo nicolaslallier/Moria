@@ -18,24 +18,24 @@ fn main() {
     }
     let out =
         out.unwrap_or_else(|| die("usage : moria-worldgen --out <fichier> [--seed N] [--force]"));
-    let old = moria_core::world::save_version(&out)
-        .unwrap_or_else(|e| die(&format!("lecture impossible : {e}")));
-    match old {
-        Some(v) if v != moria_core::world::SAVE_VERSION => {
-            let mut bak = out.as_os_str().to_owned();
-            bak.push(format!(".v{v}.bak"));
-            std::fs::rename(&out, &bak)
-                .unwrap_or_else(|e| die(&format!("mise de côté impossible : {e}")));
+    use moria_core::world;
+    let old =
+        world::save_version(&out).unwrap_or_else(|e| die(&format!("lecture impossible : {e}")));
+    match world::reset_if_outdated(&out, seed) {
+        Err(e) => die(&e.to_string()),
+        Ok(Some(bak)) => {
             println!(
-                "ancien monde v{v} mis de côté : {}",
-                PathBuf::from(bak).display()
+                "ancien monde v{} mis de côté : {}",
+                old.unwrap_or(0),
+                bak.display()
             );
+            return;
         }
-        Some(_) if !force => {
+        Ok(None) if old.is_some() && !force => {
             println!("monde déjà présent, rien à faire");
             return;
         }
-        _ => {}
+        Ok(None) => {}
     }
     let w = moria_core::world::generate(seed);
     moria_core::world::save(&w, &out)

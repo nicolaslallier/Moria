@@ -330,6 +330,29 @@ pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
     }
 }
 
+/// Sets an outdated save aside as `<path>.v<n>.bak` and writes a fresh world; returns the backup path.
+/// `None` if the file is missing or already current. A newer save is an error: never wiped.
+pub fn reset_if_outdated(path: &Path, seed: u64) -> io::Result<Option<PathBuf>> {
+    match save_version(path)? {
+        None => Ok(None),
+        Some(v) if v == SAVE_VERSION => Ok(None),
+        Some(v) if v > SAVE_VERSION => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "monde v{v} plus récent que ce programme (v{SAVE_VERSION}) : refus de l'écraser"
+            ),
+        )),
+        Some(v) => {
+            let mut bak = path.as_os_str().to_owned();
+            bak.push(format!(".v{v}.bak"));
+            let bak = PathBuf::from(bak);
+            std::fs::rename(path, &bak)?;
+            save(&generate(seed), path)?;
+            Ok(Some(bak))
+        }
+    }
+}
+
 pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
     if w.regions.iter().filter(|r| r.owner.is_some()).count() >= MAX_OWNED {
         return None;
@@ -461,6 +484,32 @@ mod tests {
         assert_eq!(save_version(&p).unwrap(), Some(0));
         std::fs::write(&p, []).unwrap();
         assert_eq!(save_version(&p).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn reset_if_outdated_sets_old_worlds_aside() {
+        let d = tmpdir("reset");
+        let p = d.join("w.bin");
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        std::fs::write(&p, 2u32.to_le_bytes()).unwrap();
+        let bak = reset_if_outdated(&p, 0).unwrap().unwrap();
+        assert_eq!(bak, d.join("w.bin.v2.bak"));
+        assert!(bak.exists());
+        assert_eq!(save_version(&p).unwrap(), Some(SAVE_VERSION));
+        load(&p).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        std::fs::write(&p, [1u8]).unwrap();
+        assert_eq!(
+            reset_if_outdated(&p, 0).unwrap().unwrap(),
+            d.join("w.bin.v0.bak")
+        );
+        let newer = (SAVE_VERSION + 1).to_le_bytes();
+        std::fs::write(&p, newer).unwrap();
+        let e = reset_if_outdated(&p, 0).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&p).unwrap(), newer);
     }
 
     #[test]

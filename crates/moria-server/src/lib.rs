@@ -137,6 +137,9 @@ pub async fn run_with_listener(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    if let Some(bak) = world::reset_if_outdated(&cfg.data, 0)? {
+        tracing::warn!("ancien monde mis de côté : {}", bak.display());
+    }
     let w = match world::load(&cfg.data) {
         Ok(w) => w,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
