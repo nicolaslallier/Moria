@@ -358,4 +358,72 @@ mod tests {
             vec![(DwarfId(1), valid)]
         );
     }
+
+    /// Outdoor strip: Sky at z=0, Grass at z=1 (the ground), 40x8x2.
+    fn outdoors() -> Mountain {
+        let mut m = Mountain::new(MountainId(0), 40, 8, 2, Tile::Sky);
+        for y in 0..8 {
+            for x in 0..40 {
+                m.set(TilePos::new(x, y, 1), Tile::Grass);
+            }
+        }
+        m
+    }
+
+    fn at(id: u32, x: i16, y: i16, z: u8) -> DwarfView {
+        DwarfView {
+            id: DwarfId(id),
+            pos: TilePos::new(x, y, z),
+            idle: true,
+        }
+    }
+
+    #[test]
+    fn tree_across_water_not_assigned() {
+        let mut m = outdoors();
+        for y in 0..8 {
+            m.set(TilePos::new(5, y, 1), Tile::Water);
+        }
+        let tree = TilePos::new(8, 1, 1);
+        m.set(tree, Tile::Tree);
+        m.designate(tree, tree, DesignationKind::Chop);
+        let dig = TilePos::new(2, 3, 1);
+        m.set(dig, Tile::Rock);
+        m.designate(dig, dig, DesignationKind::Dig);
+        let v = view(m.clone(), vec![at(1, 2, 1, 1)], vec![], vec![]);
+        assert_eq!(assign(&v), vec![(DwarfId(1), dig)]);
+        // Without the reachable dig, the cut-off tree gets nobody.
+        m.designations.remove(&dig);
+        assert!(assign(&view(m, vec![at(1, 2, 1, 1)], vec![], vec![])).is_empty());
+    }
+
+    #[test]
+    fn nearest_tree_wins_via_slope() {
+        let mut m = outdoors();
+        // Hill x 5..=8 (rock at z=1, grass on top at z=0), climbed by a slope at x=4.
+        for y in 0..8 {
+            for x in 5..=8 {
+                m.set(TilePos::new(x, y, 1), Tile::Rock);
+                m.set(TilePos::new(x, y, 0), Tile::Grass);
+            }
+        }
+        m.set(TilePos::new(4, 1, 1), Tile::Slope);
+        let hill = TilePos::new(7, 1, 0);
+        let flat = TilePos::new(3, 7, 1);
+        for t in [hill, flat] {
+            m.set(t, Tile::Tree);
+            m.designate(t, t, DesignationKind::Chop);
+        }
+        // Hill tree: 3 moves via the slope; flat tree: 5. The hill is unreachable without slopes.
+        let v = view(m, vec![at(1, 3, 1, 1)], vec![], vec![]);
+        assert_eq!(assign(&v), vec![(DwarfId(1), hill)]);
+    }
+
+    #[test]
+    fn full_size_view_validates() {
+        let w = moria_core::world::generate(1);
+        let m = w.mountains.values().next().unwrap().clone();
+        let v = view(m, vec![at(1, 130, 47, 4)], vec![], vec![]);
+        assert!(validate(&v).is_ok());
+    }
 }

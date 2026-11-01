@@ -1240,9 +1240,18 @@ mod tests {
             w.fortresses[&M].dwarves[1].task.is_none(),
             "stone bed waits"
         );
-        // The hero can't build stone either, nor take the 3 reserved wood beyond 6.
+        // The hero can't build stone either.
         apply_command(&mut w, M, Command::Build(Dir::E, DesignationKind::Bed));
         assert!(hero(&w).dig.is_none());
+        // Nor spend wood a dwarf task has reserved: 6 wood minus 3 reserved leaves 3 < 4.
+        *res(&mut w) = wood(6);
+        apply_command(
+            &mut w,
+            M,
+            Command::Build(Dir::E, DesignationKind::WoodTable),
+        );
+        assert!(hero(&w).dig.is_none(), "reserved wood is not spare");
+        *res(&mut w) = wood(9);
         for _ in 0..80 {
             step(&mut w);
         }
@@ -1446,6 +1455,10 @@ mod tests {
             "mean step+assign: {mean:?}; busy dwarf-ticks {busy}/30000; designations left: {left}"
         );
         assert!(left > 500 && busy > 10_000, "workload ran dry");
+        assert!(
+            w.fortresses.values().any(|f| f.resources.wood > 0),
+            "no tree was chopped"
+        );
         assert!(mean.as_millis() < 10, "{mean:?}");
     }
 }
