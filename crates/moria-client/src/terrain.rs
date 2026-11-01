@@ -25,7 +25,7 @@ fn pixels(tile: Tile) -> Vec<u8> {
     for y in 0_i32..96 {
         for x in 0_i32..96 {
             let noise = ((x * 73 + y * 179 + x * y * 13) % 11) - 5;
-            let floor = matches!(tile, Tile::Floor | Tile::Stair);
+            let floor = matches!(tile, Tile::Floor | Tile::Stair) || tile.is_furniture();
             let wall = tile == Tile::Wall;
             let (bx, by) = if floor {
                 ((x + (y / 48) * 24) % 48, y % 48)
@@ -66,10 +66,42 @@ fn pixels(tile: Tile) -> Vec<u8> {
                     rgb = ore.map(|c| (c + noise + glint).clamp(0, 255) as u8);
                 }
             }
+            if let Some(c) = furniture(tile, x, y) {
+                rgb = c.map(|c| (c + noise).clamp(0, 255) as u8);
+            }
             data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
     }
     data
+}
+
+/// Top-down carved-stone furniture over the floor: `(x0, y0, x1, y1, rgb)` boxes, last wins.
+fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
+    const STONE: [i32; 3] = [158, 150, 136];
+    const DARK: [i32; 3] = [104, 98, 88];
+    let boxes: &[(i32, i32, i32, i32, [i32; 3])] = match tile {
+        Tile::Bed => &[
+            (18, 8, 78, 88, DARK),
+            (22, 12, 74, 84, STONE),
+            (26, 16, 70, 30, [226, 220, 204]), // pillow
+            (24, 36, 72, 82, [150, 48, 44]),   // blanket
+        ],
+        Tile::Table => &[
+            (12, 20, 84, 70, DARK),
+            (16, 24, 80, 66, STONE),
+            (40, 36, 56, 52, [190, 150, 70]), // tankard
+        ],
+        Tile::Chair => &[
+            (28, 22, 68, 72, DARK),
+            (32, 34, 64, 68, STONE), // seat; the dark strip above is the back
+        ],
+        _ => &[],
+    };
+    boxes
+        .iter()
+        .rev()
+        .find(|&&(x0, y0, x1, y1, _)| (x0..x1).contains(&x) && (y0..y1).contains(&y))
+        .map(|b| b.4)
 }
 
 #[cfg(test)]
@@ -86,6 +118,9 @@ mod tests {
             Tile::Wall,
             Tile::Gold,
             Tile::Mithril,
+            Tile::Bed,
+            Tile::Table,
+            Tile::Chair,
         ] {
             let data = pixels(tile);
             assert_eq!(data.len(), rock.len());
@@ -102,5 +137,7 @@ mod tests {
         }
         assert_ne!(pixels(Tile::Gold), pixels(Tile::Mithril));
         assert_ne!(pixels(Tile::Floor), rock);
+        assert_ne!(pixels(Tile::Bed), pixels(Tile::Floor));
+        assert_ne!(pixels(Tile::Table), pixels(Tile::Chair));
     }
 }
