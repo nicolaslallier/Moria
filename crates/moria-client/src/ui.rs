@@ -307,9 +307,12 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 DesignationKind::Dig => "Mode : Creuser",
                 DesignationKind::Stairs => "Mode : Escalier",
                 DesignationKind::Wall => "Mode : Mur (1 pierre)",
+                DesignationKind::Bed => "Mode : Lit (1 pierre)",
+                DesignationKind::Table => "Mode : Table (1 pierre)",
+                DesignationKind::Chair => "Mode : Chaise (1 pierre)",
             });
             ui.small(
-                "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode Mur : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
+                "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
                  · X, 1, 2 : mode · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \

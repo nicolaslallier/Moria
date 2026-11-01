@@ -499,14 +499,25 @@ async fn names_are_case_insensitive() {
 async fn future_hello_gets_version_mismatch() {
     let s = Server::start("future").await;
     let mut c = Client::connect(&s).await;
-    // Hello (tag 0), version 3, then bytes today's Hello cannot decode.
-    let body = [0u8, 3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    // Hello (tag 0), the next version, then bytes today's Hello cannot decode.
+    let body = [
+        0u8,
+        PROTOCOL_VERSION as u8 + 1,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+    ];
     let mut frame = (body.len() as u32).to_be_bytes().to_vec();
     frame.extend(body);
     c.0.write_all(&frame).await.unwrap();
     assert_eq!(
         c.recv().await,
-        ServerMsg::Reject(Reject::VersionMismatch { server: 2 })
+        ServerMsg::Reject(Reject::VersionMismatch {
+            server: PROTOCOL_VERSION
+        })
     );
     s.stop().await;
 }

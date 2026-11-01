@@ -62,7 +62,8 @@ impl Mountain {
     }
 
     pub fn walkable(&self, p: TilePos) -> bool {
-        matches!(self.get(p), Some(Tile::Floor | Tile::Stair))
+        self.get(p)
+            .is_some_and(|t| matches!(t, Tile::Floor | Tile::Stair) || t.is_furniture())
     }
 
     pub fn can_move(&self, from: TilePos, dir: Dir) -> bool {
@@ -80,11 +81,11 @@ impl Mountain {
     /// Whether `kind` can be applied at `p` right now.
     pub fn diggable(&self, p: TilePos, kind: DesignationKind) -> bool {
         match (self.get(p), kind) {
-            (Some(t), DesignationKind::Dig) => t.is_solid(),
+            (Some(t), DesignationKind::Dig) => t.is_solid() || t.is_furniture(),
             (Some(t), DesignationKind::Stairs) => {
                 (t.is_solid() || t == Tile::Floor) && p.z + 1 < self.d
             }
-            (Some(t), DesignationKind::Wall) => t == Tile::Floor,
+            (Some(t), _) => t == Tile::Floor, // builds
             (None, _) => false,
         }
     }
@@ -133,7 +134,10 @@ impl Mountain {
         match kind {
             DesignationKind::Dig => self.set(p, Tile::Floor),
             // The stone cost is paid by the caller, which holds the resources.
-            DesignationKind::Wall => self.set(p, Tile::Wall),
+            DesignationKind::Wall
+            | DesignationKind::Bed
+            | DesignationKind::Table
+            | DesignationKind::Chair => self.set(p, kind.builds()?),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
@@ -244,6 +248,22 @@ mod tests {
         assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Wall));
         assert!(!m.walkable(p(1, 1, 0)));
         assert_eq!(m.dig(p(1, 1, 0), DesignationKind::Dig).unwrap().stone, 1);
+    }
+
+    #[test]
+    fn furniture_on_floor_is_walkable_and_digs_back_to_stone() {
+        let mut m = Mountain::new(MountainId(0), 3, 3, 1, Tile::Floor);
+        let r = m.dig(p(1, 1, 0), DesignationKind::Bed).unwrap();
+        assert_eq!(r.stone, 0);
+        assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Bed));
+        assert!(m.walkable(p(1, 1, 0)));
+        assert_eq!(
+            m.dig(p(1, 1, 0), DesignationKind::Chair),
+            None,
+            "only on floor"
+        );
+        assert_eq!(m.dig(p(1, 1, 0), DesignationKind::Dig).unwrap().stone, 1);
+        assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Floor));
     }
 
     #[test]

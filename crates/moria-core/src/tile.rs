@@ -9,6 +9,10 @@ pub enum Tile {
     Stair,
     /// Built by dwarves from stone; dug back like rock.
     Wall,
+    /// Stone furniture: walkable, dug back to floor for its stone.
+    Bed,
+    Table,
+    Chair,
 }
 
 #[derive(
@@ -32,8 +36,11 @@ impl Resources {
 pub enum DesignationKind {
     Dig,
     Stairs,
-    /// Build a wall on a floor tile; costs 1 stone.
+    /// Build a wall on a floor tile; costs 1 stone. So does each piece of furniture.
     Wall,
+    Bed,
+    Table,
+    Chair,
 }
 
 impl DesignationKind {
@@ -42,7 +49,18 @@ impl DesignationKind {
         match self {
             Self::Dig => Self::Stairs,
             Self::Stairs => Self::Wall,
-            Self::Wall => Self::Dig,
+            Self::Wall | Self::Bed | Self::Table | Self::Chair => Self::Dig,
+        }
+    }
+
+    /// The tile this kind builds on floor (for 1 stone); `None` for digging kinds.
+    pub fn builds(self) -> Option<Tile> {
+        match self {
+            Self::Dig | Self::Stairs => None,
+            Self::Wall => Some(Tile::Wall),
+            Self::Bed => Some(Tile::Bed),
+            Self::Table => Some(Tile::Table),
+            Self::Chair => Some(Tile::Chair),
         }
     }
 }
@@ -52,9 +70,13 @@ impl Tile {
         matches!(self, Tile::Rock | Tile::Gold | Tile::Mithril | Tile::Wall)
     }
 
+    pub fn is_furniture(self) -> bool {
+        matches!(self, Tile::Bed | Tile::Table | Tile::Chair)
+    }
+
     pub fn dig_ticks(self) -> u16 {
         match self {
-            Tile::Rock | Tile::Wall => 10,
+            Tile::Rock | Tile::Wall | Tile::Bed | Tile::Table | Tile::Chair => 10,
             Tile::Gold => 15,
             Tile::Mithril => 25,
             Tile::Floor | Tile::Stair => 0,
@@ -64,7 +86,7 @@ impl Tile {
     pub fn yield_(self) -> Resources {
         let mut r = Resources::default();
         match self {
-            Tile::Rock | Tile::Wall => r.stone = 1,
+            Tile::Rock | Tile::Wall | Tile::Bed | Tile::Table | Tile::Chair => r.stone = 1,
             Tile::Gold => r.gold = 1,
             Tile::Mithril => r.mithril = 1,
             Tile::Floor | Tile::Stair => {}

@@ -90,7 +90,12 @@ pub struct Game {
 }
 
 /// Everything the player can build: mode, label, stone cost.
-pub const BUILDS: &[(DesignationKind, &str, u32)] = &[(DesignationKind::Wall, "Mur", 1)];
+pub const BUILDS: &[(DesignationKind, &str, u32)] = &[
+    (DesignationKind::Wall, "Mur", 1),
+    (DesignationKind::Bed, "Lit", 1),
+    (DesignationKind::Table, "Table", 1),
+    (DesignationKind::Chair, "Chaise", 1),
+];
 
 impl Game {
     /// Moves the build-menu highlight by one row, wrapping.
@@ -211,17 +216,19 @@ impl Game {
         None
     }
 
-    /// Hero action toward the last move direction: dig a solid tile, or in Wall mode build
-    /// on floor (with stone).
+    /// Hero action toward the last move direction: in a build mode build on floor (with
+    /// stone), else dig a solid tile or furniture.
     pub fn dig(&self) -> Option<ClientMsg> {
         let target = self.hero.pos.step(self.last_dir);
-        if self.mountain.get(target)?.is_solid() {
-            Some(ClientMsg::Dig(self.last_dir))
+        if self.mode.builds().is_some()
+            && self.mountain.diggable(target, self.mode)
+            && self.resources.stone > 0
+        {
+            Some(ClientMsg::Build(self.last_dir, self.mode))
         } else {
-            (self.mode == DesignationKind::Wall
-                && self.mountain.diggable(target, DesignationKind::Wall)
-                && self.resources.stone > 0)
-                .then_some(ClientMsg::Build(self.last_dir))
+            self.mountain
+                .diggable(target, DesignationKind::Dig)
+                .then_some(ClientMsg::Dig(self.last_dir))
         }
     }
 }
@@ -547,9 +554,22 @@ mod tests {
         g.mode = DesignationKind::Wall;
         assert_eq!(g.dig(), None);
         g.resources.stone = 1;
-        assert_eq!(g.dig(), Some(ClientMsg::Build(Dir::E)));
+        assert_eq!(
+            g.dig(),
+            Some(ClientMsg::Build(Dir::E, DesignationKind::Wall))
+        );
         g.last_dir = Dir::N; // rock: Wall mode still digs
         assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::N)));
+        // Furniture is built the same way, and dug back from any mode but a build on floor.
+        g.mode = DesignationKind::Bed;
+        g.last_dir = Dir::E;
+        assert_eq!(
+            g.dig(),
+            Some(ClientMsg::Build(Dir::E, DesignationKind::Bed))
+        );
+        g.mountain
+            .set(g.hero.pos.step(Dir::E), moria_core::Tile::Bed);
+        assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::E)));
     }
 
     #[test]
