@@ -1,7 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Tile {
+/// One variant list feeds both the enum and `Tile::ALL`, so `ALL` cannot miss a variant.
+/// Variant order is the postcard wire encoding: only ever append.
+macro_rules! tiles {
+    ($($(#[$m:meta])* $v:ident),* $(,)?) => {
+        #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum Tile {
+            $($(#[$m])* $v),*
+        }
+
+        impl Tile {
+            /// Every variant, in declaration order.
+            pub const ALL: [Tile; [$(Tile::$v),*].len()] = [$(Tile::$v),*];
+        }
+    };
+}
+
+tiles! {
     Rock,
     Gold,
     Mithril,
@@ -23,30 +38,6 @@ pub enum Tile {
     WoodBed,
     WoodTable,
     WoodChair,
-}
-
-impl Tile {
-    /// Every variant; `all_is_complete` fails when a variant is added and this is not updated.
-    pub const ALL: [Tile; 18] = [
-        Tile::Rock,
-        Tile::Gold,
-        Tile::Mithril,
-        Tile::Floor,
-        Tile::Stair,
-        Tile::Wall,
-        Tile::Bed,
-        Tile::Table,
-        Tile::Chair,
-        Tile::Grass,
-        Tile::Tree,
-        Tile::Water,
-        Tile::Slope,
-        Tile::Soil,
-        Tile::Sky,
-        Tile::WoodBed,
-        Tile::WoodTable,
-        Tile::WoodChair,
-    ];
 }
 
 #[derive(
@@ -202,36 +193,18 @@ impl Tile {
 mod tests {
     use super::*;
 
-    /// Exhaustive, no wildcard: a new variant breaks the build here, and the new arm's
-    /// index then disagrees with `Tile::ALL` until it is added there too.
-    fn index(t: Tile) -> usize {
-        match t {
-            Tile::Rock => 0,
-            Tile::Gold => 1,
-            Tile::Mithril => 2,
-            Tile::Floor => 3,
-            Tile::Stair => 4,
-            Tile::Wall => 5,
-            Tile::Bed => 6,
-            Tile::Table => 7,
-            Tile::Chair => 8,
-            Tile::Grass => 9,
-            Tile::Tree => 10,
-            Tile::Water => 11,
-            Tile::Slope => 12,
-            Tile::Soil => 13,
-            Tile::Sky => 14,
-            Tile::WoodBed => 15,
-            Tile::WoodTable => 16,
-            Tile::WoodChair => 17,
-        }
+    #[test]
+    fn all_is_sane_and_unique() {
+        assert_eq!(Tile::ALL[0], Tile::Rock);
+        let set: std::collections::HashSet<_> = Tile::ALL.iter().collect();
+        assert_eq!(set.len(), Tile::ALL.len());
     }
 
     #[test]
-    fn all_is_complete() {
-        for (i, &t) in Tile::ALL.iter().enumerate() {
-            assert_eq!(index(t), i, "{t:?} out of place in Tile::ALL");
-        }
+    fn wire_encoding_is_unchanged() {
+        // Water is the 12th variant (index 11) since the save format v2.
+        assert_eq!(postcard::to_allocvec(&Tile::Water).unwrap(), [11]);
+        assert_eq!(postcard::to_allocvec(&Tile::WoodChair).unwrap(), [17]);
     }
 
     #[test]
