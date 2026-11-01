@@ -62,6 +62,7 @@ fn english(fr: &str) -> Option<&'static str> {
         "Charbon" => "Coal",
         "Lingots" => "Ingots",
         "Portes en fer" => "Iron doors",
+        "Nourriture" => "Food",
         "pierre" => "stone",
         "bois" => "wood",
         "or" => "gold",
