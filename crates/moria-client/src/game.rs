@@ -95,7 +95,8 @@ pub fn level_label(z: u8) -> String {
     }
 }
 
-/// Each resource with its French name.
+/// Each resource a recipe can cost, with its name inside a sentence ("1 porte en fer forgée").
+/// Not built from `resource_bar`: the bar uses short capitalised titles, and mithril is never a cost.
 fn named(r: Resources) -> [(u32, &'static str); 7] {
     [
         (r.stone, "pierre"),
@@ -627,6 +628,8 @@ pub(crate) mod tests {
     use moria_core::srd::{Abilities, Class, Race, roll_abilities};
     use moria_core::{DwarfId, MountainId, Tile};
 
+    /// The full `Resources` literal is the point: a new resource stops this from compiling
+    /// until it gets a place on the bar.
     #[test]
     fn resource_bar_shows_every_resource_in_order() {
         let r = Resources {

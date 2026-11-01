@@ -50,6 +50,7 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (top_bar, hud, action_bar, build_menu, order_menu, status)
+                    .chain()
                     .run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
@@ -408,7 +409,7 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
     let h = &g.hero;
     egui::Window::new("Statut")
         .title_bar(false)
-        .anchor(egui::Align2::RIGHT_TOP, [-8.0, BELOW_BAR])
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, below_bar(ctx)])
         .resizable(false)
         .show(ctx, |ui| {
             ui.heading(format!("Statut — {}", h.name));
@@ -445,51 +446,70 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
         });
 }
 
-/// Top margin of the corner windows, so they do not cover the resource bar.
-const BELOW_BAR: f32 = 32.0;
+/// Where `bar_window` leaves the bar's bottom edge, in egui's temp memory.
+const BAR_BOTTOM: &str = "barre_bas";
+
+/// Top margin of the corner windows: 8 pt under the bar as last drawn.
+fn below_bar(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(egui::Id::new(BAR_BOTTOM)))
+        .unwrap_or(0.0)
+        + 8.0
+}
+
+fn top_bar(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game {
+        bar_window(ctx.ctx_mut()?, g);
+    }
+    Ok(())
+}
 
 /// Full-width bar on top, StarCraft style: resources on the left, dwarves and clock on the right.
-/// An `Area`, not a `Panel`: egui then counts the pointer as over it, so clicks do not reach the map.
-fn top_bar(mut ctx: EguiContexts, client: Res<Client>) -> Result {
-    let Some(g) = &client.session.game else {
-        return Ok(());
-    };
-    let ctx = ctx.ctx_mut()?;
-    let width = ctx.content_rect().width();
-    egui::Area::new("ressources".into())
+/// Resources wrap on narrow screens; the bar's rect is returned and its bottom remembered.
+fn bar_window(ctx: &egui::Context, g: &Game) -> egui::Rect {
+    let width = (ctx.content_rect().width() - 16.0).max(0.0); // the frame's 8 pt side margins
+    let rect = egui::Area::new("ressources".into())
+        .order(egui::Order::Foreground) // stays over the menus on very short screens
         .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
         .show(ctx, |ui| {
             egui::Frame::side_top_panel(&ctx.global_style()).show(ui, |ui| {
-                ui.set_width(width - 16.0); // the frame's 8 px side margins
-                ui.horizontal(|ui| {
-                    for (n, what, [r, gr, b]) in resource_bar(g.resources) {
-                        let swatch = egui::Color32::from_rgb(r, gr, b);
-                        ui.label(egui::RichText::new("■").color(swatch));
-                        ui.label(egui::RichText::new(format!("{what} {n}")).strong());
-                        ui.add_space(12.0);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(clock_label(g.tick));
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("Nains {}", g.dwarves.len())).strong(),
-                        );
+                ui.set_width(width);
+                // Right group first, so the resources only get the space left of it.
+                // One row tall to start, like `ui.horizontal`: `with_layout` would take the whole screen height.
+                let row = egui::vec2(width, ui.spacing().interact_size.y);
+                let rtl = egui::Layout::right_to_left(egui::Align::Min);
+                ui.allocate_ui_with_layout(row, rtl, |ui| {
+                    ui.label(clock_label(g.tick));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(format!("Nains {}", g.dwarves.len())).strong());
+                    ui.add_space(24.0);
+                    let wrap = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
+                    ui.with_layout(wrap, |ui| {
+                        for (n, what, [r, gr, b]) in resource_bar(g.resources) {
+                            let swatch = egui::Color32::from_rgb(r, gr, b);
+                            ui.label(egui::RichText::new("■").color(swatch));
+                            ui.label(egui::RichText::new(format!("{what} {n}")).strong());
+                            ui.add_space(12.0);
+                        }
                     });
                 });
             });
-        });
-    Ok(())
+        })
+        .response
+        .rect;
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(BAR_BOTTOM), rect.bottom()));
+    rect
 }
 
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
     };
+    let ctx = ctx.ctx_mut()?;
     egui::Window::new("hud")
         .title_bar(false)
         .resizable(false)
-        .anchor(egui::Align2::LEFT_TOP, [8.0, BELOW_BAR])
-        .show(ctx.ctx_mut()?, |ui| {
+        .anchor(egui::Align2::LEFT_TOP, [8.0, below_bar(ctx)])
+        .show(ctx, |ui| {
             let level = level_label(g.current_z());
             if g.browse_z.is_some() {
                 ui.label(format!("{level} (héros : {})", level_label(g.hero.pos.z)));
@@ -634,6 +654,48 @@ mod tests {
             assert_eq!(ctx.memory(|m| m.focused()), None);
         }
         assert!(g.status);
+    }
+
+    /// Draws the bar twice on a `w`-pt-wide screen, the pointer over it the second time.
+    fn draw_bar(g: &Game, w: f32) -> (egui::Context, egui::Rect) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 400.0));
+        let mut bar = egui::Rect::NOTHING;
+        for pointer in [None, Some(egui::pos2(w / 2.0, 10.0))] {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: pointer.map(egui::Event::PointerMoved).into_iter().collect(),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| bar = bar_window(ui.ctx(), g))
+                .textures_delta
+                .clear();
+        }
+        (ctx, bar)
+    }
+
+    #[test]
+    fn top_bar_is_one_row_on_wide_screens() {
+        let (_, bar) = draw_bar(&crate::game::tests::game(), 1600.0);
+        assert!(bar.height() < 30.0, "{bar:?}");
+        assert_eq!(bar.width(), 1600.0);
+    }
+
+    #[test]
+    fn top_bar_fits_narrow_screens_and_swallows_clicks() {
+        let mut g = crate::game::tests::game();
+        g.resources.iron_ore = 12345;
+        let (ctx, bar) = draw_bar(&g, 600.0);
+        // Wraps instead of running off the screen.
+        assert!(bar.right() <= 600.0, "{bar:?}");
+        assert!(
+            bar.height() > 30.0 && bar.height() < 100.0,
+            "a few rows: {bar:?}"
+        );
+        // The corner windows start under the bar, however tall it gets.
+        assert_eq!(below_bar(&ctx), bar.bottom() + 8.0);
+        // A click on the bar is egui's, not the map's.
+        assert!(ctx.is_pointer_over_egui());
     }
 
     /// All text painted by `order_window` for a forge east of the hero.
