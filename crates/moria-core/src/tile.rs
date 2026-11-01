@@ -31,7 +31,7 @@ tiles! {
     Grass,
     Tree,
     Water,
-    /// Hillside: walkable; digging it flattens it to floor.
+    /// Hillside: walkable; digging it flattens it to bare ground, unless it is a hill's last way down.
     Slope,
     Soil,
     Sky,
@@ -139,6 +139,11 @@ impl Tile {
             self,
             Tile::Rock | Tile::Gold | Tile::Mithril | Tile::Wall | Tile::Soil | Tile::Tree
         ) || self.is_furniture()
+    }
+
+    /// Plain solid mass: stairs cut into it and it casts a cliff edge. Not trees or furniture.
+    pub fn is_stone(self) -> bool {
+        self.is_solid() && self != Tile::Tree && !self.is_furniture()
     }
 
     pub fn is_floor_like(self) -> bool {
@@ -303,6 +308,13 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((r.wood, r.stone), (0, 0));
+    }
+
+    #[test]
+    fn stone_is_solid_but_not_tree_or_furniture() {
+        let stone: Vec<_> = Tile::ALL.into_iter().filter(|t| t.is_stone()).collect();
+        use Tile::*;
+        assert_eq!(stone, [Rock, Gold, Mithril, Wall, Soil]);
     }
 
     #[test]

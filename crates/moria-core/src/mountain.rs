@@ -1,12 +1,14 @@
 use crate::{DesignationKind, Dir, MountainId, Resources, Tile, TilePos};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub const MOUNTAIN_W: i16 = 176;
 pub const MOUNTAIN_H: i16 = 96;
 pub const MOUNTAIN_D: u8 = 12;
 /// Surface level: z below it is sky, z above it is underground (z grows downward).
 pub const GROUND_Z: u8 = 4;
+/// Most designations one mountain holds: bounds the AI view (NATS payload) and its solver.
+pub const MAX_DESIGNATIONS: usize = 4096;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Mountain {
@@ -104,6 +106,48 @@ impl Mountain {
         None
     }
 
+    /// The bare ground digging leaves at `p`: grass outdoors (sky above, soil below), else floor.
+    pub fn ground_at(&self, p: TilePos) -> Tile {
+        let outdoors = p.z > 0
+            && self.get(p.step(Dir::Up)) == Some(Tile::Sky)
+            && self.get(p.step(Dir::Down)) == Some(Tile::Soil);
+        if outdoors { Tile::Grass } else { Tile::Floor }
+    }
+
+    /// Whether the tile above `p` has a way down off a hill that needs `p` solid under it.
+    fn holds_up_a_way_down(&self, p: TilePos) -> bool {
+        let up = p.step(Dir::Up);
+        up != p
+            && Dir::HORIZONTAL
+                .iter()
+                .any(|&d| self.move_dest(up, d).is_some_and(|q| q.z > up.z))
+    }
+
+    /// Whether the slope `p` is the only way from the high ground it leads to back down to
+    /// its level: a search over that high ground that never steps onto `p`.
+    fn is_last_way_down(&self, p: TilePos) -> bool {
+        let mut todo: Vec<TilePos> = Dir::HORIZONTAL
+            .iter()
+            .filter_map(|&d| self.move_dest(p, d))
+            .filter(|q| q.z < p.z)
+            .collect();
+        let mut seen: HashSet<TilePos> = todo.iter().copied().collect();
+        while let Some(q) = todo.pop() {
+            if q.z >= p.z {
+                return false;
+            }
+            for d in [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down] {
+                if let Some(n) = self.move_dest(q, d)
+                    && n != p
+                    && seen.insert(n)
+                {
+                    todo.push(n);
+                }
+            }
+        }
+        !seen.is_empty()
+    }
+
     pub fn can_move(&self, from: TilePos, dir: Dir) -> bool {
         self.move_dest(from, dir).is_some()
     }
@@ -113,9 +157,14 @@ impl Mountain {
         use DesignationKind as K;
         let Some(t) = self.get(p) else { return false };
         match kind {
-            K::Dig => (t.is_solid() && t != Tile::Tree) || t == Tile::Slope,
+            // Never strand someone on a hill: keep its last slope and the ground under its exits.
+            K::Dig => {
+                ((t.is_solid() && t != Tile::Tree)
+                    || (t == Tile::Slope && !self.is_last_way_down(p)))
+                    && !self.holds_up_a_way_down(p)
+            }
             K::Chop => t == Tile::Tree,
-            K::Stairs => stairs_ok(t) && p.z + 1 < self.d,
+            K::Stairs => stairs_ok(t) && p.z + 1 < self.d && !self.holds_up_a_way_down(p),
             _ => t.is_floor_like(), // builds
         }
     }
@@ -137,7 +186,8 @@ impl Mountain {
     pub fn designate(&mut self, a: TilePos, b: TilePos, kind: DesignationKind) -> usize {
         let mut n = 0;
         for p in self.rect(a, b) {
-            if self.diggable(p, kind) {
+            let full = self.designations.len() >= MAX_DESIGNATIONS;
+            if self.diggable(p, kind) && !(full && !self.designations.contains_key(&p)) {
                 self.designations.insert(p, kind);
                 n += 1;
             }
@@ -162,7 +212,7 @@ impl Mountain {
         }
         let mut res = self.get(p)?.yield_();
         match kind {
-            DesignationKind::Dig => self.set(p, Tile::Floor),
+            DesignationKind::Dig => self.set(p, self.ground_at(p)),
             DesignationKind::Chop => self.set(p, Tile::Grass),
             // The stone cost is paid by the caller, which holds the resources.
             DesignationKind::Wall
@@ -188,9 +238,9 @@ impl Mountain {
     }
 }
 
-/// Stairs can be cut into plain stone (not trees or furniture) or built on a floor.
+/// Stairs can be cut into stone or built on a floor.
 fn stairs_ok(t: Tile) -> bool {
-    (t.is_solid() && t != Tile::Tree && !t.is_furniture()) || t.is_floor_like()
+    t.is_stone() || t.is_floor_like()
 }
 
 #[cfg(test)]
@@ -443,12 +493,74 @@ mod tests {
     }
 
     #[test]
-    fn dig_slope_and_soil_give_floor() {
+    fn last_slope_down_cannot_be_dug() {
         let mut m = hill();
+        assert!(!m.diggable(p(5, 5, 2), DesignationKind::Dig));
+        // A second slope (south side) leads to the same hilltop: either may go.
+        m.set(p(6, 4, 2), Tile::Slope);
+        assert_eq!(m.move_dest(p(6, 4, 2), Dir::S), Some(p(6, 5, 1)));
+        assert!(m.diggable(p(5, 5, 2), DesignationKind::Dig));
         assert!(m.dig(p(5, 5, 2), DesignationKind::Dig).is_some());
-        assert_eq!(m.get(p(5, 5, 2)), Some(Tile::Floor));
-        assert!(m.dig(p(6, 5, 2), DesignationKind::Dig).is_some());
-        assert_eq!(m.get(p(6, 5, 2)), Some(Tile::Floor));
+        assert!(!m.diggable(p(6, 4, 2), DesignationKind::Dig));
+        // A slope leading nowhere up is plain ground.
+        m.set(p(1, 1, 2), Tile::Slope);
+        assert!(m.diggable(p(1, 1, 2), DesignationKind::Dig));
+    }
+
+    #[test]
+    fn hilltop_way_down_keeps_its_ground() {
+        let mut m = hill();
+        for k in [DesignationKind::Dig, DesignationKind::Stairs] {
+            assert!(!m.diggable(p(6, 5, 2), k), "{k:?}");
+            // The slope-less hill's top has no way down to lose.
+            assert!(m.diggable(p(6, 7, 2), k), "{k:?}");
+        }
+        assert_eq!(m.designate(p(6, 5, 2), p(6, 5, 2), DesignationKind::Dig), 0);
+        assert_eq!(m.dig(p(6, 5, 2), DesignationKind::Dig), None);
+        // Interior: digging under a floor stays allowed.
+        let mut r = rock();
+        r.set(p(1, 1, 0), Tile::Floor);
+        assert!(r.diggable(p(1, 1, 1), DesignationKind::Dig));
+    }
+
+    #[test]
+    fn dug_ground_is_grass_outdoors_floor_indoors() {
+        // z0 sky, z1 grass/rock surface, z2 soil/rock, z3 rock.
+        let mut m = Mountain::new(MountainId(0), 4, 1, 4, Tile::Rock);
+        for x in 0..4 {
+            m.set(p(x, 0, 0), Tile::Sky);
+        }
+        m.set(p(0, 0, 1), Tile::Grass);
+        m.set(p(0, 0, 2), Tile::Soil);
+        m.set(p(1, 0, 1), Tile::Slope);
+        m.set(p(1, 0, 2), Tile::Soil);
+        m.set(p(2, 0, 1), Tile::Floor);
+        // Furniture built on grass goes back to grass.
+        m.dig(p(0, 0, 1), DesignationKind::WoodTable).unwrap();
+        m.dig(p(0, 0, 1), DesignationKind::Dig).unwrap();
+        assert_eq!(m.get(p(0, 0, 1)), Some(Tile::Grass));
+        assert_eq!(m.ground_at(p(1, 0, 1)), Tile::Grass);
+        // Rock surface (rock below): floor. Underground: floor.
+        m.dig(p(2, 0, 1), DesignationKind::Bed).unwrap();
+        m.dig(p(2, 0, 1), DesignationKind::Dig).unwrap();
+        assert_eq!(m.get(p(2, 0, 1)), Some(Tile::Floor));
+        m.dig(p(3, 0, 1), DesignationKind::Dig).unwrap();
+        assert_eq!(m.get(p(3, 0, 1)), Some(Tile::Floor));
+        m.dig(p(0, 0, 2), DesignationKind::Dig).unwrap();
+        assert_eq!(m.get(p(0, 0, 2)), Some(Tile::Floor));
+        assert_eq!(m.ground_at(p(0, 0, 0)), Tile::Floor);
+    }
+
+    #[test]
+    fn designations_are_capped() {
+        let mut m = Mountain::new(MountainId(0), 100, 100, 2, Tile::Rock);
+        let all = m.designate(p(0, 0, 0), p(99, 99, 0), DesignationKind::Dig);
+        assert_eq!(all, MAX_DESIGNATIONS);
+        assert_eq!(m.designations.len(), MAX_DESIGNATIONS);
+        // Re-designating an existing tile still works when full.
+        let first = *m.designations.keys().next().unwrap();
+        assert_eq!(m.designate(first, first, DesignationKind::Stairs), 1);
+        assert_eq!(m.designations[&first], DesignationKind::Stairs);
     }
 
     #[test]
