@@ -11,6 +11,9 @@ services:
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
     image: moria-worldgen:local
+    # build : Portainer (auto-update GitOps sur main) reconstruit à chaque déploiement
+    # au lieu de réutiliser l'ancienne image :local.
+    pull_policy: build
     build:
       <<: *build
       args: { BIN: moria-worldgen }
@@ -20,6 +23,7 @@ services:
 
   server:
     image: moria-server:local
+    pull_policy: build
     build:
       <<: *build
       args: { BIN: moria-server }
@@ -38,6 +42,7 @@ services:
 
   dwarf-ai:
     image: moria-dwarf-ai:local
+    pull_policy: build
     build:
       <<: *build
       args: { BIN: moria-dwarf-ai }
