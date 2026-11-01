@@ -124,11 +124,13 @@ mod tests {
         ] {
             let data = pixels(tile);
             assert_eq!(data.len(), rock.len());
-            assert!(data.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             if matches!(tile, Tile::Gold | Tile::Mithril) {
                 let same = data
-                    .chunks_exact(4)
-                    .zip(rock.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(rock.as_chunks::<4>().0.iter())
                     .filter(|(a, b)| a == b)
                     .count();
                 assert!(same > 96 * 96 / 2, "ore should be a vein in rock");

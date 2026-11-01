@@ -21,6 +21,16 @@ fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
         Tile::Bed => (art.bed.clone(), Color::WHITE),
         Tile::Table => (art.table.clone(), Color::WHITE),
         Tile::Chair => (art.chair.clone(), Color::WHITE),
+        // Placeholders (tinted indoor textures); Task 7 draws the real ones.
+        Tile::Grass => (art.floor.clone(), Color::srgb(0.4, 0.8, 0.3)),
+        Tile::Tree => (art.wall.clone(), Color::srgb(0.1, 0.5, 0.15)),
+        Tile::Water => (art.floor.clone(), Color::srgb(0.2, 0.4, 0.9)),
+        Tile::Slope => (art.floor.clone(), Color::srgb(0.6, 0.55, 0.3)),
+        Tile::Soil => (art.rock.clone(), Color::srgb(0.7, 0.5, 0.3)),
+        Tile::Sky => (art.floor.clone(), Color::srgb(0.5, 0.7, 1.0)),
+        Tile::WoodBed => (art.bed.clone(), Color::srgb(0.9, 0.7, 0.4)),
+        Tile::WoodTable => (art.table.clone(), Color::srgb(0.9, 0.7, 0.4)),
+        Tile::WoodChair => (art.chair.clone(), Color::srgb(0.9, 0.7, 0.4)),
     }
 }
 
@@ -268,9 +278,13 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),
             DesignationKind::Wall => Color::srgb(1.0, 0.5, 0.2),
-            DesignationKind::Bed | DesignationKind::Table | DesignationKind::Chair => {
-                Color::srgb(0.7, 0.45, 1.0)
-            }
+            DesignationKind::Chop => Color::srgb(0.3, 0.9, 0.3),
+            DesignationKind::Bed
+            | DesignationKind::Table
+            | DesignationKind::Chair
+            | DesignationKind::WoodBed
+            | DesignationKind::WoodTable
+            | DesignationKind::WoodChair => Color::srgb(0.7, 0.45, 1.0),
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }

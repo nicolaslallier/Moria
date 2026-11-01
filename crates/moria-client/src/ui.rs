@@ -310,6 +310,10 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 DesignationKind::Bed => "Mode : Lit (1 pierre)",
                 DesignationKind::Table => "Mode : Table (1 pierre)",
                 DesignationKind::Chair => "Mode : Chaise (1 pierre)",
+                DesignationKind::Chop => "Mode : Abattre",
+                DesignationKind::WoodBed => "Mode : Lit en bois (3 bois)",
+                DesignationKind::WoodTable => "Mode : Table en bois (4 bois)",
+                DesignationKind::WoodChair => "Mode : Chaise en bois (2 bois)",
             });
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \

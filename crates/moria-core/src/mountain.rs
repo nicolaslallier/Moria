@@ -132,12 +132,16 @@ impl Mountain {
         }
         let mut res = self.get(p)?.yield_();
         match kind {
-            DesignationKind::Dig => self.set(p, Tile::Floor),
+            // Chop/Slope/tree behaviour arrives in Task 3.
+            DesignationKind::Dig | DesignationKind::Chop => self.set(p, Tile::Floor),
             // The stone cost is paid by the caller, which holds the resources.
             DesignationKind::Wall
             | DesignationKind::Bed
             | DesignationKind::Table
-            | DesignationKind::Chair => self.set(p, kind.builds()?),
+            | DesignationKind::Chair
+            | DesignationKind::WoodBed
+            | DesignationKind::WoodTable
+            | DesignationKind::WoodChair => self.set(p, kind.builds()?),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
@@ -177,7 +181,8 @@ mod tests {
             Resources {
                 stone: 1,
                 gold: 0,
-                mithril: 0
+                mithril: 0,
+                wood: 0
             }
         );
         assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Floor));
