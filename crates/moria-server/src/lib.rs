@@ -12,7 +12,7 @@ use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, Hero, World};
-use moria_core::{DesignationKind, MountainId, PlayerId, TilePos};
+use moria_core::{MountainId, PlayerId, TilePos};
 use sim::{Changes, Command};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -500,9 +500,7 @@ impl State {
         // ponytail: all-or-nothing; with 1 spare stone the AI may still pick several walls
         // (the server keeps one). Send the spare count in AiView if that ever matters.
         if sim::spare_stone(f) == 0 {
-            mountain
-                .designations
-                .retain(|_, k| *k != DesignationKind::Wall);
+            mountain.designations.retain(|_, k| k.builds().is_none());
         }
         let view = AiView {
             mountain,

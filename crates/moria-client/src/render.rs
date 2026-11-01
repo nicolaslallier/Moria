@@ -18,6 +18,9 @@ fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
         Tile::Mithril => (art.mithril.clone(), Color::WHITE),
         Tile::Stair => (art.stair.clone(), Color::WHITE),
         Tile::Wall => (art.wall.clone(), Color::WHITE),
+        Tile::Bed => (art.bed.clone(), Color::WHITE),
+        Tile::Table => (art.table.clone(), Color::WHITE),
+        Tile::Chair => (art.chair.clone(), Color::WHITE),
     }
 }
 
@@ -265,6 +268,9 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),
             DesignationKind::Wall => Color::srgb(1.0, 0.5, 0.2),
+            DesignationKind::Bed | DesignationKind::Table | DesignationKind::Chair => {
+                Color::srgb(0.7, 0.45, 1.0)
+            }
         };
         gizmos.rect_2d(to_world(p.x, p.y), Vec2::splat(TILE - 2.0), color);
     }
