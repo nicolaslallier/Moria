@@ -90,6 +90,14 @@ impl Resources {
         self.food = self.food.saturating_add(o.food);
     }
 
+    /// `(add, take)`: per field, the gain and the loss going from `before` to `after`.
+    pub fn delta(before: &Resources, after: &Resources) -> (Resources, Resources) {
+        let (mut add, mut take) = (*after, *before);
+        add.take(before);
+        take.take(after);
+        (add, take)
+    }
+
     pub fn covers(&self, c: &Resources) -> bool {
         self.stone >= c.stone
             && self.gold >= c.gold
@@ -403,6 +411,35 @@ impl Tile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_splits_gains_and_losses() {
+        let before = Resources {
+            stone: 5,
+            wood: 1,
+            ..Default::default()
+        };
+        let after = Resources {
+            stone: 2,
+            wood: 4,
+            ..Default::default()
+        };
+        let (add, take) = Resources::delta(&before, &after);
+        assert_eq!(
+            add,
+            Resources {
+                wood: 3,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            take,
+            Resources {
+                stone: 3,
+                ..Default::default()
+            }
+        );
+    }
 
     #[test]
     fn all_is_sane_and_unique() {

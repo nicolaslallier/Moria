@@ -1,6 +1,6 @@
 FROM rust:1.98-bookworm AS build
 ARG BIN
-RUN test -n "$BIN" || { echo "ARG BIN est vide (moria-server, moria-dwarf-ai ou moria-worldgen)" >&2; exit 1; }
+RUN test -n "$BIN" || { echo "ARG BIN est vide (moria-server, moria-dwarf-ai, moria-inventory ou moria-worldgen)" >&2; exit 1; }
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p "$BIN" && cp "target/release/$BIN" /moria

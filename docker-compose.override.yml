@@ -1,5 +1,6 @@
 # Dev local uniquement (chargé automatiquement par `docker compose`, ignoré par Portainer
 # qui passe le fichier explicitement) : construit les images depuis les sources.
+x-amqp: &amqp { AMQP_URL: "amqp://guest:guest@rabbitmq:5672/%2f" }
 x-build: &build
   context: .
   dockerfile: docker/Dockerfile
@@ -11,6 +12,19 @@ services:
   server:
     image: moria-server:local
     build: { <<: *build, args: { BIN: moria-server } }
+    environment: *amqp
   dwarf-ai:
     image: moria-dwarf-ai:local
     build: { <<: *build, args: { BIN: moria-dwarf-ai } }
+    environment: *amqp
+    networks: [default]
+  inventory:
+    image: moria-inventory:local
+    build: { <<: *build, args: { BIN: moria-inventory } }
+    environment: *amqp
+    networks: [default]
+
+  # Pas d'Infra en local : broker jetable, compte guest sur le vhost par défaut.
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    restart: unless-stopped

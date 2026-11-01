@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 moria-core = { path = "../moria-core", features = ["tokio"] }
 tokio.workspace = true
-async-nats.workspace = true
+moria-bus = { path = "../moria-bus" }
 argon2.workspace = true
 postcard.workspace = true
 anyhow.workspace = true
@@ -16,3 +16,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 moria-dwarf-ai = { path = "../moria-dwarf-ai" }
+moria-inventory = { path = "../moria-inventory" }

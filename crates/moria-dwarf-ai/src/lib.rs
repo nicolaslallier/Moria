@@ -1,68 +1,126 @@
 pub mod assign;
 
 use futures::StreamExt;
-use moria_core::ai::{AiView, Assignments, SUBJECT_ASSIGN, SUBJECT_VIEW};
+use moria_bus::{Bus, Queue};
+use moria_core::ai::{AiView, Assignments, KEY_ASSIGN, KEY_VIEW};
 use std::{future::Future, time::Duration};
 
-/// Connect (retrying forever, 2 s backoff) and serve views until `shutdown` resolves.
-pub async fn run(nats_url: String, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Continue,
+    Reconnect,
+}
+
+/// Any publish error (dead channel included) forces a fresh connection.
+fn next_step(publish: Result<(), anyhow::Error>) -> Step {
+    match publish {
+        Ok(()) => Step::Continue,
+        Err(_) => Step::Reconnect,
+    }
+}
+
+/// Serve views until `shutdown` resolves; reconnects (2 s backoff) whenever the bus drops.
+pub async fn run(amqp_url: String, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
-    let client = loop {
-        tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            r = async_nats::connect(&nats_url) => match r {
-                Ok(c) => break c,
-                Err(e) => tracing::warn!("NATS indisponible ({e}), nouvel essai dans 2 s"),
-            },
-        }
-        tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-        }
-    };
-    let mut sub = client
-        .queue_subscribe(SUBJECT_VIEW, "dwarf-ai".into())
-        .await?;
-    tracing::info!("dwarf-ai connecte a {nats_url}");
     loop {
-        let msg = tokio::select! {
+        let bus = tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            m = sub.next() => match m { Some(m) => m, None => anyhow::bail!("abonnement NATS termine") },
+            b = Bus::connect_forever(&amqp_url) => b,
         };
-        let view: AiView = match postcard::from_bytes(&msg.payload) {
-            Ok(v) => v,
+        let queue = Queue::Shared {
+            name: "dwarf-ai",
+            latest_only: true,
+        };
+        let mut sub = match bus.subscribe(KEY_VIEW, queue).await {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("vue illisible ignoree: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = assign::validate(&view) {
-            tracing::warn!("vue invalide ignoree: {e}");
-            continue;
-        }
-        let (mountain, tick) = (view.mountain.id, view.tick);
-        let list = match tokio::task::spawn_blocking(move || assign::assign(&view)).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("assignation echouee: {e}");
-                continue;
-            }
-        };
-        if list.is_empty() {
-            continue;
-        }
-        let out = Assignments {
-            mountain,
-            tick,
-            list,
-        };
-        match postcard::to_allocvec(&out) {
-            Ok(b) => {
-                if let Err(e) = client.publish(SUBJECT_ASSIGN, b.into()).await {
-                    tracing::warn!("publication echouee: {e}");
+                tracing::warn!("abonnement impossible ({e}), nouvel essai dans 2 s");
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
                 }
             }
-            Err(e) => tracing::error!("encodage impossible: {e}"),
+        };
+        tracing::info!("dwarf-ai connecte a RabbitMQ");
+        loop {
+            let payload = tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                m = sub.next() => match m {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!("abonnement termine, reconnexion");
+                        break;
+                    }
+                },
+            };
+            let view: AiView = match postcard::from_bytes(&payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("vue illisible ignoree: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = assign::validate(&view) {
+                tracing::warn!("vue invalide ignoree: {e}");
+                continue;
+            }
+            let (mountain, tick) = (view.mountain.id, view.tick);
+            let list = match tokio::task::spawn_blocking(move || assign::assign(&view)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("assignation echouee: {e}");
+                    continue;
+                }
+            };
+            if list.is_empty() {
+                continue;
+            }
+            let out = Assignments {
+                mountain,
+                tick,
+                list,
+            };
+            match postcard::to_allocvec(&out) {
+                Ok(b) => {
+                    let res = bus.publish(KEY_ASSIGN, b, false).await;
+                    if let Err(e) = &res {
+                        tracing::warn!("publication echouee ({e}), reconnexion dans 2 s");
+                    }
+                    if next_step(res) == Step::Reconnect {
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        }
+                        break;
+                    }
+                }
+                Err(e) => tracing::error!("encodage impossible: {e}"),
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Step, next_step};
+    use moria_core::ai::{KEY_ASSIGN, KEY_VIEW};
+
+    #[test]
+    fn publish_ok_continues() {
+        assert_eq!(next_step(Ok(())), Step::Continue);
+    }
+
+    #[test]
+    fn any_publish_error_reconnects() {
+        assert_eq!(
+            next_step(Err(anyhow::anyhow!("canal ferme"))),
+            Step::Reconnect
+        );
+    }
+
+    #[test]
+    fn keys_are_the_documented_ones() {
+        assert_eq!(KEY_VIEW, "ai.view");
+        assert_eq!(KEY_ASSIGN, "ai.assign");
     }
 }
