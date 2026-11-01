@@ -53,7 +53,7 @@ pub const MOONLIGHT: f32 = 0.12;
 
 /// Tiles that stop light (they still receive it).
 pub fn blocks_light(t: Tile) -> bool {
-    t.is_stone()
+    t.is_stone() || t.is_door()
 }
 
 /// Largest radius of a built light source.
@@ -67,6 +67,7 @@ pub fn light_radius(t: Tile) -> Option<u8> {
         Tile::Lamp | Tile::Stove => Some(6),
         Tile::Campfire => Some(7),
         Tile::Hearth => Some(8),
+        Tile::Forge => Some(4),
         _ => None,
     }
 }
@@ -107,7 +108,13 @@ impl LightMap {
 }
 
 /// True if the Bresenham line a -> b crosses a blocker strictly between its ends.
-fn blocked(m: &Mountain, z: u8, (x0, y0): (i16, i16), (x1, y1): (i16, i16)) -> bool {
+fn blocked(
+    m: &Mountain,
+    z: u8,
+    sources: &[(i16, i16, u8)],
+    (x0, y0): (i16, i16),
+    (x1, y1): (i16, i16),
+) -> bool {
     let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
     let (sx, sy) = ((x1 - x0).signum(), (y1 - y0).signum());
     let (mut x, mut y, mut err) = (x0, y0, dx + dy);
@@ -121,7 +128,12 @@ fn blocked(m: &Mountain, z: u8, (x0, y0): (i16, i16), (x1, y1): (i16, i16)) -> b
             err += dx;
             y += sy;
         }
-        if (x, y) != (x1, y1) && m.get(TilePos::new(x, y, z)).is_some_and(blocks_light) {
+        if (x, y) != (x1, y1)
+            && m.get(TilePos::new(x, y, z)).is_some_and(|t| {
+                // A door someone stands in (every body is a source) is open.
+                blocks_light(t) && !(t.is_door() && sources.iter().any(|s| (s.0, s.1) == (x, y)))
+            })
+        {
             return true;
         }
     }
@@ -182,7 +194,10 @@ pub fn light_map(
         for y in (sy - r).max(area.y0)..=(sy + r).min(area.y1) {
             for x in (sx - r).max(area.x0)..=(sx + r).min(area.x1) {
                 let d = f32::hypot((x - sx) as f32, (y - sy) as f32);
-                if d <= r as f32 && tile(x, y, z).is_some() && !blocked(m, z, (sx, sy), (x, y)) {
+                if d <= r as f32
+                    && tile(x, y, z).is_some()
+                    && !blocked(m, z, sources, (sx, sy), (x, y))
+                {
                     map.raise(x, y, if d <= (r - 1) as f32 { 1.0 } else { 0.5 });
                 }
             }
@@ -222,6 +237,24 @@ mod tests {
             x1: 19,
             y1: 19,
         }
+    }
+
+    #[test]
+    fn a_door_hides_the_room_unless_someone_stands_in_it() {
+        let mut m = Mountain::new(MountainId(0), 9, 1, 2, Tile::Floor);
+        m.set(TilePos::new(4, 0, 1), Tile::StoneDoor);
+        let area = Area {
+            x0: 0,
+            y0: 0,
+            x1: 8,
+            y1: 0,
+        };
+        let shut = light_map(&m, 1, area, &[(2, 0, 4)], 20_000);
+        assert!(shut.get(4, 0) > 0.0);
+        assert_eq!(shut.get(5, 0), 0.0);
+        let open = light_map(&m, 1, area, &[(2, 0, 4), (4, 0, 1)], 20_000);
+        assert!(open.get(6, 0) > 0.0);
+        assert_eq!(light_radius(Tile::Forge), Some(4));
     }
 
     #[test]

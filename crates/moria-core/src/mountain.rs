@@ -70,13 +70,30 @@ impl Mountain {
 
     pub fn walkable(&self, p: TilePos) -> bool {
         self.get(p).is_some_and(|t| {
-            t.is_floor_like() || matches!(t, Tile::Stair | Tile::Slope) || t.is_furniture()
+            !t.is_locked_door()
+                && (t.is_floor_like() || matches!(t, Tile::Stair | Tile::Slope) || t.is_furniture())
         })
     }
 
     /// Where a move from `from` toward `dir` ends up: stairs change level vertically, slopes
     /// change it horizontally (climb onto a hill, descend from it). None when blocked.
     pub fn move_dest(&self, from: TilePos, dir: Dir) -> Option<TilePos> {
+        self.move_dest_by(from, dir, |p| self.walkable(p))
+    }
+
+    /// Like `move_dest`, but a locked door is passable for the hero (horizontal moves).
+    pub fn hero_move_dest(&self, from: TilePos, dir: Dir) -> Option<TilePos> {
+        self.move_dest_by(from, dir, |p| {
+            self.walkable(p) || self.get(p).is_some_and(Tile::is_locked_door)
+        })
+    }
+
+    fn move_dest_by(
+        &self,
+        from: TilePos,
+        dir: Dir,
+        walkable: impl Fn(TilePos) -> bool,
+    ) -> Option<TilePos> {
         let q = from.step(dir);
         if matches!(dir, Dir::Up | Dir::Down) {
             return (q != from
@@ -84,10 +101,10 @@ impl Mountain {
                 && self.get(q) == Some(Tile::Stair))
             .then_some(q);
         }
-        if !self.walkable(from) {
+        if !walkable(from) {
             return None;
         }
-        if self.walkable(q) {
+        if walkable(q) {
             return Some(q);
         }
         let up = from.step(Dir::Up);
@@ -97,7 +114,7 @@ impl Mountain {
             && self.get(up) == Some(Tile::Sky)
         {
             let q_up = q.step(Dir::Up);
-            return self.walkable(q_up).then_some(q_up);
+            return walkable(q_up).then_some(q_up);
         }
         // Mirror of the climb: only descend where the slope leads straight back up here.
         if self.get(q) == Some(Tile::Sky)
@@ -282,6 +299,20 @@ mod tests {
     }
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)
+    }
+
+    #[test]
+    fn locked_doors_stop_dwarves_not_the_hero() {
+        let mut m = Mountain::new(MountainId(0), 5, 1, 1, Tile::Floor);
+        let (a, door, b) = (p(1, 0, 0), p(2, 0, 0), p(3, 0, 0));
+        m.set(door, Tile::WoodDoor);
+        assert_eq!(m.move_dest(a, Dir::E), Some(door));
+        m.set(door, Tile::WoodDoorLocked);
+        assert!(!m.walkable(door));
+        assert_eq!(m.move_dest(a, Dir::E), None);
+        assert!(crate::path::find_path(&m, a, |q| q == b, &Default::default()).is_none());
+        assert_eq!(m.hero_move_dest(a, Dir::E), Some(door));
+        assert_eq!(m.hero_move_dest(door, Dir::E), Some(b));
     }
 
     #[test]
