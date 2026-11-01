@@ -6,7 +6,7 @@ use crate::game::{
     ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, clock_label, level_label,
     mode_label,
 };
-use crate::light::{Explored, memory_file};
+use crate::light::{MemorySync, memory_file};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -74,58 +74,30 @@ fn fallback_prefs_path() -> Option<PathBuf> {
     Some(dir.join("moria").join("prefs"))
 }
 
-/// Primary then fallback folder for the memory files, like the prefs file.
-fn memory_dirs() -> impl Iterator<Item = PathBuf> {
-    [prefs_path(), fallback_prefs_path()]
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p.parent().map(PathBuf::from))
-}
-
 /// Loads the explored memory when a game starts, saves it every 30 s and when the game ends.
-/// Best effort: a missing, unwritable or wrong-sized file only costs the memory.
 fn memory_sync(
     mut client: ResMut<Client>,
     form: Res<LoginForm>,
     time: Res<Time>,
-    mut cur: Local<Option<(PathBuf, PathBuf)>>, // (primary, fallback) file of the running game
-    mut since: Local<f32>,
+    mut sync: Local<MemorySync>,
 ) {
-    let save = |files: &(PathBuf, PathBuf), e: &Explored| {
-        let bytes = e.to_bytes();
-        if std::fs::write(&files.0, &bytes).is_err() {
-            let _ = files.1.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(&files.1, &bytes);
-        }
-    };
-    if let (Some(g), Some(files)) = (client.session.left.take(), cur.take()) {
-        save(&files, &g.explored);
-    }
-    let Some(g) = &mut client.session.game else {
-        return;
-    };
-    let Some(files) = &*cur else {
-        let mut dirs = memory_dirs();
-        let (Some(a), Some(b)) = (dirs.next(), dirs.next()) else {
-            return; // ponytail: no usable folder, no memory kept
-        };
-        let f = |d: &PathBuf| memory_file(d, &form.addr, &form.name, g.mountain.id);
-        let (w, h, d) = g.mountain.size();
-        if let Some(e) = [f(&a), f(&b)]
-            .iter()
-            .find_map(|p| Explored::from_bytes(w, h, d, &std::fs::read(p).ok()?))
-        {
-            g.explored = e;
-        }
-        *cur = Some((f(&a), f(&b)));
-        *since = 0.0;
-        return;
-    };
-    *since += time.delta_secs();
-    if *since >= 30.0 {
-        *since = 0.0;
-        save(files, &g.explored);
-    }
+    let s = &mut client.session;
+    let left = s.left.take();
+    let id = s.game.as_ref().map(|g| g.mountain.id);
+    sync.step(
+        time.delta_secs(),
+        left.as_ref().map(|g| &g.explored),
+        s.game.as_mut().map(|g| &mut g.explored),
+        || {
+            let dirs: Vec<_> = [prefs_path(), fallback_prefs_path()]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.parent().map(PathBuf::from))
+                .collect();
+            let f = |d: &PathBuf| memory_file(d, &form.addr, &form.name, id.unwrap());
+            Some((f(dirs.first()?), f(dirs.get(1)?)))
+        },
+    );
 }
 
 fn load_prefs() -> LoginForm {
