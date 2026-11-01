@@ -3,6 +3,8 @@
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
 pub mod bridge;
+#[allow(dead_code)] // wired into the tick loop in the next task
+mod inventory;
 pub mod metrics;
 pub mod net;
 pub mod sim;
