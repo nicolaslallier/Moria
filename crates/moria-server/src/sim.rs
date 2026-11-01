@@ -317,6 +317,7 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
             .iter()
             .any(|d| d.task.as_ref().is_some_and(|t| t.target == target));
         let under_occupant = kind != DesignationKind::Dig
+            && !kind.is_work()
             && (f.hero.as_ref().is_some_and(|h| h.pos == target)
                 || f.dwarves.iter().any(|d| d.pos == target));
         if taken || under_occupant || !spare(f).covers(&kind.cost()) {
@@ -494,6 +495,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 };
                 if task.progress >= needed {
                     let blocked = task.kind != DesignationKind::Dig
+                        && !task.kind.is_work()
                         && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
                             || f.dwarves.iter().any(|d| d.pos == task.target))
                         || !f.resources.covers(&task.kind.cost());
@@ -1812,6 +1814,25 @@ mod tests {
         let r = w.fortresses[&M].resources;
         assert_eq!((r.iron, r.iron_ore), (0, 2));
         assert_eq!(w.mountains[&M].orders[&forge], 1);
+    }
+
+    #[test]
+    fn standing_on_the_forge_does_not_waste_a_finished_smelt() {
+        let mut w = setup();
+        let forge = ordered_forge(&mut w, 1);
+        *res(&mut w) = ore(2, 1);
+        assign(&mut w, 0, forge);
+        for _ in 0..300 {
+            let t = w.fortresses[&M].dwarves[0].task.as_ref();
+            if t.is_some_and(|t| t.progress == DesignationKind::Smelt.work_ticks() - 1) {
+                break;
+            }
+            step(&mut w);
+        }
+        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = forge;
+        step(&mut w);
+        assert_eq!(w.fortresses[&M].resources.iron, 1);
+        assert!(w.mountains[&M].orders.is_empty());
     }
 
     #[test]
