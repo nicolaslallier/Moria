@@ -126,7 +126,7 @@ pub fn named(r: Resources) -> [(u32, &'static str); 7] {
 }
 
 /// Top resource bar: count, name, RGB colour of its marker.
-pub fn resource_bar(r: Resources) -> [(u32, &'static str, [u8; 3]); 8] {
+pub fn resource_bar(r: Resources) -> [(u32, &'static str, [u8; 3]); 9] {
     [
         (r.stone, "Pierre", [160, 160, 160]),
         (r.wood, "Bois", [170, 110, 60]),
@@ -136,6 +136,7 @@ pub fn resource_bar(r: Resources) -> [(u32, &'static str, [u8; 3]); 8] {
         (r.coal, "Charbon", [110, 110, 120]),
         (r.iron, "Lingots", [200, 205, 215]),
         (r.iron_door, "Portes en fer", [120, 150, 190]),
+        (r.food, "Nourriture", [214, 150, 150]),
     ]
 }
 
@@ -189,7 +190,9 @@ pub fn mode_label(k: DesignationKind) -> String {
     match k {
         DesignationKind::Dig => tr("Mode : Creuser", "Mode: Dig").into(),
         DesignationKind::Stairs => tr("Mode : Escalier", "Mode: Stairs").into(),
-        DesignationKind::Chop => tr("Mode : Couper (arbres)", "Mode: Chop (trees)").into(),
+        DesignationKind::Chop => {
+            tr("Mode : Couper (arbres, vaches)", "Mode: Chop (trees, cows)").into()
+        }
         _ => BUILDS
             .iter()
             .find(|b| b.0 == k)
@@ -728,6 +731,7 @@ pub(crate) mod tests {
             coal: 6,
             iron: 7,
             iron_door: 8,
+            food: 9,
         };
         let bar: Vec<_> = resource_bar(r)
             .iter()
@@ -744,6 +748,7 @@ pub(crate) mod tests {
                 (6, "Charbon"),
                 (7, "Lingots"),
                 (8, "Portes en fer"),
+                (9, "Nourriture"),
             ]
         );
     }
@@ -1383,7 +1388,7 @@ pub(crate) mod tests {
         let mut g = game();
         g.mode = g.mode.toggled().toggled();
         assert_eq!(g.mode, DesignationKind::Chop);
-        assert_eq!(mode_label(g.mode), "Mode : Couper (arbres)");
+        assert_eq!(mode_label(g.mode), "Mode : Couper (arbres, vaches)");
         assert_eq!(
             drag_msg((3, 1), (1, 1), g.current_z(), Some(g.mode)),
             ClientMsg::Designate {

@@ -878,7 +878,7 @@ mod tests {
         assert!(bar.height() < 30.0, "{bar:?}");
         assert_eq!(bar.width(), 1600.0);
         // The resources stop well short of the dwarves and clock.
-        let last = text(&texts, "■ Portes en fer").1;
+        let last = text(&texts, "■ Nourriture").1;
         let dwarves = text(&texts, "Nains").1;
         assert!(last.right() < dwarves.left(), "{last:?} {dwarves:?}");
     }

@@ -54,6 +54,8 @@ tiles! {
     WoodDoorLocked,
     StoneDoorLocked,
     IronDoorLocked,
+    /// Grazes on the grass outdoors; blocks the way. Butchered (`Chop`) for food.
+    Cow,
 }
 
 #[derive(
@@ -68,6 +70,7 @@ pub struct Resources {
     pub coal: u32,
     pub iron: u32,
     pub iron_door: u32,
+    pub food: u32,
 }
 
 impl Resources {
@@ -80,6 +83,7 @@ impl Resources {
         self.coal = self.coal.saturating_add(o.coal);
         self.iron = self.iron.saturating_add(o.iron);
         self.iron_door = self.iron_door.saturating_add(o.iron_door);
+        self.food = self.food.saturating_add(o.food);
     }
 
     pub fn covers(&self, c: &Resources) -> bool {
@@ -91,6 +95,7 @@ impl Resources {
             && self.coal >= c.coal
             && self.iron >= c.iron
             && self.iron_door >= c.iron_door
+            && self.food >= c.food
     }
 
     pub fn take(&mut self, c: &Resources) {
@@ -102,6 +107,7 @@ impl Resources {
         self.coal = self.coal.saturating_sub(c.coal);
         self.iron = self.iron.saturating_sub(c.iron);
         self.iron_door = self.iron_door.saturating_sub(c.iron_door);
+        self.food = self.food.saturating_sub(c.food);
     }
 }
 
@@ -346,7 +352,7 @@ impl Tile {
             Tile::Coal => 12,
             Tile::Mithril => 25,
             Tile::Soil | Tile::Slope => 8,
-            Tile::Tree => 20,
+            Tile::Tree | Tile::Cow => 20,
             Tile::Floor | Tile::Stair | Tile::Grass | Tile::Water | Tile::Sky => 0,
         }
     }
@@ -360,6 +366,7 @@ impl Tile {
             Tile::IronOre => r.iron_ore = 1,
             Tile::Coal => r.coal = 1,
             Tile::Tree => r.wood = 3,
+            Tile::Cow => r.food = 4,
             Tile::Wall => return DesignationKind::Wall.cost(),
             Tile::Bed => return DesignationKind::Bed.cost(),
             Tile::Table => return DesignationKind::Table.cost(),
@@ -434,6 +441,7 @@ mod tests {
             WoodDoorLocked,
             StoneDoorLocked,
             IronDoorLocked,
+            Cow,
         ];
         assert_eq!(Tile::ALL, expected);
         for (i, t) in expected.iter().enumerate() {

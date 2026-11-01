@@ -183,7 +183,7 @@ impl Mountain {
                     || (t == Tile::Slope && !self.is_last_way_down(p)))
                     && !self.holds_up_a_way_down(p)
             }
-            K::Chop => t == Tile::Tree,
+            K::Chop => matches!(t, Tile::Tree | Tile::Cow),
             K::Smelt => t == Tile::Forge,
             K::Smith => t == Tile::Anvil,
             K::Stairs => stairs_ok(t) && p.z + 1 < self.d && !self.holds_up_a_way_down(p),
@@ -562,6 +562,19 @@ mod tests {
             assert!(!m.diggable(p(3, 5, 2), k));
             assert!(!m.diggable(p(0, 0, 0), k));
         }
+    }
+
+    #[test]
+    fn butcher_cow_gives_food_and_grass() {
+        let mut m = hill();
+        let c = p(1, 1, 2);
+        m.set(c, Tile::Cow);
+        assert!(!m.walkable(c), "a cow blocks the way like a tree");
+        assert!(!m.diggable(c, DesignationKind::Dig));
+        assert!(!m.diggable(c, DesignationKind::Stairs));
+        let r = m.dig(c, DesignationKind::Chop).unwrap();
+        assert_eq!(r.food, 4);
+        assert_eq!(m.get(c), Some(Tile::Grass));
     }
 
     #[test]

@@ -116,6 +116,20 @@ fn outdoor(tile: Tile, x: i32, y: i32, noise: i32) -> Option<[i32; 3]> {
         }
         Tile::Tree if r2 < 44 * 44 => [36, 70, 34],
         Tile::Tree => grass(x, y),
+        // Seen from above: a black-and-white body, its pink muzzle toward the east, on grass.
+        Tile::Cow => {
+            let body = (x - 44).pow(2) * 9 + (y - 48).pow(2) * 25 < 26 * 26 * 9;
+            let head = (x - 76).pow(2) + (y - 48).pow(2) < 10 * 10;
+            if head {
+                [214, 150, 150]
+            } else if body && (x / 11 + y / 9) % 3 == 0 {
+                [34, 30, 30]
+            } else if body {
+                [232, 228, 220]
+            } else {
+                grass(x, y)
+            }
+        }
         Tile::Water => {
             let wave = ((x as f32 * 0.2 + (y as f32 * 0.35).sin() * 3.0).sin() * 12.0) as i32;
             [38 + wave, 82 + wave, 150 + wave - noise]
@@ -322,6 +336,7 @@ mod tests {
             Tile::WoodDoorLocked,
             Tile::StoneDoorLocked,
             Tile::IronDoorLocked,
+            Tile::Cow,
         ];
         for t in new {
             let data = pixels(t, false);
@@ -393,6 +408,14 @@ mod tests {
                 "{t:?}: same piece"
             );
         }
+    }
+
+    #[test]
+    fn cow_stands_on_grass() {
+        let (cow, grass) = (pixels(Tile::Cow, false), pixels(Tile::Grass, false));
+        let center = (48 * 96 + 48) * 4..(48 * 96 + 49) * 4;
+        assert_eq!(cow[..4], grass[..4], "corner is grass");
+        assert_ne!(cow[center.clone()], grass[center], "a cow in the middle");
     }
 
     #[test]

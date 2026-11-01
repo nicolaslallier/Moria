@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 3;
+pub const SAVE_VERSION: u32 = 4;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -233,6 +233,8 @@ fn gen_mountain(id: MountainId, rng: &mut ChaCha8Rng) -> Mountain {
             let density = 0.03 + 0.27 * ((d - 20.0) / 80.0).clamp(0.0, 1.0);
             if rng.random_bool(density) {
                 m.set(ground(x, y), Tree);
+            } else if rng.random_bool(0.003) {
+                m.set(ground(x, y), Cow);
             }
         }
     }
@@ -572,6 +574,25 @@ mod tests {
                 assert!(m.walkable(p), "{p:?}");
             }
             assert_eq!(m.get(TilePos::new(127, 47, GROUND_Z)), Some(Tile::Grass));
+        }
+    }
+
+    #[test]
+    fn every_mountain_has_a_herd_outdoors() {
+        for seed in [1, 7, 42] {
+            for m in generate(seed).mountains.values() {
+                let cows: Vec<_> = tiles(m).filter(|&(_, t)| t == Tile::Cow).collect();
+                assert!(
+                    (5..=60).contains(&cows.len()),
+                    "seed {seed}: {} cows",
+                    cows.len()
+                );
+                assert!(
+                    cows.iter()
+                        .all(|(p, _)| p.z == GROUND_Z && p.x < ENTRANCE_X.start),
+                    "cows graze outdoors on the ground level"
+                );
+            }
         }
     }
 
