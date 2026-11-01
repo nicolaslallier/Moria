@@ -4457,6 +4457,7 @@ dependencies = [
  "moria-bus",
  "moria-core",
  "moria-dwarf-ai",
+ "moria-inventory",
  "postcard",
  "tokio",
  "tracing",

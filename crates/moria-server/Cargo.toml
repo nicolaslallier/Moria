@@ -16,3 +16,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 moria-dwarf-ai = { path = "../moria-dwarf-ai" }
+moria-inventory = { path = "../moria-inventory" }
