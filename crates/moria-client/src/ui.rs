@@ -6,7 +6,7 @@ use crate::game::{
     ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, clock_label, level_label,
     mode_label,
 };
-use crate::light::{MemorySync, memory_file};
+use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -80,29 +80,22 @@ fn memory_sync(
     form: Res<LoginForm>,
     time: Res<Time>,
     mut sync: Local<MemorySync>,
+    mut dirs: Local<Option<Vec<PathBuf>>>,
     mut exit: MessageReader<AppExit>,
 ) {
-    let s = &mut client.session;
     // Closing the window ends the game too: save what is running (this system runs in `Last`).
-    if exit.read().count() > 0 && s.left.is_none() {
-        s.left = s.game.take();
-    }
-    let left = s.left.take();
-    let id = s.game.as_ref().map(|g| g.mountain.id);
-    sync.step(
-        time.delta_secs(),
-        left.as_ref().map(|g| &g.explored),
-        s.game.as_mut().map(|g| &mut g.explored),
-        || {
-            let dirs: Vec<_> = [prefs_path(), fallback_prefs_path()]
-                .into_iter()
-                .flatten()
-                .filter_map(|p| p.parent().map(PathBuf::from))
-                .collect();
-            let f = |d: &PathBuf| memory_file(d, &form.addr, &form.name, id.unwrap());
-            Some((f(dirs.first()?), f(dirs.get(1)?)))
-        },
-    );
+    let exit = exit.read().count() > 0;
+    // The one or two candidate folders, resolved once.
+    let dirs = dirs.get_or_insert_with(|| {
+        [prefs_path(), fallback_prefs_path()]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.parent().map(PathBuf::from))
+            .collect()
+    });
+    sync.step(time.delta_secs(), exit, &mut client.session, |m| {
+        memory_files(dirs, &form.addr, &form.name, m)
+    });
 }
 
 fn load_prefs() -> LoginForm {

@@ -4,7 +4,7 @@ use crate::Client;
 use crate::art::Art;
 use crate::game::{Game, Screen, outlined};
 use crate::input::Drag;
-use crate::light::{dwarf_visible, shown};
+use crate::light::shown;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use moria_core::light::{Area, LightMap, light_map};
@@ -141,36 +141,43 @@ fn spawn_map(
 #[derive(Resource)]
 struct Lighting(LightMap);
 
-/// What the light map depends on: hour step, hero, level, dwarves, snapshot, map, view.
-type LightKey = (u64, TilePos, u8, Vec<TilePos>, u32, u32, (i16, i16));
+/// What the light map depends on: hour step, hero, level, snapshot, map, view (plus the dwarves).
+type LightKey = (u64, TilePos, u8, u32, u32, (i16, i16));
 
 /// Recomputes the light map when its key changes, and explores what it lights.
+/// The key is checked without marking `Client` changed and without allocating.
 fn compute_light(
     mut commands: Commands,
     mut client: ResMut<Client>,
     window: Single<&Window, With<PrimaryWindow>>,
     lighting: Option<Res<Lighting>>,
     mut key: Local<Option<LightKey>>,
+    mut dwarves: Local<Vec<TilePos>>,
 ) {
-    let snapshots = client.session.snapshots;
-    let Some(g) = &mut client.session.game else {
+    let (rx, ry) = view_radius(window.width(), window.height());
+    let c = client.bypass_change_detection();
+    let Some(g) = &c.session.game else {
         return;
     };
-    let (rx, ry) = view_radius(window.width(), window.height());
     let z = g.current_z();
     let want = (
         g.tick / 150,
         g.hero.pos,
         z,
-        g.dwarves.iter().map(|d| d.1).collect(),
-        snapshots,
+        c.session.snapshots,
         g.map_rev,
         (rx, ry),
     );
-    if lighting.is_some() && key.as_ref() == Some(&want) {
+    let same_dwarves = g.dwarves.iter().map(|d| d.1).eq(dwarves.iter().copied());
+    if lighting.is_some() && same_dwarves && *key == Some(want) {
         return;
     }
     *key = Some(want);
+    dwarves.clear();
+    dwarves.extend(g.dwarves.iter().map(|d| d.1));
+    let Some(g) = &mut client.session.game else {
+        return;
+    };
     let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
     let area = Area {
         x0: hx - rx,
@@ -237,9 +244,10 @@ fn sync_tiles(
 }
 
 /// `depth` keeps the hero drawn above a dwarf sharing its tile; `lit` false hides it.
-fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32, lit: bool) {
+/// Shown whenever on the viewed level: every dwarf is a `BODY_LIGHT` source, so its own tile is always lit.
+fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32) {
     t.translation = to_world(p.x, p.y).extend(depth);
-    *v = if p.z == z && lit {
+    *v = if p.z == z {
         Visibility::Inherited
     } else {
         Visibility::Hidden
@@ -250,32 +258,27 @@ fn sync_marks(
     mut commands: Commands,
     client: Res<Client>,
     art: Res<Art>,
-    lighting: Option<Res<Lighting>>,
     mut marks: Query<(Entity, &Mark, &mut Transform, &mut Visibility)>,
 ) {
-    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
+    let Some(g) = &client.session.game else {
         return;
     };
     let z = g.current_z();
-    let lit = |p: TilePos| dwarf_visible(l.0.get(p.x, p.y));
     let mut ds = g.dwarves.iter();
     for (e, mark, mut t, mut v) in &mut marks {
-        let (pos, depth, visible) = match mark {
-            Mark::Hero => (Some(g.hero.pos), 2.0, true),
-            Mark::Dwarf => {
-                let p = ds.next().map(|&(_, p, _)| p);
-                (p, 1.0, p.is_some_and(lit))
-            }
+        let (pos, depth) = match mark {
+            Mark::Hero => (Some(g.hero.pos), 2.0),
+            Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), 1.0),
         };
         match pos {
-            Some(p) => place(&mut t, &mut v, p, z, depth, visible),
+            Some(p) => place(&mut t, &mut v, p, z, depth),
             None => commands.entity(e).despawn(),
         }
     }
     for &(_, p, _) in ds {
         let mut t = Transform::default();
         let mut v = Visibility::default();
-        place(&mut t, &mut v, p, z, 1.0, lit(p));
+        place(&mut t, &mut v, p, z, 1.0);
         commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
     }
 }
@@ -358,9 +361,9 @@ fn draw_relief(
             }
         }
     }
-    // Circles follow the heads: a remembered but dark tile does not reveal its dwarf.
+    // Circles follow the heads (see `place`).
     for &(_, p, _) in &g.dwarves {
-        if p.z == z && dwarf_visible(l.0.get(p.x, p.y)) {
+        if p.z == z {
             gizmos.circle_2d(
                 to_world(p.x, p.y),
                 TILE * 0.47,

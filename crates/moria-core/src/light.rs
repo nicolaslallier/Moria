@@ -11,18 +11,33 @@ const DUSK_START: u64 = 10 * HOUR_TICKS;
 const NIGHT_START: u64 = 12 * HOUR_TICKS;
 const DAWN_START: u64 = 22 * HOUR_TICKS;
 
+/// Part of the day, as `daylight` sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DayPhase {
+    Day,
+    Dusk,
+    Night,
+    Dawn,
+}
+
+pub fn phase(tick: u64) -> DayPhase {
+    match tick % DAY_TICKS {
+        t if t < DUSK_START => DayPhase::Day,
+        t if t < NIGHT_START => DayPhase::Dusk,
+        t if t < DAWN_START => DayPhase::Night,
+        _ => DayPhase::Dawn,
+    }
+}
+
 /// Daylight level: 1.0 by day, 0.0 at night, linear through dusk and dawn.
 pub fn daylight(tick: u64) -> f32 {
     let t = tick % DAY_TICKS;
     let ramp = |from: u64| (t - from) as f32 / (2 * HOUR_TICKS) as f32;
-    if t < DUSK_START {
-        1.0
-    } else if t < NIGHT_START {
-        1.0 - ramp(DUSK_START)
-    } else if t < DAWN_START {
-        0.0
-    } else {
-        ramp(DAWN_START)
+    match phase(tick) {
+        DayPhase::Day => 1.0,
+        DayPhase::Dusk => 1.0 - ramp(DUSK_START),
+        DayPhase::Night => 0.0,
+        DayPhase::Dawn => ramp(DAWN_START),
     }
 }
 
@@ -41,7 +56,10 @@ pub fn blocks_light(t: Tile) -> bool {
     t.is_stone()
 }
 
-/// Radius of a built light source.
+/// Largest radius of a built light source.
+pub const MAX_LIGHT_RADIUS: u8 = 8;
+
+/// Radius of a built light source, at most `MAX_LIGHT_RADIUS`.
 pub fn light_radius(t: Tile) -> Option<u8> {
     match t {
         Tile::Candle => Some(3),
@@ -147,10 +165,11 @@ pub fn light_map(
         }
     }
 
-    // Built lights within 8 tiles of the area (the largest radius).
+    // Built lights that can reach the area.
     let mut all = sources.to_vec();
-    for y in (area.y0 - 8).max(0)..=(area.y1 + 8).min(mh - 1) {
-        for x in (area.x0 - 8).max(0)..=(area.x1 + 8).min(mw - 1) {
+    let r = MAX_LIGHT_RADIUS as i16;
+    for y in (area.y0 - r).max(0)..=(area.y1 + r).min(mh - 1) {
+        for x in (area.x0 - r).max(0)..=(area.x1 + r).min(mw - 1) {
             if let Some(r) = tile(x, y, z).and_then(light_radius) {
                 all.push((x, y, r));
             }
@@ -265,6 +284,22 @@ mod tests {
         assert!((daylight(34_500) - 0.5).abs() < 1e-3); // mid-dawn
         assert_eq!(daylight(DAY_TICKS), 1.0); // next morning
         let _ = daylight(u64::MAX); // no panic
+    }
+
+    #[test]
+    fn phases_change_at_the_daylight_boundaries() {
+        assert_eq!(phase(14_999), DayPhase::Day);
+        assert_eq!(phase(15_000), DayPhase::Dusk);
+        assert_eq!(phase(18_000), DayPhase::Night);
+        assert_eq!(phase(33_000), DayPhase::Dawn);
+        assert_eq!(phase(DAY_TICKS), DayPhase::Day);
+    }
+
+    #[test]
+    fn no_light_exceeds_the_max_radius() {
+        for t in Tile::ALL {
+            assert!(light_radius(t).unwrap_or(0) <= MAX_LIGHT_RADIUS, "{t:?}");
+        }
     }
 
     #[test]

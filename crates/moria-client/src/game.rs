@@ -5,7 +5,7 @@ use crate::light::{Explored, SEEN_AT};
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
-use moria_core::light::{Area, BODY_LIGHT, LightMap, hour};
+use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
@@ -13,6 +13,7 @@ use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
 // ponytail: fixed margin; measure real RTT jitter if moves still get dropped server-side.
@@ -76,14 +77,13 @@ pub fn drag_msg(
 
 /// HUD clock: the game hour and the phase of the day.
 pub fn clock_label(tick: u64) -> String {
-    let h = hour(tick);
-    let phase = match h {
-        6..16 => "Jour",
-        16..18 => "Crépuscule",
-        4..6 => "Aube",
-        _ => "Nuit",
+    let name = match phase(tick) {
+        DayPhase::Day => "Jour",
+        DayPhase::Dusk => "Crépuscule",
+        DayPhase::Night => "Nuit",
+        DayPhase::Dawn => "Aube",
     };
-    format!("{h} h — {phase}")
+    format!("{} h — {name}", hour(tick))
 }
 
 /// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
@@ -170,6 +170,8 @@ pub struct Game {
     pub tick: u64,
     /// Tiles the hero has seen lit.
     pub explored: Explored,
+    /// Files `explored` was loaded from and is saved to; `None` until loaded.
+    pub memory: Option<Vec<PathBuf>>,
     /// Bumped (wrapping) by every tick that changes tiles; a cache key for the light map.
     pub map_rev: u32,
     /// Status page (key C) open.
@@ -266,6 +268,7 @@ impl Game {
             resources: v.resources,
             tick: v.tick,
             explored: Explored::new(w, h, d),
+            memory: None,
             map_rev: 0,
             status: false,
             last_dir: Dir::E,
@@ -436,8 +439,8 @@ pub struct Session {
     pub game: Option<Game>,
     /// Bumped on every accepted snapshot so the renderer rebuilds the map.
     pub snapshots: u32,
-    /// The game dropped by a disconnect or a new mountain, kept so its memory can be saved.
-    pub left: Option<Game>,
+    /// Games dropped by a disconnect or a new mountain, queued until each is saved to its own files.
+    pub left: Vec<Game>,
 }
 
 impl Session {
@@ -470,8 +473,9 @@ impl Session {
                     if old.mountain.id == g.mountain.id && old.mountain.size() == g.mountain.size()
                     {
                         g.explored = old.explored;
+                        g.memory = old.memory;
                     } else {
-                        self.left = Some(old);
+                        self.left.push(old);
                     }
                 }
                 self.game = Some(g);
@@ -499,9 +503,7 @@ impl Session {
     fn end(&mut self, screen: Screen, msg: String) {
         self.screen = screen;
         self.error = Some(msg);
-        // Never overwrite a pending `left`: its memory is not saved yet.
-        let ended = self.game.take();
-        self.left = self.left.take().or(ended);
+        self.left.extend(self.game.take());
     }
 }
 
@@ -795,7 +797,8 @@ pub(crate) mod tests {
         s.handle(snap(1));
         s.handle(snap(2)); // old mountain 1 is now pending in `left`
         s.handle(NetEvent::Disconnected("perdu".into()));
-        assert_eq!(s.left.unwrap().mountain.id, MountainId(1));
+        let ids: Vec<_> = s.left.iter().map(|g| g.mountain.id).collect();
+        assert_eq!(ids, [MountainId(1), MountainId(2)]); // both queued, none lost
     }
 
     #[test]
