@@ -39,6 +39,11 @@ pub enum Command {
         a: TilePos,
         b: TilePos,
     },
+    Use(Dir),
+    Order {
+        dir: Dir,
+        add: u8,
+    },
 }
 
 impl Command {
@@ -48,8 +53,11 @@ impl Command {
             ClientMsg::Dig(d) => Command::Dig(d),
             ClientMsg::Build(d, k) if k.builds().is_some() => Command::Build(d, k),
             ClientMsg::Build(..) => return None,
+            ClientMsg::Designate { kind, .. } if kind.is_work() => return None,
             ClientMsg::Designate { a, b, kind } => Command::Designate { a, b, kind },
             ClientMsg::CancelDesignation { a, b } => Command::Cancel { a, b },
+            ClientMsg::Use(d) => Command::Use(d),
+            ClientMsg::Order { dir, add } => Command::Order { dir, add },
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
         })
     }
@@ -120,6 +128,8 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
                 }
             }
         }
+        // Filled in by the door and workshop tasks.
+        Command::Use(_) | Command::Order { .. } => {}
         Command::Cancel { a, b } => {
             ch.0 = mt
                 .cancel_designations(a, b)
@@ -447,6 +457,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 designations_added: vec![],
                 designations_removed: vec![],
                 resources: f.resources,
+                orders: vec![],
             };
             ch.merge_into(&mut d);
             out.insert(id, d);
@@ -788,6 +799,31 @@ mod tests {
         assert_eq!(
             hero(&w).dig.as_ref().map(|j| j.kind),
             Some(DesignationKind::Dig)
+        );
+    }
+
+    #[test]
+    fn work_kinds_cannot_be_designated() {
+        let q = TilePos::new(0, 0, 0);
+        for kind in [DesignationKind::Smelt, DesignationKind::Smith] {
+            assert_eq!(
+                Command::from_client(ClientMsg::Designate { a: q, b: q, kind }),
+                None
+            );
+        }
+        assert_eq!(
+            Command::from_client(ClientMsg::Use(Dir::E)),
+            Some(Command::Use(Dir::E))
+        );
+        assert_eq!(
+            Command::from_client(ClientMsg::Order {
+                dir: Dir::N,
+                add: 5
+            }),
+            Some(Command::Order {
+                dir: Dir::N,
+                add: 5
+            })
         );
     }
 

@@ -590,6 +590,7 @@ pub(crate) mod tests {
             designations_added: vec![],
             designations_removed: vec![],
             resources: Resources::default(),
+            orders: vec![],
         }
     }
 
