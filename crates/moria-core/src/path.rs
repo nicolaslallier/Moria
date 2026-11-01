@@ -16,8 +16,8 @@ pub fn find_path(
     let mut q = VecDeque::from([from]);
     while let Some(p) = q.pop_front() {
         for d in [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down] {
-            let n = p.step(d);
-            if n == from || prev.contains_key(&n) || blocked.contains(&n) || !m.can_move(p, d) {
+            let Some(n) = m.move_dest(p, d) else { continue };
+            if n == from || prev.contains_key(&n) || blocked.contains(&n) {
                 continue;
             }
             prev.insert(n, p);
@@ -52,8 +52,8 @@ pub fn distances_from(
     while let Some(p) = q.pop_front() {
         let d0 = dist[&p];
         for d in [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down] {
-            let n = p.step(d);
-            if dist.contains_key(&n) || blocked.contains(&n) || !m.can_move(p, d) {
+            let Some(n) = m.move_dest(p, d) else { continue };
+            if dist.contains_key(&n) || blocked.contains(&n) {
                 continue;
             }
             dist.insert(n, d0 + 1);
@@ -177,5 +177,26 @@ mod tests {
         assert!(g(TilePos::new(2, 1, 0)));
         assert!(!g(TilePos::new(2, 2, 1)));
         assert!(!g(TilePos::new(3, 2, 0)));
+    }
+
+    #[test]
+    fn path_uses_slopes() {
+        let mut m = Mountain::new(MountainId(0), 12, 12, 4, Tile::Sky);
+        for y in 0..12 {
+            for x in 0..12 {
+                m.set(TilePos::new(x, y, 2), Tile::Grass);
+            }
+        }
+        m.set(TilePos::new(5, 5, 2), Tile::Slope);
+        m.set(TilePos::new(6, 5, 2), Tile::Soil);
+        m.set(TilePos::new(6, 5, 1), Tile::Grass);
+        let goal = TilePos::new(6, 5, 1);
+        let p = find_path(&m, TilePos::new(2, 5, 2), |t| t == goal, &HashSet::new()).unwrap();
+        assert_eq!(p.last(), Some(&goal));
+        assert!(p.contains(&TilePos::new(5, 5, 2)));
+        assert_eq!(
+            distances_from(&m, TilePos::new(2, 5, 2), &HashSet::new())[&goal],
+            4
+        );
     }
 }

@@ -179,8 +179,9 @@ impl Client {
     async fn designate_near_dwarves(&mut self, n: usize) -> Vec<TilePos> {
         let m = &self.view.mountain;
         let d = self.view.dwarves[0].1;
-        let mut c: Vec<TilePos> = (0..48)
-            .flat_map(|x| (0..48).map(move |y| TilePos { x, y, z: d.z }))
+        let (w, h, _) = m.size();
+        let mut c: Vec<TilePos> = (0..w)
+            .flat_map(|x| (0..h).map(move |y| TilePos { x, y, z: d.z }))
             .filter(|&p| m.get(p) == Some(Tile::Rock))
             .filter(|p| {
                 [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(dx, dy)| {

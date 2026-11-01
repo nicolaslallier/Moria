@@ -1,5 +1,5 @@
 //! Images baked into the binary: the release ships a lone executable, no assets folder.
-//! Heads and portraits use the user's art; stone and floor are generated in `terrain`.
+//! Heads, portraits and stairs use the user's art; every other tile is generated in `terrain`.
 //! The bytes go into Bevy's `embedded://` source, so decoding runs on the asset
 //! task pool instead of blocking startup.
 
@@ -7,6 +7,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::asset::io::embedded::EmbeddedAssetRegistry;
 use bevy::image::ImageLoaderSettings;
 use bevy::prelude::*;
+use moria_core::Tile;
 use moria_core::srd::Race;
 use std::path::{Path, PathBuf};
 
@@ -59,14 +60,10 @@ fn slug(r: Race) -> &'static str {
 
 #[derive(Resource)]
 pub struct Art {
-    pub rock: Handle<Image>,
-    pub floor: Handle<Image>,
-    pub gold: Handle<Image>,
-    pub mithril: Handle<Image>,
-    pub wall: Handle<Image>,
-    pub bed: Handle<Image>,
-    pub table: Handle<Image>,
-    pub chair: Handle<Image>,
+    /// Baked textures, one per `terrain::bake` tile.
+    terrain: std::collections::HashMap<Tile, Handle<Image>>,
+    /// Furniture's outdoor look, one per `terrain::bake_on_grass` tile.
+    on_grass: std::collections::HashMap<Tile, Handle<Image>>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
     pub castle: Handle<Image>,
@@ -82,6 +79,17 @@ fn race_index(r: Race) -> usize {
 impl Art {
     pub fn head(&self, r: Race) -> Handle<Image> {
         self.heads[race_index(r)].clone()
+    }
+
+    /// The tile's texture (`on_grass`: standing outdoors); only the stairs (not baked) use
+    /// their own art. Never panics.
+    pub fn tile(&self, t: Tile, on_grass: bool) -> Handle<Image> {
+        on_grass
+            .then(|| self.on_grass.get(&t))
+            .flatten()
+            .or_else(|| self.terrain.get(&t))
+            .unwrap_or(&self.stair)
+            .clone()
     }
 
     pub fn portrait(&self, r: Race) -> Handle<Image> {
@@ -115,14 +123,14 @@ impl FromWorld for Art {
             .into();
         let mut images = world.resource_mut::<Assets<Image>>();
         Art {
-            rock: images.add(crate::terrain::image(moria_core::Tile::Rock)),
-            floor: images.add(crate::terrain::image(moria_core::Tile::Floor)),
-            gold: images.add(crate::terrain::image(moria_core::Tile::Gold)),
-            mithril: images.add(crate::terrain::image(moria_core::Tile::Mithril)),
-            wall: images.add(crate::terrain::image(moria_core::Tile::Wall)),
-            bed: images.add(crate::terrain::image(moria_core::Tile::Bed)),
-            table: images.add(crate::terrain::image(moria_core::Tile::Table)),
-            chair: images.add(crate::terrain::image(moria_core::Tile::Chair)),
+            terrain: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
+                .collect(),
+            on_grass: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake_on_grass(t)?))))
+                .collect(),
             stair,
             worker_head,
             castle,
@@ -136,6 +144,36 @@ impl FromWorld for Art {
 mod tests {
     use super::*;
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
+
+    #[test]
+    fn every_tile_has_art() {
+        let mut images = Assets::<Image>::default();
+        let (stair, other) = (images.add(Image::default()), images.add(Image::default()));
+        let art = Art {
+            terrain: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
+                .collect(),
+            on_grass: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake_on_grass(t)?))))
+                .collect(),
+            stair: stair.clone(),
+            worker_head: other.clone(),
+            castle: other,
+            heads: vec![],
+            portraits: vec![],
+        };
+        for t in Tile::ALL {
+            assert_eq!(art.tile(t, false) == stair, t == Tile::Stair, "{t:?}");
+            // Only furniture has its own outdoor look.
+            assert_eq!(
+                art.tile(t, true) != art.tile(t, false),
+                t.is_furniture(),
+                "{t:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_embedded_image_decodes() {

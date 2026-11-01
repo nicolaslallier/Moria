@@ -496,14 +496,8 @@ impl State {
         let Some(mt) = self.w.mountains.get(&m) else {
             return;
         };
-        let mut mountain = mt.clone();
-        // ponytail: all-or-nothing; with 1 spare stone the AI may still pick several walls
-        // (the server keeps one). Send the spare count in AiView if that ever matters.
-        if sim::spare_stone(f) == 0 {
-            mountain.designations.retain(|_, k| k.builds().is_none());
-        }
         let view = AiView {
-            mountain,
+            mountain: sim::view_mountain(mt, f),
             tick: self.w.tick,
             dwarves: f
                 .dwarves
@@ -521,13 +515,11 @@ impl State {
     }
 }
 
-/// First walkable surface tile, row by row: the entrance strip.
+/// The entrance room's first tile, where a new hero appears.
 fn entrance(w: &World, m: MountainId) -> Option<TilePos> {
-    let mt = w.mountains.get(&m)?;
-    let (wd, ht, _) = mt.size();
-    (0..ht)
-        .flat_map(|y| (0..wd).map(move |x| TilePos::new(x, y, 0)))
-        .find(|&p| mt.walkable(p))
+    w.mountains
+        .get(&m)
+        .and_then(|_| world::entrance_tiles().next())
 }
 
 #[cfg(test)]
@@ -570,8 +562,9 @@ mod tests {
         (s, cmd_tx)
     }
 
+    /// A tile of the mountain's rock, `x` tiles east of its foot.
     fn designate(x: i16, y: i16) -> Command {
-        let t = TilePos::new(x, y, 0);
+        let t = TilePos::new(world::ENTRANCE_X.start + x, y, moria_core::GROUND_Z);
         Command::Designate {
             a: t,
             b: t,

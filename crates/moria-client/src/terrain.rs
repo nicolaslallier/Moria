@@ -6,7 +6,17 @@ use bevy::{
 };
 use moria_core::Tile;
 
-pub fn image(tile: Tile) -> Image {
+/// The generated texture of every tile but the stairs (user art).
+pub fn bake(t: Tile) -> Option<Image> {
+    (t != Tile::Stair).then(|| image(t, false))
+}
+
+/// Furniture standing outdoors, drawn on grass instead of the stone floor.
+pub fn bake_on_grass(t: Tile) -> Option<Image> {
+    t.is_furniture().then(|| image(t, true))
+}
+
+fn image(tile: Tile, on_grass: bool) -> Image {
     Image::new(
         Extent3d {
             width: 96,
@@ -14,13 +24,13 @@ pub fn image(tile: Tile) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        pixels(tile),
+        pixels(tile, on_grass),
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     )
 }
 
-fn pixels(tile: Tile) -> Vec<u8> {
+fn pixels(tile: Tile, on_grass: bool) -> Vec<u8> {
     let mut data = Vec::with_capacity(96 * 96 * 4);
     for y in 0_i32..96 {
         for x in 0_i32..96 {
@@ -66,7 +76,11 @@ fn pixels(tile: Tile) -> Vec<u8> {
                     rgb = ore.map(|c| (c + noise + glint).clamp(0, 255) as u8);
                 }
             }
-            if let Some(c) = furniture(tile, x, y) {
+            let ground = on_grass.then(|| grass(x, y));
+            if let Some(c) = furniture(tile, x, y)
+                .or(ground)
+                .or_else(|| outdoor(tile, x, y, noise))
+            {
                 rgb = c.map(|c| (c + noise).clamp(0, 255) as u8);
             }
             data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
@@ -75,25 +89,79 @@ fn pixels(tile: Tile) -> Vec<u8> {
     data
 }
 
-/// Top-down carved-stone furniture over the floor: `(x0, y0, x1, y1, rgb)` boxes, last wins.
+/// Grass with darker tufts, also the ground under a tree.
+fn grass(x: i32, y: i32) -> [i32; 3] {
+    let tuft = if (x * 7 + y * 13 + (x / 6) * (y / 5)) % 9 == 0 {
+        -22
+    } else {
+        0
+    };
+    [72 + tuft, 122 + tuft, 58 + tuft]
+}
+
+/// Outdoor tiles, seen from above. `noise` is added by the caller.
+fn outdoor(tile: Tile, x: i32, y: i32, noise: i32) -> Option<[i32; 3]> {
+    let (dx, dy) = (x - 48, y - 48);
+    let r2 = dx * dx + dy * dy;
+    Some(match tile {
+        Tile::Grass => grass(x, y),
+        // A round canopy with a lit top-left and a shadow ring, over grass.
+        Tile::Tree if r2 < 40 * 40 => {
+            let lit = -(dx + dy) / 4 + if (x / 7 + y / 9) % 3 == 0 { 10 } else { 0 };
+            [38 + lit, 92 + lit, 42 + lit]
+        }
+        Tile::Tree if r2 < 44 * 44 => [36, 70, 34],
+        Tile::Tree => grass(x, y),
+        Tile::Water => {
+            let wave = ((x as f32 * 0.2 + (y as f32 * 0.35).sin() * 3.0).sin() * 12.0) as i32;
+            [38 + wave, 82 + wave, 150 + wave - noise]
+        }
+        // Earthy grass brightening toward the east (+x), with contour ridges: reads as a rise.
+        Tile::Slope => {
+            let ridge = if x % 16 < 3 { -26 } else { 0 };
+            let rise = x / 4;
+            [90 + rise + ridge, 112 + rise + ridge, 56 + rise / 2 + ridge]
+        }
+        Tile::Soil => {
+            let pebble = if (x * 11 + y * 17 + x * y) % 23 == 0 {
+                40
+            } else {
+                0
+            };
+            [112 + pebble, 80 + pebble, 50 + pebble]
+        }
+        // Dark, nearly flat: an empty level, not a surface.
+        Tile::Sky => [16 - noise, 22 - noise, 46 - noise],
+        _ => return None,
+    })
+}
+
+/// Top-down carved-stone (or wooden) furniture over the floor: `(x0, y0, x1, y1, rgb)`
+/// boxes, last wins.
 fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
-    const STONE: [i32; 3] = [158, 150, 136];
-    const DARK: [i32; 3] = [104, 98, 88];
+    let wood = matches!(tile, Tile::WoodBed | Tile::WoodTable | Tile::WoodChair);
+    let (top, dark) = if wood {
+        // Plank grain along x.
+        let grain = if y % 8 == 0 { -18 } else { 0 };
+        ([156 + grain, 104 + grain, 58 + grain], [96, 60, 32])
+    } else {
+        ([158, 150, 136], [104, 98, 88])
+    };
     let boxes: &[(i32, i32, i32, i32, [i32; 3])] = match tile {
-        Tile::Bed => &[
-            (18, 8, 78, 88, DARK),
-            (22, 12, 74, 84, STONE),
+        Tile::Bed | Tile::WoodBed => &[
+            (18, 8, 78, 88, dark),
+            (22, 12, 74, 84, top),
             (26, 16, 70, 30, [226, 220, 204]), // pillow
             (24, 36, 72, 82, [150, 48, 44]),   // blanket
         ],
-        Tile::Table => &[
-            (12, 20, 84, 70, DARK),
-            (16, 24, 80, 66, STONE),
+        Tile::Table | Tile::WoodTable => &[
+            (12, 20, 84, 70, dark),
+            (16, 24, 80, 66, top),
             (40, 36, 56, 52, [190, 150, 70]), // tankard
         ],
-        Tile::Chair => &[
-            (28, 22, 68, 72, DARK),
-            (32, 34, 64, 68, STONE), // seat; the dark strip above is the back
+        Tile::Chair | Tile::WoodChair => &[
+            (28, 22, 68, 72, dark),
+            (32, 34, 64, 68, top), // seat; the dark strip above is the back
         ],
         _ => &[],
     };
@@ -109,8 +177,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_stairs_are_not_baked() {
+        for t in Tile::ALL {
+            assert_eq!(bake(t).is_none(), t == Tile::Stair, "{t:?}");
+        }
+    }
+
+    #[test]
     fn terrain_is_opaque_and_ore_retains_the_rock_background() {
-        let rock = pixels(Tile::Rock);
+        let rock = pixels(Tile::Rock, false);
         assert_eq!(rock.len(), 96 * 96 * 4);
         for tile in [
             Tile::Rock,
@@ -122,22 +197,95 @@ mod tests {
             Tile::Table,
             Tile::Chair,
         ] {
-            let data = pixels(tile);
+            let data = pixels(tile, false);
             assert_eq!(data.len(), rock.len());
-            assert!(data.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             if matches!(tile, Tile::Gold | Tile::Mithril) {
                 let same = data
-                    .chunks_exact(4)
-                    .zip(rock.chunks_exact(4))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(rock.as_chunks::<4>().0.iter())
                     .filter(|(a, b)| a == b)
                     .count();
                 assert!(same > 96 * 96 / 2, "ore should be a vein in rock");
                 assert!(same < 96 * 96 * 9 / 10, "vein should be visible");
             }
         }
-        assert_ne!(pixels(Tile::Gold), pixels(Tile::Mithril));
-        assert_ne!(pixels(Tile::Floor), rock);
-        assert_ne!(pixels(Tile::Bed), pixels(Tile::Floor));
-        assert_ne!(pixels(Tile::Table), pixels(Tile::Chair));
+        assert_ne!(pixels(Tile::Gold, false), pixels(Tile::Mithril, false));
+        assert_ne!(pixels(Tile::Floor, false), rock);
+        assert_ne!(pixels(Tile::Bed, false), pixels(Tile::Floor, false));
+        assert_ne!(pixels(Tile::Table, false), pixels(Tile::Chair, false));
+    }
+
+    #[test]
+    fn outdoor_and_wood_tiles_have_their_own_look() {
+        let (grass, floor) = (pixels(Tile::Grass, false), pixels(Tile::Floor, false));
+        assert_ne!(grass, floor);
+        let new = [
+            Tile::Tree,
+            Tile::Water,
+            Tile::Slope,
+            Tile::Soil,
+            Tile::Sky,
+            Tile::WoodBed,
+            Tile::WoodTable,
+            Tile::WoodChair,
+        ];
+        for t in new {
+            let data = pixels(t, false);
+            assert_eq!(data.len(), 96 * 96 * 4);
+            assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+            assert_ne!(data, grass, "{t:?} looks like grass");
+            assert_ne!(data, floor, "{t:?} looks like floor");
+            for u in new.into_iter().filter(|&u| u != t) {
+                assert_ne!(data, pixels(u, false), "{t:?} looks like {u:?}");
+            }
+        }
+        // Wood furniture is browner (more red than blue) than its stone twin.
+        let warmth = |t| {
+            pixels(t, false)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| i64::from(p[0]) - i64::from(p[2]))
+                .sum::<i64>()
+        };
+        for (wood, stone) in [
+            (Tile::WoodBed, Tile::Bed),
+            (Tile::WoodTable, Tile::Table),
+            (Tile::WoodChair, Tile::Chair),
+        ] {
+            assert!(warmth(wood) > warmth(stone) + 96 * 96 * 10, "{wood:?}");
+        }
+    }
+
+    #[test]
+    fn furniture_outdoors_sits_on_grass() {
+        let grass = pixels(Tile::Grass, false);
+        let center = (48 * 96 + 48) * 4..(48 * 96 + 49) * 4;
+        for t in Tile::ALL.into_iter().filter(|t| t.is_furniture()) {
+            let (out, inside) = (pixels(t, true), pixels(t, false));
+            assert_eq!(out[..4], grass[..4], "{t:?}: corner is grass");
+            assert_ne!(inside[..4], grass[..4], "{t:?}: indoor corner is floor");
+            assert_eq!(
+                out[center.clone()],
+                inside[center.clone()],
+                "{t:?}: same piece"
+            );
+        }
+    }
+
+    #[test]
+    fn slope_rises_toward_the_east() {
+        // Generated slopes climb toward +x, so the texture must brighten left to right.
+        let data = pixels(Tile::Slope, false);
+        let sum = |cols: std::ops::Range<usize>| -> u32 {
+            (0..96)
+                .flat_map(|y| cols.clone().map(move |x| (y, x)))
+                .map(|(y, x)| u32::from(data[(y * 96 + x) * 4]))
+                .sum()
+        };
+        assert!(sum(0..8) < sum(88..96), "{} vs {}", sum(0..8), sum(88..96));
     }
 }

@@ -26,6 +26,22 @@ Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-d
 4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il écoute sur `192.168.2.10:7777`. Le port `9464` (métriques Prometheus, lues par la stack Infra) est aussi publié, pour le réseau local uniquement ; NATS reste sur le réseau interne.
 5. Logs : l'Alloy de la pile Infra collecte le stdout des conteneurs de cet hôte ; dans Grafana (https://grafana.infra.famillelallier.net), Explore > Loki, requête `{compose_project="moria"}` (filtrer par `compose_service`). Le nom de stack Portainer doit rester `moria`.
 
+## Mise à jour vers le dehors et le bois
+
+Le monde est régénéré (carte 176×96×12 avec forêt, rivière, lac et collines) : les anciennes sauvegardes sont refusées avec « format de sauvegarde v1 non supporté ». Il faut donc repartir d'un monde neuf, et chaque joueur recrée son compte.
+
+- En local : `make reset-world` (ou `docker compose down -v`), puis `make up`.
+- Sur Portainer, **ne jamais supprimer la stack** `moria` : elle perdrait sa variable `MORIA_INVITE`, son réglage GitOps (mise à jour automatique) et son Id. La stack suit `main` (toutes les 5 minutes) et le monde vit dans le volume Docker `moria-data`. Marche à suivre :
+  1. Laisser la nouvelle version se déployer. Tant que l'ancien monde est là, le serveur redémarre en boucle (crash-loop) avec « format de sauvegarde v1 non supporté » dans ses logs : c'est attendu, il n'écrase jamais l'ancien monde.
+  2. Sur l'hôte, supprimer uniquement le fichier de l'ancien monde, sans toucher au volume ni à la stack : `docker run --rm -v moria-data:/data alpine rm -f /data/world.bin`
+  3. Dans Portainer, **Pull and redeploy** la stack (ou la redémarrer) : le service worldgen régénère le monde au démarrage, puis le serveur démarre.
+  4. Vérifier la version : un Hello brut envoyé au port 7777 doit recevoir `00 00 00 03 01 00 04` (serveur en protocole v4). Par exemple : `printf '\x00\x00\x00\x02\x00\x01' | nc -w 2 192.168.2.10 7777 | xxd`
+  5. Chaque joueur recrée son compte.
+
+**Attention :** le volume du compose s'appelle `moria-data` globalement, quel que soit le nom du projet. `make reset-world`, `docker compose down -v` ou la suppression du volume `moria-data` détruit donc ce monde sur la machine, même depuis un autre projet Compose.
+
+Nouvelles commandes : Couper (X : creuser, escalier, couper, mur ; Espace vers un arbre le coupe), les pentes changent de niveau, et le menu de construction (touche 3) propose le mobilier en bois (lit 3, table 4, chaise 2).
+
 ## Code d'invitation
 
 `MORIA_INVITE` est une variable de stack Portainer **obligatoire** : `docker-compose.yml` refuse de démarrer si elle est absente ou vide (sinon n'importe qui sur Internet pourrait créer un compte et occuper une des 10 montagnes). Ne jamais la commiter. Le code n'est demandé qu'à la création d'un compte ; les comptes existants se connectent sans. Partagez-le uniquement avec vos amis.

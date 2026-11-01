@@ -1,7 +1,7 @@
 use moria_core::ai::{AiView, MAX_DWARVES_PER_VIEW};
 use moria_core::path::distances_from;
 use moria_core::{Dir, DwarfId, TilePos};
-use moria_core::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
+use moria_core::{MAX_DESIGNATIONS, MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
 use std::collections::HashSet;
 
 /// A deserialized view is untrusted: postcard bypasses `Mountain`'s invariants.
@@ -17,7 +17,7 @@ pub fn validate(view: &AiView) -> Result<(), &'static str> {
     if view.dwarves.len() > MAX_DWARVES_PER_VIEW {
         return Err("trop de nains");
     }
-    if m.designations.len() > w as usize * h as usize * d as usize {
+    if m.designations.len() > MAX_DESIGNATIONS {
         return Err("trop de designations");
     }
     let ok = view.dwarves.iter().all(|d| m.in_bounds(d.pos))
@@ -52,8 +52,9 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
         return vec![];
     }
     // Dwarves don't block each other: empty `blocked`.
-    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x 18k tiles); if that gets
-    // too slow, run a single multi-source BFS from the tasks' work spots instead.
+    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x walkable tiles: ~12k
+    // outdoor tiles on the 176x96x12 map plus whatever is dug), then a <= 64 x MAX_DESIGNATIONS
+    // matrix; if that gets too slow, run one multi-source BFS from the tasks' work spots.
     let no_block = HashSet::new();
     let dist: Vec<Vec<Option<u32>>> = dwarves
         .iter()
@@ -87,15 +88,17 @@ fn solve(dist: &[Vec<Option<u32>>]) -> Vec<Option<usize>> {
     let nt = dist.first().map_or(0, Vec::len);
     let mut got: Vec<Option<usize>> = vec![None; nd];
     let mut taken = vec![false; nt];
-    // Greedy: globally shortest pair first; (d, t) index order breaks ties.
-    while let Some((_, d, t)) = (0..nd)
-        .filter(|&d| got[d].is_none())
-        .flat_map(|d| (0..nt).filter(|&t| !taken[t]).map(move |t| (d, t)))
-        .filter_map(|(d, t)| dist[d][t].map(|c| (c, d, t)))
-        .min()
-    {
-        got[d] = Some(t);
-        taken[t] = true;
+    // Greedy: globally shortest pair first; (d, t) index order breaks ties. One sort of all
+    // pairs, O(nd*nt log), instead of a fresh min scan per assignment.
+    let mut pairs: Vec<(u32, usize, usize)> = (0..nd)
+        .flat_map(|d| (0..nt).filter_map(move |t| dist[d][t].map(|c| (c, d, t))))
+        .collect();
+    pairs.sort_unstable();
+    for (_, d, t) in pairs {
+        if got[d].is_none() && !taken[t] {
+            got[d] = Some(t);
+            taken[t] = true;
+        }
     }
     // Improvement: pairwise swaps and moves to free tasks, only on strict gain.
     // Each step lowers the total, so this terminates.
@@ -289,6 +292,19 @@ mod tests {
     }
 
     #[test]
+    fn too_many_designations_rejected() {
+        // 4800 tiles, all designated: within the map, over the cap.
+        let mut m = Mountain::new(MountainId(0), 80, 60, 1, Tile::Rock);
+        // A forged view bypasses `designate` and its cap.
+        for x in 0..80 {
+            for y in 0..60 {
+                m.designations.insert(p(x, y), DesignationKind::Dig);
+            }
+        }
+        assert!(validate(&view(m, vec![], vec![], vec![])).is_err());
+    }
+
+    #[test]
     fn too_many_dwarves_rejected() {
         let m = corridor(10);
         let ds = (0..65).map(|i| dw(i, 1, true)).collect();
@@ -357,5 +373,73 @@ mod tests {
             assign(&view(m, vec![dw(1, 1, true)], vec![], vec![])),
             vec![(DwarfId(1), valid)]
         );
+    }
+
+    /// Outdoor strip: Sky at z=0, Grass at z=1 (the ground), 40x8x2.
+    fn outdoors() -> Mountain {
+        let mut m = Mountain::new(MountainId(0), 40, 8, 2, Tile::Sky);
+        for y in 0..8 {
+            for x in 0..40 {
+                m.set(TilePos::new(x, y, 1), Tile::Grass);
+            }
+        }
+        m
+    }
+
+    fn at(id: u32, x: i16, y: i16, z: u8) -> DwarfView {
+        DwarfView {
+            id: DwarfId(id),
+            pos: TilePos::new(x, y, z),
+            idle: true,
+        }
+    }
+
+    #[test]
+    fn tree_across_water_not_assigned() {
+        let mut m = outdoors();
+        for y in 0..8 {
+            m.set(TilePos::new(5, y, 1), Tile::Water);
+        }
+        let tree = TilePos::new(8, 1, 1);
+        m.set(tree, Tile::Tree);
+        m.designate(tree, tree, DesignationKind::Chop);
+        let dig = TilePos::new(2, 3, 1);
+        m.set(dig, Tile::Rock);
+        m.designate(dig, dig, DesignationKind::Dig);
+        let v = view(m.clone(), vec![at(1, 2, 1, 1)], vec![], vec![]);
+        assert_eq!(assign(&v), vec![(DwarfId(1), dig)]);
+        // Without the reachable dig, the cut-off tree gets nobody.
+        m.designations.remove(&dig);
+        assert!(assign(&view(m, vec![at(1, 2, 1, 1)], vec![], vec![])).is_empty());
+    }
+
+    #[test]
+    fn nearest_tree_wins_via_slope() {
+        let mut m = outdoors();
+        // Hill x 5..=8 (rock at z=1, grass on top at z=0), climbed by a slope at x=4.
+        for y in 0..8 {
+            for x in 5..=8 {
+                m.set(TilePos::new(x, y, 1), Tile::Rock);
+                m.set(TilePos::new(x, y, 0), Tile::Grass);
+            }
+        }
+        m.set(TilePos::new(4, 1, 1), Tile::Slope);
+        let hill = TilePos::new(7, 1, 0);
+        let flat = TilePos::new(3, 7, 1);
+        for t in [hill, flat] {
+            m.set(t, Tile::Tree);
+            m.designate(t, t, DesignationKind::Chop);
+        }
+        // Hill tree: 3 moves via the slope; flat tree: 5. The hill is unreachable without slopes.
+        let v = view(m, vec![at(1, 3, 1, 1)], vec![], vec![]);
+        assert_eq!(assign(&v), vec![(DwarfId(1), hill)]);
+    }
+
+    #[test]
+    fn full_size_view_validates() {
+        let w = moria_core::world::generate(1);
+        let m = w.mountains.values().next().unwrap().clone();
+        let v = view(m, vec![at(1, 130, 47, 4)], vec![], vec![]);
+        assert!(validate(&v).is_ok());
     }
 }

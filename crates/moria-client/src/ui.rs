@@ -2,12 +2,11 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{BUILDS, Screen, Session};
+use crate::game::{BUILDS, Screen, Session, build_text, level_label, mode_label};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
-use moria_core::DesignationKind;
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
 use std::path::PathBuf;
@@ -255,15 +254,17 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     if !g.build_menu {
         return Ok(());
     }
-    let stone = g.resources.stone;
+    let r = g.resources;
     centered("Construire").show(ctx.ctx_mut()?, |ui| {
-        ui.label(format!("Pierre disponible : {stone}"));
+        ui.label(format!(
+            "Pierre disponible : {} · Bois disponible : {}",
+            r.stone, r.wood
+        ));
         ui.separator();
         let mut picked = None;
-        for (i, &(_, label, cost)) in BUILDS.iter().enumerate() {
-            let text = format!("{label} — {cost} pierre");
-            let b = egui::Button::new(text).selected(i == g.build_sel);
-            if ui.add_enabled(stone >= cost, b).clicked() {
+        for (i, &(kind, label)) in BUILDS.iter().enumerate() {
+            let b = egui::Button::new(build_text(kind, label)).selected(i == g.build_sel);
+            if ui.add_enabled(r.covers(&kind.cost()), b).clicked() {
                 picked = Some(i);
             }
         }
@@ -286,16 +287,16 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
         .resizable(false)
         .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
         .show(ctx.ctx_mut()?, |ui| {
-            let z = g.current_z();
+            let level = level_label(g.current_z());
             if g.browse_z.is_some() {
-                ui.label(format!("Niveau Z {z} (héros en Z {})", g.hero.pos.z));
+                ui.label(format!("{level} (héros : {})", level_label(g.hero.pos.z)));
             } else {
-                ui.label(format!("Niveau Z {z}"));
+                ui.label(level);
             }
             let r = g.resources;
             ui.label(format!(
-                "Pierre {} / Or {} / Mithril {}",
-                r.stone, r.gold, r.mithril
+                "Pierre {} / Bois {} / Or {} / Mithril {}",
+                r.stone, r.wood, r.gold, r.mithril
             ));
             ui.label(format!(
                 "{} — {} {}",
@@ -303,17 +304,10 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 g.hero.race.label_fr(),
                 g.hero.class.label_fr()
             ));
-            ui.label(match g.mode {
-                DesignationKind::Dig => "Mode : Creuser",
-                DesignationKind::Stairs => "Mode : Escalier",
-                DesignationKind::Wall => "Mode : Mur (1 pierre)",
-                DesignationKind::Bed => "Mode : Lit (1 pierre)",
-                DesignationKind::Table => "Mode : Table (1 pierre)",
-                DesignationKind::Chair => "Mode : Chaise (1 pierre)",
-            });
+            ui.label(mode_label(g.mode));
             ui.small(
-                "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X, 1, 2 : mode · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
+                "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
+                 · X : mode (creuser, escalier, couper, mur) · 1, 2 : creuser, escalier · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
