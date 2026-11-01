@@ -8,6 +8,11 @@ use moria_core::{MountainId, Resources};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+/// Log the first drop, then once per thousand more (a long outage at the cap drops every tick).
+fn should_log_drop(dropped: u64, seen: u64) -> bool {
+    dropped > seen && (seen == 0 || dropped / 1000 > seen / 1000)
+}
+
 pub struct InvSync {
     cache: Cache,
     state: State,
@@ -81,10 +86,9 @@ impl InvSync {
             }
         }
         let dropped = self.cache.dropped();
-        if dropped > self.dropped_seen {
+        if should_log_drop(dropped, self.dropped_seen) {
             tracing::error!(
-                "inventaire injoignable: {} lots non confirmes oubliés par le cache (total {dropped})",
-                dropped - self.dropped_seen
+                "inventaire injoignable: lots non confirmés oubliés par le cache (total {dropped})"
             );
             self.dropped_seen = dropped;
         }
@@ -154,6 +158,41 @@ mod tests {
         assert_eq!(res(&w).food, 12);
         assert_eq!(inv.cache.pending_len(), 0);
         assert!(!inv.inventory_up(Instant::now()));
+    }
+
+    #[test]
+    fn logs_first_drop() {
+        assert!(should_log_drop(1, 0));
+        assert!(!should_log_drop(0, 0));
+    }
+
+    #[test]
+    fn does_not_log_every_drop() {
+        assert!(!should_log_drop(2, 1));
+        assert!(!should_log_drop(999, 1));
+    }
+
+    #[test]
+    fn logs_each_thousand() {
+        assert!(should_log_drop(1000, 1));
+        assert!(!should_log_drop(1500, 1000));
+        assert!(should_log_drop(2000, 1000));
+    }
+
+    #[test]
+    fn yield_persists_across_ticks_with_cache_only_sync() {
+        let mut w = world(food(12));
+        let mut inv = InvSync::new("s", 1);
+        // No on_state ever: the cache alone must carry the yield from one tick to the next.
+        for i in 0..6 {
+            inv.begin_tick(&mut w);
+            if i == 0 {
+                w.fortresses.get_mut(&M).unwrap().resources.add(stone(4));
+            }
+            inv.end_tick(&w);
+        }
+        assert_eq!(res(&w).stone, 4);
+        assert_eq!(res(&w).food, 12);
     }
 
     #[test]

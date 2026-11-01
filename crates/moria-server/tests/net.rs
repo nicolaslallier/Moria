@@ -571,7 +571,7 @@ async fn create_hero_flood_keeps_server_usable() {
 
 #[tokio::test]
 async fn game_keeps_running_without_inventory() {
-    // amqp_url is None: the cache alone carries the game.
+    // amqp_url is None: the inventory is disabled and Fortress.resources stays authoritative.
     let s = Server::start("noinv").await;
     let (mut c, pos) = Client::new_player(&s, "durin").await;
     // Walk to the entrance's east edge, then dig the rock there.
@@ -581,6 +581,10 @@ async fn game_keeps_running_without_inventory() {
         loop {
             let d = c.next_tick().await;
             if d.resources.stone > 0 {
+                // Still there on later ticks: nothing overwrites the resources.
+                for _ in 0..5 {
+                    assert!(c.next_tick().await.resources.stone > 0, "yield lost");
+                }
                 break d.tick > first;
             }
             c.send(&ClientMsg::Move(Dir::E)).await;

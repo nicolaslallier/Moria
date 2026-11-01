@@ -91,6 +91,11 @@ async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) {
                 "publication de lot echouee ({} en attente): {e}",
                 unsent.len()
             );
+            // Best effort, once per failed attempt: the queue may have been deleted mid-run.
+            // No broker-free seam exists to test this.
+            if let Err(e) = bus.declare(KEY_APPLY, Queue::Durable("inventory")).await {
+                tracing::warn!("redeclaration de la file inventaire impossible: {e}");
+            }
             return;
         }
         unsent.pop_front();
@@ -98,10 +103,12 @@ async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) {
 }
 
 /// Runs until `views` closes. Connects with retry and reconnects when the subscription ends;
-/// views are dropped while the broker is down. Inventory batches are kept (capped, see
-/// `MAX_UNSENT`) and re-sent in order. Limitation: while stuck inside `connect_forever` (or
-/// a 10 s publish confirm) `batches` is not drained, so the channel itself buffers; the world
-/// task then logs and counts the overflow instead of blocking.
+/// views are dropped while the broker is down. Inventory batches are kept in `unsent` and
+/// re-sent in order. Limitation: while the bridge is inside `connect_forever` or a publish
+/// confirm (up to 10 s), `batches` is not drained, so the real cap there is the 65_536-slot
+/// channel, where the world side drops the NEWEST batches (counter
+/// `moria_inventory_dropped_total`). `MAX_UNSENT` (oldest dropped) only applies once the
+/// bridge is running again.
 pub async fn run(
     url: String,
     known: BTreeSet<MountainId>,
