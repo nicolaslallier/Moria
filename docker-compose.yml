@@ -1,7 +1,10 @@
 # Stack Moria. Variable de stack Portainer OBLIGATOIRE : MORIA_INVITE (code d'invitation).
-x-build: &build
-  context: .
-  dockerfile: docker/Dockerfile
+#
+# Déploiement : Portainer (stack 6) suit main en auto-update GitOps. Les images sont
+# construites par .github/workflows/server.yml, poussées sur GHCR, puis épinglées
+# ci-dessous par un commit automatique. Un commit sans changement d'image (client,
+# docs) ne recrée donc aucun conteneur. Rollback : git revert du commit « deploy: ».
+# En local, docker-compose.override.yml (chargé automatiquement) reconstruit depuis les sources.
 
 services:
   nats:
@@ -10,19 +13,15 @@ services:
 
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
-    image: moria-worldgen:local
-    build:
-      <<: *build
-      args: { BIN: moria-worldgen }
+    image: ghcr.io/nicolaslallier/moria-worldgen:sha-bootstrap
     volumes: ["moria-data:/data"]
     command: ["--out", "/data/world.bin"]
     restart: "no"
 
   server:
-    image: moria-server:local
-    build:
-      <<: *build
-      args: { BIN: moria-server }
+    image: ghcr.io/nicolaslallier/moria-server:sha-bootstrap
+    # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
+    stop_grace_period: 30s
     # 9464 : /metrics pour Prometheus (stack Infra, via host.docker.internal:9464).
     # Ne jamais le rediriger sur le routeur : seul 7777 sort sur Internet.
     ports: ["7777:7777", "9464:9464"]
@@ -37,10 +36,7 @@ services:
       worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
-    image: moria-dwarf-ai:local
-    build:
-      <<: *build
-      args: { BIN: moria-dwarf-ai }
+    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-bootstrap
     environment:
       NATS_URL: nats://nats:4222
     restart: unless-stopped

@@ -1,0 +1,16 @@
+# Dev local uniquement (chargé automatiquement par `docker compose`, ignoré par Portainer
+# qui passe le fichier explicitement) : construit les images depuis les sources.
+x-build: &build
+  context: .
+  dockerfile: docker/Dockerfile
+
+services:
+  worldgen:
+    image: moria-worldgen:local
+    build: { <<: *build, args: { BIN: moria-worldgen } }
+  server:
+    image: moria-server:local
+    build: { <<: *build, args: { BIN: moria-server } }
+  dwarf-ai:
+    image: moria-dwarf-ai:local
+    build: { <<: *build, args: { BIN: moria-dwarf-ai } }
