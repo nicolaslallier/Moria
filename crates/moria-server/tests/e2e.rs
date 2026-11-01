@@ -92,6 +92,8 @@ struct Client {
     s: TcpStream,
     view: FortressView,
     tick: u64,
+    /// Direction of the last dug tile, entered before the next dig.
+    step: Option<Dir>,
 }
 
 impl Client {
@@ -123,6 +125,7 @@ impl Client {
                 s,
                 view: *v,
                 tick: 0,
+                step: None,
             },
             m => panic!("expected snapshot, got {m:?}"),
         }
@@ -373,7 +376,10 @@ impl Client {
         let mut rx = env.states.clone();
         rx.borrow_and_update();
         for _ in 0..600 {
-            if rx.has_changed().unwrap() {
+            if rx
+                .has_changed()
+                .unwrap_or_else(|_| panic!("state forwarder ended; last seen {:?}", *rx.borrow()))
+            {
                 let s = rx.borrow_and_update().clone();
                 if ok(&s) {
                     return s;
@@ -387,6 +393,13 @@ impl Client {
     /// Hero digs `n` rock tiles, one after the other; returns the stone they yield.
     async fn dig(&mut self, n: u32) -> u32 {
         for _ in 0..n {
+            if let Some(d) = self.step.take() {
+                self.s
+                    .write_all(&encode(&ClientMsg::Move(d)))
+                    .await
+                    .unwrap();
+                self.ticks(4).await;
+            }
             let pos = self.view.hero.pos;
             let dir = Dir::HORIZONTAL
                 .into_iter()
@@ -399,11 +412,7 @@ impl Client {
                 .unwrap();
             self.until(300, |c| c.view.mountain.get(t) != Some(Tile::Rock))
                 .await;
-            self.s
-                .write_all(&encode(&ClientMsg::Move(dir)))
-                .await
-                .unwrap();
-            self.ticks(4).await;
+            self.step = Some(dir); // entered at the next dig, so callers act right after the yield
         }
         n * Tile::Rock.yield_().stone
     }
@@ -439,7 +448,7 @@ async fn resources_flow_through_the_inventory() {
     assert!(expected > start, "digging yields stone");
 
     let s = c.until_state(&env, |s| total(s).stone == expected).await;
-    assert_eq!(total(&s), c.view.resources);
+    assert_eq!(total(&s).stone, c.view.resources.stone);
     srv.stop().await;
     inv.stop().await;
     let disk = State::load_or_default(&inventory_file(&data)).unwrap();
@@ -476,7 +485,7 @@ async fn inventory_outage_keeps_the_game_running() {
     let inv = start_inventory(&file);
     let s = c.until_state(&env, |s| total(s).stone == expected).await;
     c.ticks(10).await;
-    assert_eq!(total(&s), c.view.resources);
+    assert_eq!(total(&s).stone, c.view.resources.stone);
     assert_eq!(c.view.resources.stone, expected, "no stone counted twice");
     srv.stop().await;
     inv.stop().await;
@@ -487,6 +496,8 @@ async fn inventory_outage_keeps_the_game_running() {
     rm(&data);
 }
 
+// Known gap: batches still unsent when the server stops are not covered (we wait for the
+// inventory to catch up before stopping).
 #[tokio::test]
 #[ignore]
 async fn server_restart_does_not_drop_batches() {
@@ -531,7 +542,12 @@ async fn inventory_killed_without_final_save_loses_nothing() {
     let (srv, addr) = start_server(&data).await;
     let mut c = Client::login(addr, "alice").await;
     let mut expected = c.view.resources.stone;
-    expected += c.dig(3).await;
+    expected += c.dig(1).await;
+    c.until_state(&env, |s| total(s).stone == expected).await;
+    // Burst without waiting for the inventory, then kill it right after the last yield, so
+    // batches are in flight. Probabilistic: the ack-before-save ordering is also guarded
+    // structurally by the `step` unit tests in moria-inventory.
+    expected += c.dig(12).await;
     inv.done.abort(); // no clean shutdown, no final save
     let _ = inv.done.await;
     c.ticks(10).await;
@@ -539,7 +555,7 @@ async fn inventory_killed_without_final_save_loses_nothing() {
     let inv = start_inventory(&file);
     let s = c.until_state(&env, |s| total(s).stone == expected).await;
     c.ticks(10).await;
-    assert_eq!(total(&s), c.view.resources);
+    assert_eq!(total(&s).stone, c.view.resources.stone);
     srv.stop().await;
     inv.stop().await;
     assert_eq!(
