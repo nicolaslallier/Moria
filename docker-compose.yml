@@ -22,14 +22,21 @@ services:
     image: ghcr.io/nicolaslallier/moria-server:sha-d19bc51602d88af310d722bfad2b7162d3f4cc62
     # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
     stop_grace_period: 30s
+    # 7777 n'est plus publié ici : le nginx de l'infra (stream.d/moria.conf) l'expose et
+    # joint ce conteneur par l'alias « moria-server » sur infra-net.
     # 9464 : /metrics pour Prometheus (stack Infra, via host.docker.internal:9464).
     # Ne jamais le rediriger sur le routeur : seul 7777 sort sur Internet.
-    ports: ["7777:7777", "9464:9464"]
+    ports: ["9464:9464"]
+    networks:
+      default:
+      infra-net: { aliases: [moria-server] }
     volumes: ["moria-data:/data"]
     environment:
       NATS_URL: nats://nats:4222
       MORIA_INVITE: ${MORIA_INVITE:?définir MORIA_INVITE dans les variables de la stack Portainer}
-      MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-4}
+      # Derrière nginx, toutes les connexions viennent de l'IP du proxy : la limite par IP
+      # réelle est faite par nginx (limit_conn), on neutralise celle du serveur.
+      MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-1000}
     restart: unless-stopped
     depends_on:
       nats: { condition: service_started }
@@ -43,6 +50,10 @@ services:
     depends_on: [nats]
     deploy:
       replicas: 1
+
+networks:
+  infra-net:
+    external: true
 
 volumes:
   moria-data:
