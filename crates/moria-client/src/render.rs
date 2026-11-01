@@ -68,6 +68,7 @@ pub fn plugin(app: &mut App) {
                 (
                     sync_tiles,
                     sync_marks,
+                    sync_order_counts,
                     follow_camera,
                     draw_outlines,
                     draw_relief,
@@ -280,6 +281,35 @@ fn sync_marks(
         let mut v = Visibility::default();
         place(&mut t, &mut v, p, z, 1.0);
         commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
+    }
+}
+
+/// The order count of a workshop, redrawn each frame (a handful of orders at most).
+#[derive(Component)]
+struct OrderCount;
+
+fn sync_order_counts(
+    mut commands: Commands,
+    client: Res<Client>,
+    lighting: Option<Res<Lighting>>,
+    old: Query<Entity, With<OrderCount>>,
+) {
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    let (Some(g), Some(l)) = (&client.session.game, lighting) else {
+        return;
+    };
+    let z = g.current_z();
+    for (&p, n) in g.mountain.orders.iter().filter(|(p, _)| p.z == z) {
+        commands.spawn((
+            Text2d::new(n.to_string()),
+            TextFont::from_font_size(TILE * 0.4),
+            TextColor(dim(Color::WHITE, brightness(g, &l, p.x, p.y, z))),
+            Transform::from_translation(to_world(p.x, p.y).extend(1.5)),
+            DespawnOnExit(Screen::Playing),
+            OrderCount,
+        ));
     }
 }
 
