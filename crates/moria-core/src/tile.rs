@@ -202,9 +202,16 @@ mod tests {
 
     #[test]
     fn wire_encoding_is_unchanged() {
-        // Water is the 12th variant (index 11) since the save format v2.
-        assert_eq!(postcard::to_allocvec(&Tile::Water).unwrap(), [11]);
-        assert_eq!(postcard::to_allocvec(&Tile::WoodChair).unwrap(), [17]);
+        use Tile::*;
+        // The original variant order since save format v2; the index is the postcard byte.
+        let expected = [
+            Rock, Gold, Mithril, Floor, Stair, Wall, Bed, Table, Chair, Grass, Tree, Water, Slope,
+            Soil, Sky, WoodBed, WoodTable, WoodChair,
+        ];
+        assert_eq!(Tile::ALL, expected);
+        for (i, t) in expected.iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(t).unwrap(), [i as u8], "{t:?}");
+        }
     }
 
     #[test]
