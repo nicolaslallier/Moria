@@ -75,8 +75,9 @@ pub fn decode_state(bytes: &[u8]) -> Option<State> {
     }
 }
 
-/// Publishes unsent batches in order until one fails (it stays at the front for the next try).
-async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) {
+/// Publishes unsent batches in order until one fails (it stays at the front for the next
+/// try). `false` = a publish failed: the caller reconnects (which re-declares the queue).
+async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) -> bool {
     while let Some(b) = unsent.front() {
         let bytes = match postcard::to_allocvec(b) {
             Ok(v) => v,
@@ -91,14 +92,39 @@ async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) {
                 "publication de lot echouee ({} en attente): {e}",
                 unsent.len()
             );
-            // Best effort, once per failed attempt: the queue may have been deleted mid-run.
-            // No broker-free seam exists to test this.
-            if let Err(e) = bus.declare(KEY_APPLY, Queue::Durable("inventory")).await {
-                tracing::warn!("redeclaration de la file inventaire impossible: {e}");
-            }
-            return;
+            return false;
         }
         unsent.pop_front();
+    }
+    true
+}
+
+/// Waits 2 s before a reconnect, still taking batches. `false` = the world task is gone.
+async fn pause(batches: &mut mpsc::Receiver<Batch>, unsent: &mut VecDeque<Batch>) -> bool {
+    let t = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(t);
+    loop {
+        tokio::select! {
+            () = &mut t => return true,
+            b = batches.recv() => match b {
+                Some(b) => push_unsent(unsent, b),
+                None => return false,
+            },
+        }
+    }
+}
+
+/// Shutdown: the world task is gone, so whatever is left in the channel and in `unsent` is the
+/// last word on the stock. Best effort within 5 s.
+async fn finish(bus: &Bus, unsent: &mut VecDeque<Batch>, batches: &mut mpsc::Receiver<Batch>) {
+    while let Ok(b) = batches.try_recv() {
+        push_unsent(unsent, b);
+    }
+    if tokio::time::timeout(Duration::from_secs(5), flush(bus, unsent))
+        .await
+        .is_err()
+    {
+        tracing::warn!("{} lots d'inventaire non envoyes a l'arret", unsent.len());
     }
 }
 
@@ -125,7 +151,9 @@ pub async fn run(
             tracing::warn!(
                 "declaration de la file inventaire impossible ({e}), nouvel essai dans 2 s"
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !pause(&mut batches, &mut unsent).await {
+                return;
+            }
             continue;
         }
         let (mut sub, mut state_sub) = match (
@@ -135,18 +163,23 @@ pub async fn run(
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => {
                 tracing::warn!("abonnement impossible ({e}), nouvel essai dans 2 s");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !pause(&mut batches, &mut unsent).await {
+                    return;
+                }
                 continue;
             }
         };
         tracing::info!("pont IA connecte a {}", moria_bus::redact_url(&url));
         M.bus_up.store(1, Relaxed);
-        flush(&bus, &mut unsent).await;
+        let mut ok = flush(&bus, &mut unsent).await;
         let mut retry = tokio::time::interval(Duration::from_secs(1));
-        loop {
+        while ok {
             tokio::select! {
                 v = views.recv() => {
-                    let Some(v) = v else { return };
+                    let Some(v) = v else {
+                        finish(&bus, &mut unsent, &mut batches).await;
+                        return;
+                    };
                     let up = bus.is_connected();
                     M.bus_up.store(up as i64, Relaxed);
                     if !up {
@@ -155,20 +188,26 @@ pub async fn run(
                     match postcard::to_allocvec(&v) {
                         Ok(b) => match bus.publish(KEY_VIEW, b, false).await {
                             Ok(()) => inc(&M.views_published),
-                            Err(e) => tracing::warn!("publication de vue echouee: {e}"),
+                            Err(e) => {
+                                tracing::warn!("publication de vue echouee, reconnexion: {e}");
+                                break;
+                            }
                         },
                         Err(e) => tracing::error!("encodage de vue impossible: {e}"),
                     }
                 }
                 b = batches.recv() => {
-                    let Some(b) = b else { return };
+                    let Some(b) = b else {
+                        finish(&bus, &mut unsent, &mut batches).await;
+                        return;
+                    };
                     push_unsent(&mut unsent, b);
                     if bus.is_connected() {
-                        flush(&bus, &mut unsent).await;
+                        ok = flush(&bus, &mut unsent).await;
                     }
                 }
                 _ = retry.tick(), if !unsent.is_empty() && bus.is_connected() => {
-                    flush(&bus, &mut unsent).await;
+                    ok = flush(&bus, &mut unsent).await;
                 }
                 m = sub.next() => {
                     let Some(m) = m else {
@@ -197,6 +236,12 @@ pub async fn run(
             }
         }
         M.bus_up.store(0, Relaxed);
+        if !ok {
+            tracing::warn!("canal de publication inutilisable, reconnexion");
+            if !pause(&mut batches, &mut unsent).await {
+                return;
+            }
+        }
     }
 }
 

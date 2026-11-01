@@ -154,6 +154,11 @@ pub async fn run_with_listener(
         ),
         Err(e) => anyhow::bail!("lecture du monde {} impossible : {e}", cfg.data.display()),
     };
+    let world_mtime_ms = std::fs::metadata(&cfg.data)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
     let (req_tx, req_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (assign_tx, assign_rx) = mpsc::channel(64);
@@ -228,10 +233,11 @@ pub async fn run_with_listener(
         }
     });
 
-    // Wall-clock ms: the inventory tells runs apart by it (not monotonic if the clock is set back).
-    let epoch = std::time::SystemTime::now()
+    // The inventory tells runs apart by epoch: wall-clock ms, lifted above world.bin's mtime.
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
+    let epoch = start_epoch(now_ms, world_mtime_ms);
     tracing::info!("époque de l'inventaire : {epoch}");
     let inv = if cfg.amqp_url.is_some() {
         InvSync::new("server", epoch)
@@ -255,10 +261,23 @@ pub async fn run_with_listener(
     };
     let r = state.run(shutdown).await;
     accept.abort();
-    if let Some(b) = bridge {
+    // The state is gone, so the bridge's channels are closed: let it flush what is left.
+    if let Some(mut b) = bridge
+        && tokio::time::timeout(Duration::from_secs(5), &mut b)
+            .await
+            .is_err()
+    {
+        tracing::warn!("le pont n'a pas fini d'envoyer les lots d'inventaire en 5 s, arrêt forcé");
         b.abort();
     }
     r
+}
+
+/// Wall-clock ms, but never below the world file's mtime + 1: world.bin is rewritten during
+/// and at the end of every run, so its mtime is past the previous run's epoch even when the
+/// clock was set back (a lower epoch makes the inventory discard every batch).
+fn start_epoch(now_ms: u64, world_mtime_ms: Option<u64>) -> u64 {
+    world_mtime_ms.map_or(now_ms, |m| now_ms.max(m.saturating_add(1)))
 }
 
 struct State {
@@ -667,6 +686,22 @@ mod tests {
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
         assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
+    }
+
+    #[test]
+    fn epoch_never_below_world_mtime() {
+        assert_eq!(start_epoch(1_000, Some(5_000)), 5_001);
+        assert_eq!(start_epoch(5_000, Some(5_000)), 5_001);
+    }
+
+    #[test]
+    fn epoch_uses_clock_when_ahead() {
+        assert_eq!(start_epoch(9_000, Some(5_000)), 9_000);
+    }
+
+    #[test]
+    fn epoch_falls_back_without_mtime() {
+        assert_eq!(start_epoch(1_000, None), 1_000);
     }
 
     #[test]

@@ -8,10 +8,31 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Un lot d'une epoque plus ancienne que celle deja vue pour son emetteur est ignore a vie.
+fn is_older_epoch(state: &State, b: &Batch) -> bool {
+    state.acks.get(&b.sender).is_some_and(|&(e, _)| b.epoch < e)
+}
+
+/// Un lot legitime fait ~100 octets.
+const MAX_BATCH_BYTES: usize = 1024;
+
 /// Decode et applique un lot ; `false` si illisible, perime ou doublon.
 pub fn handle(state: &mut State, payload: &[u8]) -> bool {
+    if payload.len() > MAX_BATCH_BYTES {
+        tracing::warn!("lot ignore: {} octets", payload.len());
+        return false;
+    }
     match postcard::from_bytes::<Batch>(payload) {
-        Ok(b) => state.apply(&b),
+        Ok(b) => {
+            if is_older_epoch(state, &b) {
+                tracing::warn!(
+                    "lot d'une epoque perimee ignore (emetteur {}, epoque {})",
+                    b.sender,
+                    b.epoch
+                );
+            }
+            state.apply(&b)
+        }
         Err(e) => {
             tracing::warn!("lot illisible ignore ({} octets): {e}", payload.len());
             false
@@ -153,6 +174,31 @@ mod tests {
             take: Resources::default(),
             seed: false,
         }
+    }
+
+    #[test]
+    fn oversized_batch_payload_is_ignored() {
+        let mut s = State::default();
+        let mut big = payload();
+        // trailing bytes would decode fine, so only the cap can reject this
+        big.resize(MAX_BATCH_BYTES + 1, 0);
+        assert!(postcard::from_bytes::<Batch>(&big).is_ok());
+        assert!(!handle(&mut s, &big));
+        assert_eq!(s, State::default());
+    }
+
+    #[test]
+    fn older_epoch_is_told_apart_from_a_duplicate() {
+        let mut s = State::default();
+        s.acks.insert("a".into(), (5, 3));
+        let b = |epoch, seq| Batch {
+            epoch,
+            seq,
+            ..batch()
+        };
+        assert!(is_older_epoch(&s, &b(4, 9)));
+        assert!(!is_older_epoch(&s, &b(5, 3)), "doublon, pas une epoque");
+        assert!(!is_older_epoch(&s, &b(6, 1)));
     }
 
     #[test]

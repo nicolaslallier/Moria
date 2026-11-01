@@ -13,8 +13,16 @@ fn should_log_drop(dropped: u64, seen: u64) -> bool {
     dropped > seen && (seen == 0 || dropped / 1000 > seen / 1000)
 }
 
+/// The inventory has seen a NEWER run of our sender than this one: it will ignore all our batches.
+fn ack_ahead(st: &State, sender: &str, epoch: u64) -> bool {
+    st.acks.get(sender).is_some_and(|&(e, _)| e > epoch)
+}
+
 pub struct InvSync {
     cache: Cache,
+    sender: String,
+    epoch: u64,
+    warned_epoch: bool,
     state: State,
     last_state: Option<Instant>,
     seeded: BTreeSet<MountainId>,
@@ -29,6 +37,9 @@ impl InvSync {
     pub fn new(sender: &str, epoch: u64) -> InvSync {
         InvSync {
             cache: Cache::new(sender, epoch),
+            sender: sender.into(),
+            epoch,
+            warned_epoch: false,
             state: State::default(),
             last_state: None,
             seeded: BTreeSet::new(),
@@ -96,6 +107,13 @@ impl InvSync {
     }
 
     pub fn on_state(&mut self, st: State) {
+        if !self.warned_epoch && ack_ahead(&st, &self.sender, self.epoch) {
+            self.warned_epoch = true;
+            tracing::error!(
+                "l'inventaire connait une époque plus récente que {} : tous les lots de cette exécution seront ignorés (horloge en retard ?)",
+                self.epoch
+            );
+        }
         self.cache.reconcile(&st);
         self.state = st;
         self.last_state = Some(Instant::now());
@@ -158,6 +176,17 @@ mod tests {
         assert_eq!(res(&w).food, 12);
         assert_eq!(inv.cache.pending_len(), 0);
         assert!(!inv.inventory_up(Instant::now()));
+    }
+
+    #[test]
+    fn newer_ack_epoch_is_detected() {
+        let mut st = State::default();
+        assert!(!ack_ahead(&st, "s", 5));
+        st.acks.insert("s".into(), (5, 9));
+        assert!(!ack_ahead(&st, "s", 5), "same run");
+        assert!(!ack_ahead(&st, "s", 6));
+        assert!(ack_ahead(&st, "s", 4));
+        assert!(!ack_ahead(&st, "other", 4));
     }
 
     #[test]
