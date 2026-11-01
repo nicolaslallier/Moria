@@ -3,8 +3,9 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, ORDER_ROWS, Screen, Session, ability_rows, build_text, clock_label,
-    level_label, mode_label, recipe_label, resource_bar, stock_text, workshop_label,
+    ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, ability_rows,
+    available_text, build_text, clock_label, level_label, mode_label, recipe_label, resource_bar,
+    stock_text, workshop_label,
 };
 use crate::lang::{en, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
@@ -25,8 +26,6 @@ struct LoginForm {
     name: String,
     password: String,
     invite: String,
-    /// English instead of French.
-    en: bool,
 }
 
 #[derive(Resource)]
@@ -111,15 +110,15 @@ fn load_prefs() -> LoginForm {
         .flatten()
         .find_map(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
-    let f = parse_prefs(&text);
-    set_en(f.en);
+    let (f, en) = parse_prefs(&text);
+    set_en(en);
     f
 }
 
-/// Lines: address, name, language (`en` or `fr`).
-fn parse_prefs(text: &str) -> LoginForm {
+/// Lines: address, name, language (`en` or `fr`). Returns the form and whether English is on.
+fn parse_prefs(text: &str) -> (LoginForm, bool) {
     let mut l = text.lines().map(str::to_owned);
-    LoginForm {
+    let f = LoginForm {
         addr: l
             .next()
             .filter(|s| !s.is_empty())
@@ -127,19 +126,19 @@ fn parse_prefs(text: &str) -> LoginForm {
         name: l.next().unwrap_or_default(),
         password: String::new(),
         invite: String::new(),
-        // An older file's 3rd line is the invite: anything but `en` means French.
-        en: l.next().is_some_and(|s| s == "en"),
-    }
+    };
+    // An older file's 3rd line is the invite: anything but `en` means French.
+    (f, l.next().is_some_and(|s| s == "en"))
 }
 
 /// Never contains the password or the invite code.
-fn prefs_text(f: &LoginForm) -> String {
-    let lang = if f.en { "en" } else { "fr" };
+fn prefs_text(f: &LoginForm, en: bool) -> String {
+    let lang = if en { "en" } else { "fr" };
     format!("{}\n{}\n{lang}\n", f.addr, f.name)
 }
 
 fn save_prefs(f: &LoginForm) {
-    let text = prefs_text(f);
+    let text = prefs_text(f, en());
     if prefs_path().is_some_and(|p| std::fs::write(p, &text).is_ok()) {
         return;
     }
@@ -185,7 +184,7 @@ fn backdrop(ctx: &mut EguiContexts, images: &Assets<Image>, image: &Handle<Image
 
 fn error_label(ui: &mut egui::Ui, s: &Session) {
     if let Some(e) = &s.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, e);
+        ui.colored_label(egui::Color32::LIGHT_RED, e.text());
     }
 }
 
@@ -216,7 +215,7 @@ fn login(
             )));
             ui.end_row();
         });
-        lang_picker(ui, &mut form);
+        lang_picker(ui, &form);
         error_label(ui, &client.session);
         if connecting {
             ui.label(tr("Connexion en cours…", "Connecting…"));
@@ -307,17 +306,7 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     }
     let r = g.resources;
     centered(tr("Construire", "Build")).show(ctx.ctx_mut()?, |ui| {
-        ui.label(if en() {
-            format!(
-                "Available: {} stone · {} wood · {} gold · {} ingots · {} iron doors",
-                r.stone, r.wood, r.gold, r.iron, r.iron_door
-            )
-        } else {
-            format!(
-                "Disponible : {} pierre · {} bois · {} or · {} lingots · {} portes en fer",
-                r.stone, r.wood, r.gold, r.iron, r.iron_door
-            )
-        });
+        ui.label(available_text(r));
         ui.separator();
         let mut picked = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -623,68 +612,109 @@ fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
 }
 
 /// French / English; the choice is kept in the prefs file.
-fn lang_picker(ui: &mut egui::Ui, form: &mut LoginForm) {
+fn lang_picker(ui: &mut egui::Ui, form: &LoginForm) {
     ui.horizontal(|ui| {
         ui.label(tr("Langue", "Language"));
-        let mut en = form.en;
-        ui.radio_value(&mut en, false, "Français");
-        ui.radio_value(&mut en, true, "English");
-        if en != form.en {
-            form.en = en;
-            set_en(en);
-            save_prefs(form);
+        let mut on = en();
+        ui.radio_value(&mut on, false, "Français");
+        ui.radio_value(&mut on, true, "English");
+        if on != en() {
+            switch_language(form, on);
         }
     });
 }
 
+fn switch_language(form: &LoginForm, on: bool) {
+    set_en(on);
+    save_prefs(form);
+}
+
+fn pause_label(row: PauseRow) -> &'static str {
+    match row {
+        PauseRow::Resume => tr("Reprendre", "Resume"),
+        PauseRow::MainMenu => tr("Retour au menu principal", "Back to main menu"),
+        PauseRow::Save => tr("Sauvegarder", "Save"),
+        PauseRow::Language => tr(
+            "Langue : Français → English",
+            "Language: English → Français",
+        ),
+        PauseRow::Quit => tr("Quitter le jeu", "Quit the game"),
+    }
+}
+
 /// Escape menu: back to the login screen, save, language, quit. The world keeps running.
+/// Mouse clicks, or N/S + Space / A from `play`, pick a row.
 fn pause_menu(
     mut ctx: EguiContexts,
     mut client: ResMut<Client>,
-    mut form: ResMut<LoginForm>,
+    form: Res<LoginForm>,
     mut exit: MessageWriter<AppExit>,
-    mut saved: Local<bool>,
 ) -> Result {
-    let Some(g) = &mut client.session.game else {
+    let s = &mut client.session;
+    let Some(g) = &mut s.game else {
         return Ok(());
     };
     if !g.pause {
-        *saved = false;
+        s.saved = None;
         return Ok(());
     }
-    let (mut leave, mut save) = (false, false);
+    let mut picked = std::mem::take(&mut g.pause_pick).then_some(g.pause_sel);
     centered(tr("Menu", "Menu")).show(ctx.ctx_mut()?, |ui| {
         ui.vertical_centered_justified(|ui| {
-            if ui.button(tr("Reprendre (Échap)", "Resume (Esc)")).clicked() {
-                g.pause = false;
+            for (i, &row) in PAUSE_ROWS.iter().enumerate() {
+                let r = ui.add(egui::Button::new(pause_label(row)).selected(i == g.pause_sel));
+                // Space picks the row (see `play`): a focused button would click too.
+                r.surrender_focus();
+                if r.clicked() {
+                    picked = Some(i);
+                }
+                if row == PauseRow::Save {
+                    match s.saved {
+                        Some(true) => {
+                            ui.label(tr(
+                                "Carte sauvegardée. Le serveur sauvegarde le monde toutes les 30 s.",
+                                "Map saved. The server saves the world every 30 s.",
+                            ));
+                        }
+                        Some(false) => {
+                            ui.colored_label(
+                                egui::Color32::LIGHT_RED,
+                                tr(
+                                    "Échec de la sauvegarde de la carte (dossier non inscriptible ?)",
+                                    "Saving the map failed (folder not writable?)",
+                                ),
+                            );
+                        }
+                        None => {}
+                    }
+                }
             }
-            leave = ui
-                .button(tr("Retour au menu principal", "Back to main menu"))
-                .clicked();
-            save = ui.button(tr("Sauvegarder", "Save")).clicked();
-            if *saved {
-                ui.label(tr(
-                    "Carte sauvegardée. Le serveur sauvegarde le monde toutes les 30 s.",
-                    "Map saved. The server saves the world every 30 s.",
-                ));
-            }
-            ui.separator();
-            lang_picker(ui, &mut form);
-            ui.separator();
-            if ui.button(tr("Quitter le jeu", "Quit the game")).clicked() {
-                // `memory_sync` saves the map on exit.
-                exit.write(AppExit::Success);
-            }
+            ui.small(tr(
+                "Échap ou Start : fermer · N/S + Espace ou A : choisir",
+                "Esc or Start: close · N/S + Space or A: pick",
+            ));
         });
     });
-    if save {
-        client.session.save_now = true;
-        *saved = true;
-    }
-    if leave {
-        // Dropping the handle closes the connection; `memory_sync` saves the map.
-        client.session.leave();
-        client.net = None;
+    let Some(i) = picked else {
+        return Ok(());
+    };
+    g.pause_sel = i;
+    match PAUSE_ROWS[i] {
+        PauseRow::Resume => g.pause = false,
+        PauseRow::MainMenu => {
+            // Dropping the handle closes the connection; `memory_sync` saves the map.
+            s.leave();
+            client.net = None;
+        }
+        PauseRow::Save => {
+            s.saved = None;
+            s.save_now = true;
+        }
+        PauseRow::Language => switch_language(&form, !en()),
+        PauseRow::Quit => {
+            // `memory_sync` saves the map on exit.
+            exit.write(AppExit::Success);
+        }
     }
     Ok(())
 }
@@ -959,17 +989,16 @@ mod tests {
             name: "Gimli".into(),
             password: "motdepasse".into(),
             invite: "mellon".into(),
-            en: true,
         };
-        let t = prefs_text(&f);
+        let t = prefs_text(&f, true);
         assert_eq!(t, "1.2.3.4:7777\nGimli\nen\n");
     }
 
     #[test]
     fn prefs_keep_the_language_and_ignore_an_old_invite_line() {
-        assert!(parse_prefs("a\nb\nen\n").en);
-        assert!(!parse_prefs("a\nb\nfr\n").en);
-        assert!(!parse_prefs("a\nb\nmellon\n").en); // older file: 3rd line was the invite
-        assert!(!parse_prefs("").en);
+        assert!(parse_prefs("a\nb\nen\n").1);
+        assert!(!parse_prefs("a\nb\nfr\n").1);
+        assert!(!parse_prefs("a\nb\nmellon\n").1); // older file: 3rd line was the invite
+        assert!(!parse_prefs("").1);
     }
 }

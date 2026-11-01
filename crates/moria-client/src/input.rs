@@ -1,7 +1,7 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Game, ORDER_ROWS, Screen, drag_msg};
+use crate::game::{Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
@@ -196,6 +196,16 @@ fn order_frame(
     })
 }
 
+/// The pause menu's share of a frame: N/S step on a new press, the action button picks.
+fn pause_frame(g: &mut Game, menu_dir: &mut Option<Dir>, walk: Option<Dir>, act: bool) {
+    if walk != *menu_dir && matches!(walk, Some(Dir::N | Dir::S)) {
+        let n = PAUSE_ROWS.len();
+        g.pause_sel = (g.pause_sel + if walk == Some(Dir::S) { 1 } else { n - 1 }) % n;
+    }
+    *menu_dir = walk;
+    g.pause_pick |= act;
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -225,9 +235,9 @@ fn play(
         g.close_menus();
         g.pause = false;
     }
-    // Pause menu open: the mouse drives it, nothing reaches the hero.
+    // Pause menu open: moves and the action button drive it, nothing reaches the hero.
     if g.pause {
-        *menu_dir = None;
+        pause_frame(g, menu_dir, k.walk.or(p.walk), k.dig || p.dig);
         return;
     }
     if k.build_menu || p.build_menu {
@@ -339,6 +349,24 @@ fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_menu_steps_on_new_presses_and_picks_with_the_action_button() {
+        use crate::game::PAUSE_ROWS;
+        let mut g = crate::game::tests::game();
+        g.pause = true;
+        let mut d = None;
+        pause_frame(&mut g, &mut d, Some(Dir::S), false);
+        pause_frame(&mut g, &mut d, Some(Dir::S), false); // held: one step only
+        assert_eq!(g.pause_sel, 1);
+        for walk in [None, Some(Dir::N), None, Some(Dir::N)] {
+            pause_frame(&mut g, &mut d, walk, false);
+        }
+        assert_eq!(g.pause_sel, PAUSE_ROWS.len() - 1); // wrapped
+        assert!(!g.pause_pick);
+        pause_frame(&mut g, &mut d, None, true);
+        assert!(g.pause_pick);
+    }
 
     #[test]
     fn key_4_picks_chop() {

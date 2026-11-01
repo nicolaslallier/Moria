@@ -1,9 +1,9 @@
 //! Client-side model, free of Bevy systems: session flow, local fortress copy,
 //! prediction and input rules. The Bevy systems in the other modules only call this.
 
-use crate::lang::{en, tr, word};
+use crate::lang::{tr, word};
 use crate::light::{Explored, SEEN_AT};
-use crate::net::NetEvent;
+use crate::net::{NetEvent, Notice};
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
 use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
@@ -45,14 +45,16 @@ pub enum Screen {
     Disconnected,
 }
 
-pub fn reject_fr(r: &Reject) -> String {
+pub fn reject_text(r: &Reject) -> String {
     match r {
-        Reject::VersionMismatch { server } if en() => {
-            format!("Server version differs (server v{server}) — update the client")
-        }
-        Reject::VersionMismatch { server } => {
-            format!("Version différente du serveur (serveur v{server}) — mettez le client à jour")
-        }
+        Reject::VersionMismatch { server } => format!(
+            "{}{server}{}",
+            tr(
+                "Version différente du serveur (serveur v",
+                "Server version differs (server v"
+            ),
+            tr(") — mettez le client à jour", ") — update the client")
+        ),
         Reject::BadPassword => tr(
             "Pseudo ou mot de passe incorrect — première fois ? utilisez « Créer un compte »",
             "Wrong name or password — first time? use “Create an account”",
@@ -111,7 +113,7 @@ pub fn level_label(z: u8) -> String {
 
 /// Each resource a recipe can cost, with its name inside a sentence ("1 porte en fer forgée").
 /// Not built from `resource_bar`: the bar uses short capitalised titles, and mithril is never a cost.
-fn named(r: Resources) -> [(u32, &'static str); 7] {
+pub fn named(r: Resources) -> [(u32, &'static str); 7] {
     [
         (r.stone, "pierre"),
         (r.wood, "bois"),
@@ -157,6 +159,16 @@ pub fn stock_text(k: DesignationKind, spare: Resources) -> String {
         .collect::<Vec<_>>()
         .join(" · ");
     format!("{}{have}", tr("En réserve : ", "In stock: "))
+}
+
+/// Build-menu line: every resource a build can cost, "Disponible : 1 pierre · 0 bois · …".
+pub fn available_text(r: Resources) -> String {
+    let have = named(r)
+        .iter()
+        .map(|(n, what)| format!("{n} {}", word(what)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("{}{have}", tr("Disponible : ", "Available: "))
 }
 
 /// A workshop's name, from the build menu.
@@ -242,6 +254,10 @@ pub struct Game {
     pub status: bool,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
+    /// Highlighted row of the pause menu, for keyboard and gamepad.
+    pub pause_sel: usize,
+    /// The action button picked `pause_sel`; the pause menu acts on it next frame.
+    pub pause_pick: bool,
     /// Last horizontal direction pressed; Space digs that way.
     pub last_dir: Dir,
     pub mode: DesignationKind,
@@ -297,6 +313,24 @@ pub fn recipe_label(k: DesignationKind) -> &'static str {
     }
 }
 
+/// Pause-menu rows, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PauseRow {
+    Resume,
+    MainMenu,
+    Save,
+    Language,
+    Quit,
+}
+
+pub const PAUSE_ROWS: [PauseRow; 5] = [
+    PauseRow::Resume,
+    PauseRow::MainMenu,
+    PauseRow::Save,
+    PauseRow::Language,
+    PauseRow::Quit,
+];
+
 /// Bottom-bar buttons with their key; `None` is the build menu.
 pub const ACTIONS: &[(&str, Option<DesignationKind>)] = &[
     ("Creuser [1]", Some(DesignationKind::Dig)),
@@ -308,6 +342,9 @@ pub const ACTIONS: &[(&str, Option<DesignationKind>)] = &[
 impl Game {
     /// A bar button or its key: picks the mode (closing the menu), or toggles the build menu.
     pub fn pick_action(&mut self, a: Option<DesignationKind>) {
+        if self.pause {
+            return;
+        }
         match a {
             Some(m) => {
                 self.mode = m;
@@ -343,6 +380,7 @@ impl Game {
     pub fn escape(&mut self) {
         if !self.close_menus() {
             self.pause = !self.pause;
+            self.pause_sel = 0;
         }
     }
 
@@ -376,6 +414,8 @@ impl Game {
             map_rev: 0,
             status: false,
             pause: false,
+            pause_sel: 0,
+            pause_pick: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
             build_menu: false,
@@ -588,8 +628,8 @@ pub fn outlined(
 #[derive(Default)]
 pub struct Session {
     pub screen: Screen,
-    /// Login error or disconnect reason, in French.
-    pub error: Option<String>,
+    /// Login error or disconnect reason.
+    pub error: Option<Notice>,
     pub game: Option<Game>,
     /// Bumped on every accepted snapshot so the renderer rebuilds the map.
     pub snapshots: u32,
@@ -597,6 +637,8 @@ pub struct Session {
     pub left: Vec<Game>,
     /// Save the running game's explored map on the next frame.
     pub save_now: bool,
+    /// Whether the last `save_now` reached the disk, for the pause menu.
+    pub saved: Option<bool>,
 }
 
 impl Session {
@@ -611,18 +653,11 @@ impl Session {
                 false
             }
             NetEvent::Msg(ServerMsg::Reject(r)) => {
-                self.end(Screen::Login, reject_fr(&r));
+                self.end(Screen::Login, Notice::Rejected(r));
                 true
             }
             NetEvent::Msg(ServerMsg::Snapshot(v)) if !valid_view(&v) => {
-                self.end(
-                    Screen::Disconnected,
-                    tr(
-                        "Données invalides reçues du serveur",
-                        "Invalid data received from the server",
-                    )
-                    .into(),
-                );
+                self.end(Screen::Disconnected, Notice::BadData);
                 true
             }
             NetEvent::Msg(ServerMsg::Snapshot(v)) => {
@@ -667,7 +702,7 @@ impl Session {
         self.left.extend(self.game.take());
     }
 
-    fn end(&mut self, screen: Screen, msg: String) {
+    fn end(&mut self, screen: Screen, msg: Notice) {
         self.screen = screen;
         self.error = Some(msg);
         self.left.extend(self.game.take());
@@ -771,17 +806,40 @@ pub(crate) mod tests {
         g.order_menu = Some(Dir::E);
         g.escape();
         assert!(!g.build_menu && !g.status && g.order_menu.is_none() && !g.pause);
+        g.pause_sel = 3;
         g.escape();
-        assert!(g.pause);
+        assert!(g.pause && g.pause_sel == 0);
         g.escape();
         assert!(!g.pause);
+    }
+
+    #[test]
+    fn bar_actions_do_nothing_while_paused() {
+        let mut g = game();
+        g.pause = true;
+        g.pick_action(None);
+        g.pick_action(Some(DesignationKind::Chop));
+        assert!(!g.build_menu && g.mode == DesignationKind::Dig);
+    }
+
+    #[test]
+    fn available_line_lists_every_cost_resource() {
+        let r = Resources {
+            stone: 1,
+            iron: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            available_text(r),
+            "Disponible : 1 pierre · 0 bois · 0 or · 0 minerai de fer · 0 charbon · 2 lingots · 0 porte en fer forgée"
+        );
     }
 
     #[test]
     fn leaving_returns_to_login_and_queues_the_game_for_its_save() {
         let mut s = Session {
             screen: Screen::Playing,
-            error: Some("old".into()),
+            error: Some(Notice::BadData),
             game: Some(game()),
             ..Default::default()
         };
@@ -844,7 +902,7 @@ pub(crate) mod tests {
             ),
         ];
         for (r, want) in cases {
-            assert_eq!(reject_fr(&r), want);
+            assert_eq!(Notice::Rejected(r).text(), want);
         }
     }
 
@@ -989,9 +1047,10 @@ pub(crate) mod tests {
             };
             assert!(s.handle(view(m)));
             assert_eq!(s.screen, Screen::Disconnected);
+            assert_eq!(s.error, Some(Notice::BadData));
             assert_eq!(
-                s.error.as_deref(),
-                Some("Données invalides reçues du serveur")
+                Notice::BadData.text(),
+                "Données invalides reçues du serveur"
             );
             assert!(s.game.is_none());
         }
@@ -1025,7 +1084,7 @@ pub(crate) mod tests {
         let mut s = Session::default();
         s.handle(snap(1));
         s.handle(snap(2)); // old mountain 1 is now pending in `left`
-        s.handle(NetEvent::Disconnected("perdu".into()));
+        s.handle(NetEvent::Disconnected(Notice::Lost("perdu".into())));
         let ids: Vec<_> = s.left.iter().map(|g| g.mountain.id).collect();
         assert_eq!(ids, [MountainId(1), MountainId(2)]); // both queued, none lost
     }
@@ -1275,15 +1334,15 @@ pub(crate) mod tests {
         assert_eq!(s.screen, Screen::Playing);
         s.handle(NetEvent::Msg(ServerMsg::Tick(tick(p(3, 1, 0)))));
         assert_eq!(s.game.as_ref().unwrap().hero.pos, p(3, 1, 0));
-        assert!(s.handle(NetEvent::Disconnected("perdu".into())));
+        assert!(s.handle(NetEvent::Disconnected(Notice::Lost("perdu".into()))));
         assert_eq!(s.screen, Screen::Disconnected);
-        assert_eq!(s.error.as_deref(), Some("perdu"));
+        assert_eq!(s.error, Some(Notice::Lost("perdu".into())));
         assert!(s.game.is_none());
 
         let mut s = Session::default();
         assert!(s.handle(NetEvent::Msg(ServerMsg::Reject(Reject::BadInvite))));
         assert_eq!(s.screen, Screen::Login);
-        assert_eq!(s.error.as_deref(), Some("Code d'invitation invalide"));
+        assert_eq!(s.error, Some(Notice::Rejected(Reject::BadInvite)));
     }
 
     #[test]

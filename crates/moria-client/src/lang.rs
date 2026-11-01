@@ -106,7 +106,9 @@ fn english(fr: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::{ACTIONS, BUILDS, ORDER_ROWS, ability_rows, recipe_label, resource_bar};
+    use crate::game::{
+        ACTIONS, BUILDS, ORDER_ROWS, ability_rows, named, recipe_label, resource_bar,
+    };
     use moria_core::srd::{Abilities, Class, Race};
     use moria_core::{DesignationKind, Resources};
 
@@ -127,6 +129,7 @@ mod tests {
             .chain(ACTIONS.iter().map(|a| a.0))
             .chain(ORDER_ROWS.iter().map(|r| r.0))
             .chain(resource_bar(Resources::default()).map(|r| r.1))
+            .chain(named(Resources::default()).map(|r| r.1))
             .chain(ability_rows(a).map(|r| r.0))
             .chain(Race::ALL.map(Race::label_fr))
             .chain(Class::ALL.map(Class::label_fr))
