@@ -28,6 +28,27 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
+/// `%XX` -> octet ; les sequences mal formees sont gardees telles quelles.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |i: usize| b.get(i).and_then(|c| (*c as char).to_digit(16));
+        match (b[i], hex(i + 1), hex(i + 2)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Masque l'URL complete puis le mot de passe nu dans un message d'erreur.
 fn scrub(msg: &str, url: &str) -> String {
     let mut out = msg.replace(url, &redact_url(url));
@@ -36,9 +57,12 @@ fn scrub(msg: &str, url: &str) -> String {
         .and_then(|(_, rest)| rest[..rest.find('/').unwrap_or(rest.len())].rsplit_once('@'))
         .map(|(u, _)| u);
     if let Some(pass) = userinfo.and_then(|u| u.split_once(':')).map(|(_, p)| p) {
-        // Moins de 3 caracteres : on n'abime pas le reste du message pour si peu.
-        if pass.len() >= 3 {
-            out = out.replace(pass, "***");
+        // lapin peut citer la forme decodee. Moins de 3 caracteres : on n'abime pas le reste
+        // du message pour si peu.
+        for p in [pass.to_string(), percent_decode(pass)] {
+            if p.len() >= 3 {
+                out = out.replace(&p, "***");
+            }
         }
     }
     out
@@ -328,5 +352,19 @@ mod tests {
         let url = "amqp://rabbitmq:5672/moria";
         let m = format!("echec {url}");
         assert_eq!(scrub(&m, url), m);
+    }
+
+    #[test]
+    fn scrub_removes_percent_decoded_password() {
+        let url = "amqp://moria:p%40ssw0rd@h/v";
+        let out = scrub("refus pour p@ssw0rd sur h", url);
+        assert!(!out.contains("p@ssw0rd"), "{out}");
+        assert!(out.contains("sur h"), "{out}");
+    }
+
+    #[test]
+    fn percent_decode_keeps_malformed_sequences() {
+        assert_eq!(percent_decode("a%zz%4"), "a%zz%4");
+        assert_eq!(percent_decode("%41"), "A");
     }
 }
