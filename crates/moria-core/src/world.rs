@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 4;
+pub const SAVE_VERSION: u32 = 5;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -72,8 +72,7 @@ pub struct Dwarf {
     pub id: DwarfId,
     pub pos: TilePos,
     pub task: Option<DwarfTask>,
-    /// Missed a meal: works no more until it has eaten. Not saved (a restart feeds everyone).
-    #[serde(skip)]
+    /// Missed a meal: only goes after food until it has eaten.
     pub hungry: bool,
 }
 
@@ -766,7 +765,9 @@ mod tests {
     #[test]
     fn save_load_roundtrip() {
         let mut w = generate(3);
-        claim_mountain(&mut w, PlayerId(1));
+        let m = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        // A restart must not feed a hungry dwarf for free.
+        w.fortresses.get_mut(&m).unwrap().dwarves[0].hungry = true;
         let p = tmpdir("rt").join("w.bin");
         save(&w, &p).unwrap();
         assert_eq!(load(&p).unwrap(), w);
