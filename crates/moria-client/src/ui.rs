@@ -2,7 +2,7 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{BUILDS, Screen, Session, build_text, level_label, mode_label};
+use crate::game::{ACTIONS, BUILDS, Screen, Session, build_text, level_label, mode_label};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -44,7 +44,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (hud, build_menu).run_if(in_state(Screen::Playing)),
+                (hud, action_bar, build_menu).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -278,6 +278,29 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     Ok(())
 }
 
+/// Bottom bar: one button per action, the current one highlighted.
+fn action_bar(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    egui::Window::new("actions")
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -8.0])
+        .show(ctx.ctx_mut()?, |ui| {
+            ui.horizontal(|ui| {
+                for &(label, a) in ACTIONS {
+                    let b = egui::Button::new(egui::RichText::new(label).heading())
+                        .selected(g.action_active(a));
+                    if ui.add(b).clicked() {
+                        g.pick_action(a);
+                    }
+                }
+            });
+        });
+    Ok(())
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -307,7 +330,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             ui.label(mode_label(g.mode));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode (creuser, escalier, couper, mur) · 1, 2 : creuser, escalier · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \

@@ -65,6 +65,8 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             Some(DesignationKind::Dig)
         } else if keys.just_pressed(KeyCode::Digit2) {
             Some(DesignationKind::Stairs)
+        } else if keys.just_pressed(KeyCode::Digit4) {
+            Some(DesignationKind::Chop)
         } else {
             None
         },
@@ -159,8 +161,7 @@ fn play(
         Intent::default()
     };
     if k.build_menu || p.build_menu {
-        g.build_menu = !g.build_menu;
-        g.build_sel = 0;
+        g.pick_action(None);
     } else if k.close_menu || p.close_menu {
         g.build_menu = false;
     }
@@ -176,8 +177,7 @@ fn play(
             g.pick_build(g.build_sel);
         }
         if let Some(m) = k.mode {
-            g.mode = m;
-            g.build_menu = false;
+            g.pick_action(Some(m));
         }
         return;
     }
@@ -196,7 +196,7 @@ fn play(
         out.extend(g.dig());
     }
     if let Some(m) = k.mode {
-        g.mode = m;
+        g.pick_action(Some(m));
     } else if k.toggle || p.toggle {
         g.mode = g.mode.toggled();
     }
@@ -247,6 +247,14 @@ fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_4_picks_chop() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::Digit4);
+        let i = keyboard_intent(&keys, &ButtonInput::default());
+        assert_eq!(i.mode, Some(DesignationKind::Chop));
+    }
 
     #[test]
     fn stick_dir_picks_dominant_axis() {

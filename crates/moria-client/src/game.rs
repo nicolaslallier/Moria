@@ -141,7 +141,38 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
     (DesignationKind::WoodChair, "Chaise en bois"),
 ];
 
+/// Bottom-bar buttons with their key; `None` is the build menu.
+pub const ACTIONS: &[(&str, Option<DesignationKind>)] = &[
+    ("Creuser [1]", Some(DesignationKind::Dig)),
+    ("Escalier [2]", Some(DesignationKind::Stairs)),
+    ("Construire [3]", None),
+    ("Couper [4]", Some(DesignationKind::Chop)),
+];
+
 impl Game {
+    /// A bar button or its key: picks the mode (closing the menu), or toggles the build menu.
+    pub fn pick_action(&mut self, a: Option<DesignationKind>) {
+        match a {
+            Some(m) => {
+                self.mode = m;
+                self.build_menu = false;
+            }
+            None => {
+                self.build_menu = !self.build_menu;
+                self.build_sel = 0;
+            }
+        }
+    }
+
+    /// Whether the bar highlights `a`: its mode is current, or for "Construire"
+    /// the menu is open or a build mode is current.
+    pub fn action_active(&self, a: Option<DesignationKind>) -> bool {
+        match a {
+            Some(m) => !self.build_menu && self.mode == m,
+            None => self.build_menu || BUILDS.iter().any(|b| b.0 == self.mode),
+        }
+    }
+
     /// Moves the build-menu highlight by one row, wrapping.
     pub fn build_step(&mut self, down: bool) {
         let n = BUILDS.len();
@@ -788,6 +819,37 @@ mod tests {
         g.mountain.set(p(3, 1, 0), Tile::Tree);
         g.last_dir = Dir::E;
         assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::E)));
+    }
+
+    #[test]
+    fn action_bar_picks_modes() {
+        let mut g = game();
+        let labels: Vec<&str> = ACTIONS.iter().map(|a| a.0).collect();
+        assert_eq!(
+            labels,
+            [
+                "Creuser [1]",
+                "Escalier [2]",
+                "Construire [3]",
+                "Couper [4]"
+            ]
+        );
+        g.pick_action(Some(DesignationKind::Chop));
+        assert_eq!(g.mode, DesignationKind::Chop);
+        assert!(g.action_active(Some(DesignationKind::Chop)));
+        assert!(!g.action_active(Some(DesignationKind::Dig)));
+        assert!(!g.action_active(None));
+        // Construire toggles the menu; a build mode keeps it highlighted once closed.
+        g.pick_action(None);
+        assert!(g.build_menu && g.action_active(None));
+        g.pick_action(None);
+        assert!(!g.build_menu);
+        g.mode = DesignationKind::Wall;
+        assert!(g.action_active(None));
+        // Picking a mode closes the menu.
+        g.build_menu = true;
+        g.pick_action(Some(DesignationKind::Dig));
+        assert!(!g.build_menu && g.mode == DesignationKind::Dig);
     }
 
     #[test]
