@@ -1,9 +1,11 @@
 //! Client-side model, free of Bevy systems: session flow, local fortress copy,
 //! prediction and input rules. The Bevy systems in the other modules only call this.
 
+use crate::light::Explored;
 use crate::net::NetEvent;
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
+use moria_core::light::BODY_LIGHT;
 use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
 };
@@ -153,6 +155,8 @@ pub struct Game {
     pub resources: Resources,
     /// World tick, drives the day/night cycle.
     pub tick: u64,
+    /// Tiles the hero has seen lit.
+    pub explored: Explored,
     /// Status page (key C) open.
     pub status: bool,
     /// Last horizontal direction pressed; Space digs that way.
@@ -232,6 +236,7 @@ impl Game {
     }
 
     pub fn new(v: FortressView) -> Self {
+        let (w, h, d) = v.mountain.size();
         Self {
             confirmed: v.hero.pos,
             mountain: v.mountain,
@@ -239,6 +244,7 @@ impl Game {
             dwarves: v.dwarves,
             resources: v.resources,
             tick: v.tick,
+            explored: Explored::new(w, h, d),
             status: false,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
@@ -256,6 +262,16 @@ impl Game {
         self.dwarves
             .iter()
             .map(|&(id, p, job)| (format!("Nain n°{}", id.0), level_label(p.z), job_label(job)))
+            .collect()
+    }
+
+    /// Light sources on level `z` as `(x, y, radius)`: the hero and every dwarf.
+    pub fn light_sources(&self, z: u8) -> Vec<(i16, i16, u8)> {
+        let hero = std::iter::once(self.hero.pos);
+        let dwarves = self.dwarves.iter().map(|d| d.1);
+        hero.chain(dwarves)
+            .filter(|p| p.z == z)
+            .map(|p| (p.x, p.y, BODY_LIGHT))
             .collect()
     }
 
@@ -446,6 +462,16 @@ pub(crate) mod tests {
         m.set(p(1, 1, 0), Tile::Stair);
         m.set(p(1, 1, 1), Tile::Stair);
         game_on(m, p(2, 1, 0))
+    }
+
+    #[test]
+    fn hero_lights_only_his_own_level() {
+        let mut g = game(); // hero on z = 0
+        g.dwarves = vec![(DwarfId(1), p(2, 1, 1), None)];
+        assert_eq!(g.light_sources(0), vec![(2, 1, BODY_LIGHT)]);
+        assert_eq!(g.light_sources(1), vec![(2, 1, BODY_LIGHT)]); // the dwarf only
+        g.dwarves.clear();
+        assert!(g.light_sources(1).is_empty());
     }
 
     fn game_on(mountain: Mountain, pos: TilePos) -> Game {
