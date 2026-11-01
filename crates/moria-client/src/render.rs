@@ -243,7 +243,7 @@ fn sync_tiles(
     }
 }
 
-/// `depth` keeps the hero drawn above a dwarf sharing its tile; `lit` false hides it.
+/// `depth` keeps the hero drawn above a dwarf sharing its tile.
 /// Shown whenever on the viewed level: every dwarf is a `BODY_LIGHT` source, so its own tile is always lit.
 fn place(t: &mut Transform, v: &mut Visibility, p: TilePos, z: u8, depth: f32) {
     t.translation = to_world(p.x, p.y).extend(depth);

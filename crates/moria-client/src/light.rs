@@ -130,6 +130,7 @@ fn save(files: &[PathBuf], e: &Explored) {
         if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, f).is_ok() {
             return;
         }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
