@@ -121,17 +121,19 @@ fn load(files: &[PathBuf], e: &mut Explored) {
 }
 
 /// Writes to the first file that accepts it, through `<file>.tmp` so a crash never truncates it.
-fn save(files: &[PathBuf], e: &Explored) {
+/// True once one of `files` holds the map.
+fn save(files: &[PathBuf], e: &Explored) -> bool {
     let bytes = e.to_bytes();
     for f in files {
         let mut tmp = f.as_os_str().to_owned();
         tmp.push(".tmp");
         let _ = f.parent().map(std::fs::create_dir_all);
         if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, f).is_ok() {
-            return;
+            return true;
         }
         let _ = std::fs::remove_file(&tmp);
     }
+    false
 }
 
 /// Load/save policy of the explored memory, independent of Bevy. Best effort: I/O errors are ignored.
@@ -164,18 +166,31 @@ impl MemorySync {
             });
             save(&f, &g.explored);
         }
-        let Some(g) = &mut s.game else { return };
+        // A save request is answered on this frame whatever the state, so it never lingers.
+        let now = std::mem::take(&mut s.save_now);
+        let Some(g) = &mut s.game else {
+            if now {
+                s.saved = Some(false);
+            }
+            return;
+        };
         let Some(f) = &g.memory else {
             let f = files(g.mountain.id);
             load(&f, &mut g.explored);
+            if now {
+                s.saved = Some(save(&f, &g.explored));
+            }
             g.memory = Some(f);
             self.since = 0.0;
             return;
         };
         self.since += dt;
-        if self.since >= Self::EVERY {
+        if now || self.since >= Self::EVERY {
             self.since = 0.0;
-            save(f, &g.explored);
+            let ok = save(f, &g.explored);
+            if now {
+                s.saved = Some(ok);
+            }
         }
     }
 }
@@ -289,9 +304,61 @@ mod tests {
         sync.step(30.0, false, &mut s, files(&d));
         assert!(disk(&d, 1).seen(p(1))); // (c) saved
         mark(&mut s, 2);
-        s.handle(NetEvent::Disconnected("perdu".into()));
+        s.handle(NetEvent::Disconnected(crate::net::Notice::Lost(
+            "perdu".into(),
+        )));
         sync.step(1.0, false, &mut s, files(&d));
         assert!(disk(&d, 1).seen(p(2))); // (d) saved on end
+    }
+
+    #[test]
+    fn save_now_writes_the_running_map_at_once() {
+        let d = tmp("now");
+        let (mut s, mut sync) = (Session::default(), MemorySync::default());
+        on(&mut s, 1);
+        sync.step(0.0, false, &mut s, files(&d));
+        mark(&mut s, 1);
+        s.save_now = true;
+        sync.step(0.0, false, &mut s, files(&d));
+        assert!(disk(&d, 1).seen(p(1)));
+        assert!(!s.save_now);
+        assert_eq!(s.saved, Some(true));
+    }
+
+    #[test]
+    fn save_now_before_the_map_loads_still_saves_and_reports_it() {
+        let d = tmp("early");
+        let (mut s, mut sync) = (Session::default(), MemorySync::default());
+        on(&mut s, 1);
+        mark(&mut s, 1);
+        s.save_now = true;
+        sync.step(0.0, false, &mut s, files(&d));
+        assert!(disk(&d, 1).seen(p(1)));
+        assert!(!s.save_now);
+        assert_eq!(s.saved, Some(true));
+    }
+
+    #[test]
+    fn save_now_reports_a_failed_write() {
+        let d = tmp("fail");
+        let not_a_dir = d.join("file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let (mut s, mut sync) = (Session::default(), MemorySync::default());
+        on(&mut s, 1);
+        sync.step(0.0, false, &mut s, files(&not_a_dir));
+        s.save_now = true;
+        sync.step(0.0, false, &mut s, files(&not_a_dir));
+        assert_eq!(s.saved, Some(false));
+    }
+
+    #[test]
+    fn save_now_without_a_game_is_dropped() {
+        let d = tmp("none");
+        let (mut s, mut sync) = (Session::default(), MemorySync::default());
+        s.save_now = true;
+        sync.step(0.0, false, &mut s, files(&d));
+        assert!(!s.save_now);
+        assert_eq!(s.saved, Some(false));
     }
 
     #[test]

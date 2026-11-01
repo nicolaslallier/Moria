@@ -1,7 +1,7 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Game, ORDER_ROWS, Screen, drag_msg};
+use crate::game::{Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
@@ -50,6 +50,8 @@ struct Intent {
     close_menu: bool,
     status: bool,
     use_: bool,
+    /// Gamepad Start: the pause menu (the keyboard uses Escape, `close_menu`).
+    pause: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -77,6 +79,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         close_menu: keys.just_pressed(KeyCode::Escape),
         status: keys.just_pressed(KeyCode::KeyC),
         use_: keys.just_pressed(KeyCode::KeyF),
+        pause: false,
     }
 }
 
@@ -140,6 +143,7 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         close_menu: any(GamepadButton::East),
         status: any(GamepadButton::Select),
         use_: any(GamepadButton::RightTrigger2),
+        pause: any(GamepadButton::Start),
         ..default()
     }
 }
@@ -192,6 +196,16 @@ fn order_frame(
     })
 }
 
+/// The pause menu's share of a frame: N/S step on a new press, the action button picks.
+fn pause_frame(g: &mut Game, menu_dir: &mut Option<Dir>, walk: Option<Dir>, act: bool) {
+    if walk != *menu_dir && matches!(walk, Some(Dir::N | Dir::S)) {
+        let n = PAUSE_ROWS.len();
+        g.pause_sel = (g.pause_sel + if walk == Some(Dir::S) { 1 } else { n - 1 }) % n;
+    }
+    *menu_dir = walk;
+    g.pause_pick |= act;
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -215,12 +229,19 @@ fn play(
         *stick = None;
         Intent::default()
     };
+    if k.close_menu || p.pause {
+        g.escape();
+    } else if p.close_menu {
+        g.close_menus();
+        g.pause = false;
+    }
+    // Pause menu open: moves and the action button drive it, nothing reaches the hero.
+    if g.pause {
+        pause_frame(g, menu_dir, k.walk.or(p.walk), k.dig || p.dig);
+        return;
+    }
     if k.build_menu || p.build_menu {
         g.pick_action(None);
-    } else if k.close_menu || p.close_menu {
-        g.build_menu = false;
-        g.order_menu = None;
-        g.status = false;
     }
     if k.status || p.status {
         g.status = !g.status;
@@ -298,6 +319,10 @@ fn mouse(
     let Some(g) = &client.session.game else {
         return;
     };
+    if g.pause {
+        drag.start = None;
+        return;
+    }
     let (mode, z) = (g.mode, g.current_z());
     if drag.start.is_none() && !egui.wants_pointer_input() {
         for b in [MouseButton::Left, MouseButton::Right] {
@@ -324,6 +349,24 @@ fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_menu_steps_on_new_presses_and_picks_with_the_action_button() {
+        use crate::game::PAUSE_ROWS;
+        let mut g = crate::game::tests::game();
+        g.pause = true;
+        let mut d = None;
+        pause_frame(&mut g, &mut d, Some(Dir::S), false);
+        pause_frame(&mut g, &mut d, Some(Dir::S), false); // held: one step only
+        assert_eq!(g.pause_sel, 1);
+        for walk in [None, Some(Dir::N), None, Some(Dir::N)] {
+            pause_frame(&mut g, &mut d, walk, false);
+        }
+        assert_eq!(g.pause_sel, PAUSE_ROWS.len() - 1); // wrapped
+        assert!(!g.pause_pick);
+        pause_frame(&mut g, &mut d, None, true);
+        assert!(g.pause_pick);
+    }
 
     #[test]
     fn key_4_picks_chop() {

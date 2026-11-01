@@ -1,6 +1,8 @@
 //! Blocking TCP on two std threads; the Bevy side only touches the channels.
 
-use moria_core::protocol::{ClientMsg, ServerMsg, encode, read_frame};
+use crate::game::reject_text;
+use crate::lang::{en, tr};
+use moria_core::protocol::{ClientMsg, Reject, ServerMsg, encode, read_frame};
 use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -12,8 +14,57 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum NetEvent {
     Msg(ServerMsg),
-    /// Connection failed or ended; the reason is in French.
-    Disconnected(String),
+    /// Connection failed or ended.
+    Disconnected(Notice),
+}
+
+/// Why a connection ended, kept as a value: its text is rendered when drawn, in the language then.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Notice {
+    Rejected(Reject),
+    BadData,
+    /// `err: None` when the address resolves to nothing.
+    CantConnect {
+        addr: String,
+        err: Option<String>,
+    },
+    LocalNet,
+    Silent,
+    Closed,
+    Lost(String),
+}
+
+impl Notice {
+    pub fn text(&self) -> String {
+        match self {
+            Notice::Rejected(r) => reject_text(r),
+            Notice::BadData => tr(
+                "Données invalides reçues du serveur",
+                "Invalid data received from the server",
+            )
+            .into(),
+            Notice::CantConnect { addr, err } => {
+                let err = err
+                    .as_deref()
+                    .unwrap_or(tr("adresse introuvable", "address not found"));
+                if en() {
+                    format!("Cannot connect to {addr}: {err}")
+                } else {
+                    format!("Connexion impossible à {addr} : {err}")
+                }
+            }
+            Notice::LocalNet => tr("Erreur réseau locale", "Local network error").into(),
+            Notice::Silent => {
+                tr("Le serveur ne répond plus", "The server stopped answering").into()
+            }
+            Notice::Closed => tr(
+                "Le serveur a fermé la connexion",
+                "The server closed the connection",
+            )
+            .into(),
+            Notice::Lost(e) => format!("{}{e}", tr("Connexion perdue : ", "Connection lost: ")),
+        }
+    }
 }
 
 /// Dropping it closes the connection (the writer thread shuts the socket down).
@@ -30,15 +81,13 @@ pub fn connect(addr: String) -> NetHandle {
     thread::spawn(move || {
         let stream = match open(&addr) {
             Ok(s) => s,
-            Err(e) => {
-                let _ = ev_tx.send(NetEvent::Disconnected(format!(
-                    "Connexion impossible à {addr} : {e}"
-                )));
+            Err(err) => {
+                let _ = ev_tx.send(NetEvent::Disconnected(Notice::CantConnect { addr, err }));
                 return;
             }
         };
         let Ok(mut wr) = stream.try_clone() else {
-            let _ = ev_tx.send(NetEvent::Disconnected("Erreur réseau locale".into()));
+            let _ = ev_tx.send(NetEvent::Disconnected(Notice::LocalNet));
             return;
         };
         thread::spawn(move || {
@@ -62,12 +111,10 @@ pub fn connect(addr: String) -> NetHandle {
                     NetEvent::Msg(m)
                 }
                 Err(e) => NetEvent::Disconnected(match e.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        "Le serveur ne répond plus".into()
-                    }
-                    ErrorKind::UnexpectedEof => "Le serveur a fermé la connexion".into(),
-                    ErrorKind::InvalidData => "Données invalides reçues du serveur".into(),
-                    _ => format!("Connexion perdue : {e}"),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => Notice::Silent,
+                    ErrorKind::UnexpectedEof => Notice::Closed,
+                    ErrorKind::InvalidData => Notice::BadData,
+                    _ => Notice::Lost(e.to_string()),
                 }),
             };
             let end = matches!(ev, NetEvent::Disconnected(_));
@@ -80,15 +127,16 @@ pub fn connect(addr: String) -> NetHandle {
     NetHandle { tx, rx }
 }
 
-fn open(addr: &str) -> std::io::Result<TcpStream> {
-    let mut last = std::io::Error::new(ErrorKind::NotFound, "adresse introuvable");
-    for a in addr.to_socket_addrs()? {
+/// `Err(None)`: the address resolves to nothing.
+fn open(addr: &str) -> Result<TcpStream, Option<String>> {
+    let mut last = None;
+    for a in addr.to_socket_addrs().map_err(|e| Some(e.to_string()))? {
         match TcpStream::connect_timeout(&a, Duration::from_secs(5)) {
             Ok(s) => {
                 let _ = s.set_nodelay(true);
                 return Ok(s);
             }
-            Err(e) => last = e,
+            Err(e) => last = Some(e.to_string()),
         }
     }
     Err(last)
@@ -108,9 +156,7 @@ mod tests {
         let (mut s, _) = l.accept().unwrap();
         s.write_all(&[0, 0, 0, 2, 0xff, 0xff]).unwrap();
         let ev = h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(
-            matches!(&ev, NetEvent::Disconnected(r) if r == "Données invalides reçues du serveur")
-        );
+        assert!(matches!(&ev, NetEvent::Disconnected(Notice::BadData)));
         // Dropping the handle closes the socket.
         drop(h);
         let mut buf = [0u8; 1];
@@ -145,10 +191,10 @@ mod tests {
         // Then nothing: ticks should come every 100 ms.
         let ev = h.rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
-            matches!(&ev, NetEvent::Disconnected(r) if r == "Le serveur ne répond plus"),
+            matches!(&ev, NetEvent::Disconnected(Notice::Silent)),
             "{}",
             match ev {
-                NetEvent::Disconnected(r) => r,
+                NetEvent::Disconnected(r) => r.text(),
                 _ => "message".into(),
             }
         );
@@ -161,7 +207,18 @@ mod tests {
         drop(l);
         let h = connect(addr);
         let ev = h.rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(matches!(ev, NetEvent::Disconnected(r) if r.starts_with("Connexion impossible")));
+        assert!(
+            matches!(&ev, NetEvent::Disconnected(r) if r.text().starts_with("Connexion impossible"))
+        );
+    }
+
+    #[test]
+    fn unknown_address_has_its_own_notice() {
+        let n = Notice::CantConnect {
+            addr: "x:1".into(),
+            err: None,
+        };
+        assert_eq!(n.text(), "Connexion impossible à x:1 : adresse introuvable");
     }
 }
 
@@ -226,7 +283,7 @@ mod smoke {
         let ev = h.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert!(s.handle(ev));
         assert_eq!(s.screen, Screen::Login);
-        println!("rejet : {}", s.error.as_deref().unwrap());
+        println!("rejet : {}", s.error.as_ref().unwrap().text());
 
         let h = connect(addr.to_string());
         h.tx.send(hello(Some("secret"))).unwrap();
