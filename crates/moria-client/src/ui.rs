@@ -485,9 +485,16 @@ fn bar_window(ctx: &egui::Context, g: &Game) -> egui::Rect {
                     let wrap = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
                     ui.with_layout(wrap, |ui| {
                         for (n, what, [r, gr, b]) in resource_bar(g.resources) {
-                            let swatch = egui::Color32::from_rgb(r, gr, b);
-                            ui.label(egui::RichText::new("■").color(swatch));
-                            ui.label(egui::RichText::new(format!("{what} {n}")).strong());
+                            // One label that never wraps: a swatch and its name stay on one row.
+                            let mut job = egui::text::LayoutJob::default();
+                            let fmt = |color| egui::TextFormat {
+                                color,
+                                ..Default::default()
+                            };
+                            job.append("■ ", 0.0, fmt(egui::Color32::from_rgb(r, gr, b)));
+                            let strong = ui.visuals().strong_text_color();
+                            job.append(&format!("{what} {n}"), 0.0, fmt(strong));
+                            ui.add(egui::Label::new(job).extend());
                             ui.add_space(12.0);
                         }
                     });
@@ -656,36 +663,78 @@ mod tests {
         assert!(g.status);
     }
 
+    /// A painted text: its string, screen rect and number of rows.
+    type Text = (String, egui::Rect, usize);
+
     /// Draws the bar twice on a `w`-pt-wide screen, the pointer over it the second time.
-    fn draw_bar(g: &Game, w: f32) -> (egui::Context, egui::Rect) {
+    /// Returns the bar's rect and the texts of the last frame, in paint order.
+    fn draw_bar(g: &Game, w: f32) -> (egui::Context, egui::Rect, Vec<Text>) {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 400.0));
         let mut bar = egui::Rect::NOTHING;
+        let mut texts = vec![];
         for pointer in [None, Some(egui::pos2(w / 2.0, 10.0))] {
             let input = egui::RawInput {
                 screen_rect: Some(screen),
                 events: pointer.map(egui::Event::PointerMoved).into_iter().collect(),
                 ..Default::default()
             };
-            ctx.run_ui(input, |ui| bar = bar_window(ui.ctx(), g))
-                .textures_delta
-                .clear();
+            let mut out = ctx.run_ui(input, |ui| bar = bar_window(ui.ctx(), g));
+            out.textures_delta.clear();
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some((
+                        t.galley.text().to_owned(),
+                        s.shape.visual_bounding_rect(),
+                        t.galley.rows.len(),
+                    )),
+                    _ => None,
+                })
+                .collect();
         }
-        (ctx, bar)
+        (ctx, bar, texts)
+    }
+
+    /// The painted text starting with `prefix`.
+    fn text<'a>(texts: &'a [Text], prefix: &str) -> &'a Text {
+        texts
+            .iter()
+            .find(|t| t.0.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {texts:?}"))
     }
 
     #[test]
     fn top_bar_is_one_row_on_wide_screens() {
-        let (_, bar) = draw_bar(&crate::game::tests::game(), 1600.0);
+        let (_, bar, texts) = draw_bar(&crate::game::tests::game(), 1600.0);
         assert!(bar.height() < 30.0, "{bar:?}");
         assert_eq!(bar.width(), 1600.0);
+        // The resources stop well short of the dwarves and clock.
+        let last = text(&texts, "■ Portes en fer").1;
+        let dwarves = text(&texts, "Nains").1;
+        assert!(last.right() < dwarves.left(), "{last:?} {dwarves:?}");
+    }
+
+    #[test]
+    fn top_bar_wraps_whole_resources_on_narrow_screens() {
+        let mut g = crate::game::tests::game();
+        g.resources.iron_ore = 12345;
+        let (_, _, texts) = draw_bar(&g, 600.0);
+        for t in &texts {
+            assert_eq!(t.2, 1, "{:?} is cut across rows", t.0);
+        }
+        // Each name carries its swatch, so the two cannot end up on different rows.
+        for (n, what, _) in crate::game::resource_bar(g.resources) {
+            text(&texts, &format!("■ {what} {n}"));
+        }
     }
 
     #[test]
     fn top_bar_fits_narrow_screens_and_swallows_clicks() {
         let mut g = crate::game::tests::game();
         g.resources.iron_ore = 12345;
-        let (ctx, bar) = draw_bar(&g, 600.0);
+        let (ctx, bar, _) = draw_bar(&g, 600.0);
         // Wraps instead of running off the screen.
         assert!(bar.right() <= 600.0, "{bar:?}");
         assert!(
