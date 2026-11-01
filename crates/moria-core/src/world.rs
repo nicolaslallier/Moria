@@ -342,6 +342,42 @@ mod tests {
     use super::*;
     use crate::protocol::encode;
 
+    #[test]
+    fn worst_case_snapshot_fits_in_a_frame() {
+        use crate::protocol::{FortressView, HeroView, MAX_FRAME};
+        use crate::srd::{Abilities, Class, Race};
+        use crate::{DesignationKind, Resources, TilePos};
+        let mut mountain = generate(1).mountains.remove(&MountainId(0)).unwrap();
+        let (w, h, d) = mountain.size();
+        for z in 0..d {
+            let (a, b) = (TilePos::new(0, 0, z), TilePos::new(w - 1, h - 1, z));
+            mountain.designate(a, b, DesignationKind::Dig);
+            mountain.designate(a, b, DesignationKind::Chop);
+        }
+        assert!(mountain.designations.len() > 10_000, "not a worst case");
+        let view = FortressView {
+            mountain,
+            hero: HeroView {
+                name: "x".repeat(32),
+                race: Race::Dwarf,
+                class: Class::Barbarian,
+                abilities: Abilities {
+                    str: 10,
+                    dex: 10,
+                    con: 10,
+                    int: 10,
+                    wis: 10,
+                    cha: 10,
+                },
+                pos: TilePos::new(0, 0, 0),
+            },
+            dwarves: vec![],
+            resources: Resources::default(),
+        };
+        let n = encode(&view).len();
+        assert!(n < MAX_FRAME, "{n} >= {MAX_FRAME}");
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("moria-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -476,8 +512,8 @@ mod tests {
             hero: HeroView {
                 name: "h".into(),
                 race: Race::Dwarf,
-                class: Class::Fighter,
-                abilities: crate::srd::roll_abilities(Race::Dwarf, Class::Fighter),
+                class: Class::Barbarian,
+                abilities: crate::srd::roll_abilities(Race::Dwarf, Class::Barbarian),
                 pos: entrance_tiles().next().unwrap(),
             },
             dwarves: vec![],

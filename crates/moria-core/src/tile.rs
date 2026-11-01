@@ -215,6 +215,18 @@ mod tests {
     }
 
     #[test]
+    fn designation_wire_encoding_is_unchanged() {
+        use DesignationKind::*;
+        // The variant order is the postcard byte on the wire and in saves.
+        let expected = [
+            Dig, Stairs, Wall, Bed, Table, Chair, Chop, WoodBed, WoodTable, WoodChair,
+        ];
+        for (i, k) in expected.iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(k).unwrap(), [i as u8], "{k:?}");
+        }
+    }
+
+    #[test]
     fn tree_yields_three_wood() {
         assert_eq!(
             Tile::Tree.yield_(),

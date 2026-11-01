@@ -115,10 +115,7 @@ impl Mountain {
         match kind {
             K::Dig => (t.is_solid() && t != Tile::Tree) || t == Tile::Slope,
             K::Chop => t == Tile::Tree,
-            K::Stairs => {
-                ((t.is_solid() && t != Tile::Tree && !t.is_furniture()) || t.is_floor_like())
-                    && p.z + 1 < self.d
-            }
+            K::Stairs => stairs_ok(t) && p.z + 1 < self.d,
             _ => t.is_floor_like(), // builds
         }
     }
@@ -178,9 +175,7 @@ impl Mountain {
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
-                if let Some(t) = self.get(below).filter(|t| {
-                    (t.is_solid() && *t != Tile::Tree && !t.is_furniture()) || t.is_floor_like()
-                }) {
+                if let Some(t) = self.get(below).filter(|t| stairs_ok(*t)) {
                     res.add(t.yield_());
                     self.set(below, Tile::Stair);
                     // A designation there could never be dug any more.
@@ -191,6 +186,11 @@ impl Mountain {
         self.designations.remove(&p);
         Some(res)
     }
+}
+
+/// Stairs can be cut into plain stone (not trees or furniture) or built on a floor.
+fn stairs_ok(t: Tile) -> bool {
+    (t.is_solid() && t != Tile::Tree && !t.is_furniture()) || t.is_floor_like()
 }
 
 #[cfg(test)]
