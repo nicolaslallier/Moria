@@ -18,11 +18,30 @@ pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    // ponytail: dernier '@' de toute l'URL ; un '@' dans le vhost sur-redacterait (sans risque).
-    match rest.rfind('@') {
+    // Seule l'autorite (avant le premier '/') est examinee : un '@' du chemin/vhost est intact.
+    // Garantie : le userinfo disparait pour une URL bien formee ; un mot de passe contenant un
+    // '/' non encode (URL invalide) n'est pas couvert.
+    let auth_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..auth_end].rfind('@') {
         Some(i) => format!("{scheme}://{}", &rest[i + 1..]),
         None => url.to_string(),
     }
+}
+
+/// Masque l'URL complete puis le mot de passe nu dans un message d'erreur.
+fn scrub(msg: &str, url: &str) -> String {
+    let mut out = msg.replace(url, &redact_url(url));
+    let userinfo = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest[..rest.find('/').unwrap_or(rest.len())].rsplit_once('@'))
+        .map(|(u, _)| u);
+    if let Some(pass) = userinfo.and_then(|u| u.split_once(':')).map(|(_, p)| p) {
+        // Moins de 3 caracteres : on n'abime pas le reste du message pour si peu.
+        if pass.len() >= 3 {
+            out = out.replace(pass, "***");
+        }
+    }
+    out
 }
 
 pub struct Bus {
@@ -69,11 +88,11 @@ impl Bus {
         let conn = Connection::connect(url, ConnectionProperties::default())
             .await
             .map_err(|e| {
-                // lapin peut citer l'URL (mot de passe compris) : on la masque.
+                // lapin peut citer l'URL ou le mot de passe : on les masque.
                 anyhow::anyhow!(
                     "connexion AMQP impossible a {}: {}",
                     redact_url(url),
-                    e.to_string().replace(url, &redact_url(url))
+                    scrub(&e.to_string(), url)
                 )
             })?;
         let chan = conn.create_channel().await?;
@@ -289,5 +308,25 @@ mod tests {
         );
         assert_eq!(redact_url("garbage"), "garbage");
         assert_eq!(redact_url(""), "");
+    }
+
+    #[test]
+    fn redact_url_ignores_at_sign_in_path() {
+        assert_eq!(redact_url("amqp://host:5672/a@b"), "amqp://host:5672/a@b");
+    }
+
+    #[test]
+    fn scrub_removes_url_and_bare_password() {
+        let url = "amqp://moria:s3cr3t@rabbitmq:5672/moria";
+        let out = scrub(&format!("echec {url} ; auth s3cr3t refusee"), url);
+        assert!(!out.contains("s3cr3t"), "{out}");
+        assert!(out.contains("rabbitmq:5672"), "{out}");
+    }
+
+    #[test]
+    fn scrub_leaves_message_alone_without_userinfo() {
+        let url = "amqp://rabbitmq:5672/moria";
+        let m = format!("echec {url}");
+        assert_eq!(scrub(&m, url), m);
     }
 }
