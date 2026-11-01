@@ -62,6 +62,8 @@ fn slug(r: Race) -> &'static str {
 pub struct Art {
     /// Baked textures, one per `terrain::bake` tile.
     terrain: std::collections::HashMap<Tile, Handle<Image>>,
+    /// Furniture's outdoor look, one per `terrain::bake_on_grass` tile.
+    on_grass: std::collections::HashMap<Tile, Handle<Image>>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
     pub castle: Handle<Image>,
@@ -79,9 +81,15 @@ impl Art {
         self.heads[race_index(r)].clone()
     }
 
-    /// The tile's texture; only the stairs (not baked) use their own art. Never panics.
-    pub fn tile(&self, t: Tile) -> Handle<Image> {
-        self.terrain.get(&t).unwrap_or(&self.stair).clone()
+    /// The tile's texture (`on_grass`: standing outdoors); only the stairs (not baked) use
+    /// their own art. Never panics.
+    pub fn tile(&self, t: Tile, on_grass: bool) -> Handle<Image> {
+        on_grass
+            .then(|| self.on_grass.get(&t))
+            .flatten()
+            .or_else(|| self.terrain.get(&t))
+            .unwrap_or(&self.stair)
+            .clone()
     }
 
     pub fn portrait(&self, r: Race) -> Handle<Image> {
@@ -119,6 +127,10 @@ impl FromWorld for Art {
                 .into_iter()
                 .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
                 .collect(),
+            on_grass: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake_on_grass(t)?))))
+                .collect(),
             stair,
             worker_head,
             castle,
@@ -142,6 +154,10 @@ mod tests {
                 .into_iter()
                 .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
                 .collect(),
+            on_grass: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake_on_grass(t)?))))
+                .collect(),
             stair: stair.clone(),
             worker_head: other.clone(),
             castle: other,
@@ -149,7 +165,13 @@ mod tests {
             portraits: vec![],
         };
         for t in Tile::ALL {
-            assert_eq!(art.tile(t) == stair, t == Tile::Stair, "{t:?}");
+            assert_eq!(art.tile(t, false) == stair, t == Tile::Stair, "{t:?}");
+            // Only furniture has its own outdoor look.
+            assert_eq!(
+                art.tile(t, true) != art.tile(t, false),
+                t.is_furniture(),
+                "{t:?}"
+            );
         }
     }
 

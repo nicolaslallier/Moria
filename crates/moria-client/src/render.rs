@@ -18,12 +18,28 @@ pub fn to_tile(w: Vec2) -> (i16, i16) {
     ((w.x / TILE).round() as i16, (-w.y / TILE).round() as i16)
 }
 
-/// `shown` caches the drawn tile so only changed sprites get a new color.
+/// One sprite per on-screen cell: the camera is on the hero, so cell `(dx, dy)` shows the
+/// tile at hero + (dx, dy). `shown` caches what is drawn so only changed cells are touched.
 #[derive(Component)]
 struct TileSprite {
-    x: i16,
-    y: i16,
-    shown: Option<Tile>,
+    dx: i16,
+    dy: i16,
+    shown: Option<(TilePos, Option<Tile>, bool)>,
+}
+
+/// Tiles from the hero to the window edge, plus a margin of 2.
+// ponytail: assumes the camera is pinned on the hero at scale 1; switch to the camera
+// Transform and projection if zoom or panning is ever added.
+fn view_radius(width: f32, height: f32) -> (i16, i16) {
+    (
+        (width / TILE / 2.0) as i16 + 2,
+        (height / TILE / 2.0) as i16 + 2,
+    )
+}
+
+/// Every cell offset of a `rx` x `ry` view radius.
+fn cells(rx: i16, ry: i16) -> impl Iterator<Item = (i16, i16)> {
+    (-ry..=ry).flat_map(move |dy| (-rx..=rx).map(move |dx| (dx, dy)))
 }
 
 #[derive(Component, PartialEq)]
@@ -34,7 +50,9 @@ enum Mark {
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<Built>()
-        .add_systems(OnExit(Screen::Playing), |mut b: ResMut<Built>| b.0 = 0)
+        .add_systems(OnExit(Screen::Playing), |mut b: ResMut<Built>| {
+            *b = Built::default()
+        })
         .add_systems(
             Update,
             (
@@ -70,67 +88,82 @@ fn head(image: Handle<Image>) -> impl Bundle {
 #[derive(Component)]
 struct MapPart;
 
-/// `Session::snapshots` value the map sprites were built for (0: none).
-#[derive(Resource, Default)]
-struct Built(u32);
+/// `Session::snapshots` value (0: none) and view radius the sprites were built for.
+#[derive(Resource, Default, PartialEq)]
+struct Built(u32, (i16, i16));
 
-/// (Re)builds the sprites on entering Playing and on every new snapshot.
+/// (Re)builds the sprites on entering Playing, on every new snapshot and on window resize.
 fn spawn_map(
     mut commands: Commands,
     client: Res<Client>,
     art: Res<Art>,
+    window: Single<&Window, With<PrimaryWindow>>,
     mut built: ResMut<Built>,
     old: Query<Entity, With<MapPart>>,
 ) {
     let Some(g) = &client.session.game else {
         return;
     };
-    if built.0 == client.session.snapshots {
+    let radius = view_radius(window.width(), window.height());
+    let want = Built(client.session.snapshots, radius);
+    if *built == want {
         return;
     }
-    built.0 = client.session.snapshots;
+    *built = want;
     for e in &old {
         commands.entity(e).despawn();
     }
-    let (w, h, _) = g.mountain.size();
-    for y in 0..h {
-        for x in 0..w {
-            commands.spawn((
-                Sprite::from_color(Color::BLACK, Vec2::splat(TILE)),
-                Transform::from_translation(to_world(x, y).extend(0.0)),
-                TileSprite { x, y, shown: None },
-                DespawnOnExit(Screen::Playing),
-                MapPart,
-            ));
-        }
+    for (dx, dy) in cells(radius.0, radius.1) {
+        commands.spawn((
+            Sprite::from_color(Color::BLACK, Vec2::splat(TILE)),
+            Transform::default(),
+            TileSprite {
+                dx,
+                dy,
+                shown: None,
+            },
+            DespawnOnExit(Screen::Playing),
+            MapPart,
+        ));
     }
     commands.spawn((head(art.head(g.hero.race)), Mark::Hero));
 }
 
-fn sync_tiles(client: Res<Client>, art: Res<Art>, mut q: Query<(&mut TileSprite, &mut Sprite)>) {
+fn sync_tiles(
+    client: Res<Client>,
+    art: Res<Art>,
+    mut q: Query<(&mut TileSprite, &mut Sprite, &mut Transform)>,
+) {
     let Some(g) = &client.session.game else {
         return;
     };
     let z = g.current_z();
-    for (mut t, mut s) in &mut q {
-        let tile = g.mountain.get(TilePos::new(t.x, t.y, z));
-        if tile != t.shown {
-            t.shown = tile;
-            (s.image, s.color) = match tile {
-                Some(t) => (art.tile(t), Color::WHITE),
-                None => (Handle::default(), Color::BLACK),
-            };
-            // Slopes keep their orientation, stairs are the user's art, sky stays flat.
-            if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky)) {
-                let variation = ((i32::from(t.x) * 37 + i32::from(t.y) * 61).rem_euclid(11)) as f32;
-                let light = 0.88 + variation * 0.012;
-                s.color = Color::srgb(light, light, light);
-                s.flip_x = (t.x + t.y) % 2 == 0;
-                s.flip_y = t.x % 3 == 0;
-            } else {
-                s.flip_x = false;
-                s.flip_y = false;
-            }
+    let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
+    for (mut t, mut s, mut tr) in &mut q {
+        let at = TilePos::new(hx + t.dx, hy + t.dy, z);
+        let tile = g.mountain.get(at);
+        let on_grass =
+            tile.is_some_and(Tile::is_furniture) && g.mountain.ground_at(at) == Tile::Grass;
+        let key = Some((at, tile, on_grass));
+        if t.shown == key {
+            continue;
+        }
+        t.shown = key;
+        tr.translation = to_world(at.x, at.y).extend(0.0);
+        (s.image, s.color) = match tile {
+            Some(t) => (art.tile(t, on_grass), Color::WHITE),
+            None => (Handle::default(), Color::BLACK),
+        };
+        // Slopes keep their orientation, stairs are the user's art, sky stays flat.
+        if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky)) {
+            let variation = ((i32::from(at.x) * 37 + i32::from(at.y) * 61).rem_euclid(11)) as f32;
+            let light = 0.88 + variation * 0.012;
+            s.color = Color::srgb(light, light, light);
+            s.flip_x = (at.x + at.y) % 2 == 0;
+            s.flip_y = at.x % 3 == 0;
+        } else {
+            s.flip_x = false;
+            s.flip_y = false;
         }
     }
 }
@@ -188,10 +221,6 @@ fn follow_camera(client: Res<Client>, mut cam: Query<&mut Transform, With<Camera
 /// Recomputed from neighbors so digging and level changes reveal the new edges immediately.
 /// Only the tiles on screen (the camera is on the hero), so a 176×96 level stays cheap.
 /// Stone faces cast a cliff edge; trees and furniture are solid but not cliffs.
-fn casts_relief(t: Tile) -> bool {
-    t.is_solid() && t != Tile::Tree && !t.is_furniture()
-}
-
 fn draw_relief(
     client: Res<Client>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -202,10 +231,7 @@ fn draw_relief(
     };
     let z = g.current_z();
     let (w, h, _) = g.mountain.size();
-    let rx = (window.width() / TILE / 2.0) as i16 + 2;
-    let ry = (window.height() / TILE / 2.0) as i16 + 2;
-    // ponytail: assumes the camera is pinned on the hero at scale 1; switch to the camera
-    // Transform and projection if zoom or panning is ever added.
+    let (rx, ry) = view_radius(window.width(), window.height());
     let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
     let half = TILE / 2.0;
     for y in (hy - ry).max(0)..(hy + ry).min(h) {
@@ -213,7 +239,7 @@ fn draw_relief(
             if !g
                 .mountain
                 .get(TilePos::new(x, y, z))
-                .is_some_and(casts_relief)
+                .is_some_and(Tile::is_stone)
             {
                 continue;
             }
@@ -296,11 +322,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_stone_casts_relief() {
-        assert!(casts_relief(Tile::Rock));
-        assert!(!casts_relief(Tile::Tree));
-        for t in Tile::ALL.into_iter().filter(|t| t.is_furniture()) {
-            assert!(!casts_relief(t), "{t:?}");
-        }
+    fn tile_pool_is_window_sized() {
+        let (rx, ry) = view_radius(1920.0, 1080.0);
+        assert_eq!((rx, ry), (22, 13));
+        let n = cells(rx, ry).count();
+        assert_eq!(n, 45 * 27);
+        assert!(n < 176 * 96 / 10);
+        assert!(cells(rx, ry).any(|c| c == (-rx, -ry)) && cells(rx, ry).any(|c| c == (rx, ry)));
     }
 }

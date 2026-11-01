@@ -6,32 +6,17 @@ use bevy::{
 };
 use moria_core::Tile;
 
-/// The generated texture of every tile but the stairs (user art). Exhaustive, no wildcard:
-/// a new `Tile` variant fails to compile until it is given a texture or `None` here.
+/// The generated texture of every tile but the stairs (user art).
 pub fn bake(t: Tile) -> Option<Image> {
-    match t {
-        Tile::Stair => None,
-        Tile::Rock
-        | Tile::Gold
-        | Tile::Mithril
-        | Tile::Floor
-        | Tile::Wall
-        | Tile::Bed
-        | Tile::Table
-        | Tile::Chair
-        | Tile::Grass
-        | Tile::Tree
-        | Tile::Water
-        | Tile::Slope
-        | Tile::Soil
-        | Tile::Sky
-        | Tile::WoodBed
-        | Tile::WoodTable
-        | Tile::WoodChair => Some(image(t)),
-    }
+    (t != Tile::Stair).then(|| image(t, false))
 }
 
-pub fn image(tile: Tile) -> Image {
+/// Furniture standing outdoors, drawn on grass instead of the stone floor.
+pub fn bake_on_grass(t: Tile) -> Option<Image> {
+    t.is_furniture().then(|| image(t, true))
+}
+
+fn image(tile: Tile, on_grass: bool) -> Image {
     Image::new(
         Extent3d {
             width: 96,
@@ -39,13 +24,13 @@ pub fn image(tile: Tile) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        pixels(tile),
+        pixels(tile, on_grass),
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     )
 }
 
-fn pixels(tile: Tile) -> Vec<u8> {
+fn pixels(tile: Tile, on_grass: bool) -> Vec<u8> {
     let mut data = Vec::with_capacity(96 * 96 * 4);
     for y in 0_i32..96 {
         for x in 0_i32..96 {
@@ -91,7 +76,11 @@ fn pixels(tile: Tile) -> Vec<u8> {
                     rgb = ore.map(|c| (c + noise + glint).clamp(0, 255) as u8);
                 }
             }
-            if let Some(c) = furniture(tile, x, y).or_else(|| outdoor(tile, x, y, noise)) {
+            let ground = on_grass.then(|| grass(x, y));
+            if let Some(c) = furniture(tile, x, y)
+                .or(ground)
+                .or_else(|| outdoor(tile, x, y, noise))
+            {
                 rgb = c.map(|c| (c + noise).clamp(0, 255) as u8);
             }
             data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
@@ -196,7 +185,7 @@ mod tests {
 
     #[test]
     fn terrain_is_opaque_and_ore_retains_the_rock_background() {
-        let rock = pixels(Tile::Rock);
+        let rock = pixels(Tile::Rock, false);
         assert_eq!(rock.len(), 96 * 96 * 4);
         for tile in [
             Tile::Rock,
@@ -208,7 +197,7 @@ mod tests {
             Tile::Table,
             Tile::Chair,
         ] {
-            let data = pixels(tile);
+            let data = pixels(tile, false);
             assert_eq!(data.len(), rock.len());
             assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             if matches!(tile, Tile::Gold | Tile::Mithril) {
@@ -223,15 +212,15 @@ mod tests {
                 assert!(same < 96 * 96 * 9 / 10, "vein should be visible");
             }
         }
-        assert_ne!(pixels(Tile::Gold), pixels(Tile::Mithril));
-        assert_ne!(pixels(Tile::Floor), rock);
-        assert_ne!(pixels(Tile::Bed), pixels(Tile::Floor));
-        assert_ne!(pixels(Tile::Table), pixels(Tile::Chair));
+        assert_ne!(pixels(Tile::Gold, false), pixels(Tile::Mithril, false));
+        assert_ne!(pixels(Tile::Floor, false), rock);
+        assert_ne!(pixels(Tile::Bed, false), pixels(Tile::Floor, false));
+        assert_ne!(pixels(Tile::Table, false), pixels(Tile::Chair, false));
     }
 
     #[test]
     fn outdoor_and_wood_tiles_have_their_own_look() {
-        let (grass, floor) = (pixels(Tile::Grass), pixels(Tile::Floor));
+        let (grass, floor) = (pixels(Tile::Grass, false), pixels(Tile::Floor, false));
         assert_ne!(grass, floor);
         let new = [
             Tile::Tree,
@@ -244,18 +233,18 @@ mod tests {
             Tile::WoodChair,
         ];
         for t in new {
-            let data = pixels(t);
+            let data = pixels(t, false);
             assert_eq!(data.len(), 96 * 96 * 4);
             assert!(data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             assert_ne!(data, grass, "{t:?} looks like grass");
             assert_ne!(data, floor, "{t:?} looks like floor");
             for u in new.into_iter().filter(|&u| u != t) {
-                assert_ne!(data, pixels(u), "{t:?} looks like {u:?}");
+                assert_ne!(data, pixels(u, false), "{t:?} looks like {u:?}");
             }
         }
         // Wood furniture is browner (more red than blue) than its stone twin.
         let warmth = |t| {
-            pixels(t)
+            pixels(t, false)
                 .as_chunks::<4>()
                 .0
                 .iter()
@@ -272,9 +261,25 @@ mod tests {
     }
 
     #[test]
+    fn furniture_outdoors_sits_on_grass() {
+        let grass = pixels(Tile::Grass, false);
+        let center = (48 * 96 + 48) * 4..(48 * 96 + 49) * 4;
+        for t in Tile::ALL.into_iter().filter(|t| t.is_furniture()) {
+            let (out, inside) = (pixels(t, true), pixels(t, false));
+            assert_eq!(out[..4], grass[..4], "{t:?}: corner is grass");
+            assert_ne!(inside[..4], grass[..4], "{t:?}: indoor corner is floor");
+            assert_eq!(
+                out[center.clone()],
+                inside[center.clone()],
+                "{t:?}: same piece"
+            );
+        }
+    }
+
+    #[test]
     fn slope_rises_toward_the_east() {
         // Generated slopes climb toward +x, so the texture must brighten left to right.
-        let data = pixels(Tile::Slope);
+        let data = pixels(Tile::Slope, false);
         let sum = |cols: std::ops::Range<usize>| -> u32 {
             (0..96)
                 .flat_map(|y| cols.clone().map(move |x| (y, x)))
