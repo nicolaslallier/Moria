@@ -353,7 +353,10 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
         ui.separator();
         for (i, &(label, _)) in ORDER_ROWS.iter().enumerate() {
             let b = egui::Button::new(label).selected(i == g.order_sel);
-            if ui.add(b).clicked() {
+            let r = ui.add(b);
+            // Space picks the row (see `play`): a focused button would click too.
+            r.surrender_focus();
+            if r.clicked() {
                 picked = Some(i);
             }
         }
@@ -530,6 +533,40 @@ mod tests {
     }
 
     /// Space digs: no status-window control may hold focus and take it as a click.
+    /// Space picks the order row itself: no order button may hold focus.
+    #[test]
+    fn order_buttons_never_take_focus() {
+        use moria_core::{Dir, Tile};
+        let mut g = crate::game::tests::game();
+        let e = g.hero.pos.step(Dir::E);
+        g.mountain.set(e, Tile::Forge);
+        g.order_menu = Some(Dir::E);
+        let ctx = egui::Context::default();
+        let key = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for k in [
+            egui::Key::Tab,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Space,
+        ] {
+            let input = egui::RawInput {
+                events: vec![key(k)],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                order_window(ui.ctx(), &mut g);
+            });
+            out.textures_delta.clear();
+            assert_eq!(ctx.memory(|m| m.focused()), None);
+        }
+    }
+
     #[test]
     fn status_window_never_takes_focus() {
         let mut g = crate::game::tests::game();

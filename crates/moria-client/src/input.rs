@@ -143,6 +143,25 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum OrderNav {
+    Step(bool),
+    Close,
+    Keep,
+}
+
+/// Order menu navigation: only a new direction press acts (N/S step, E/W close).
+fn order_nav(prev: Option<Dir>, walk: Option<Dir>) -> OrderNav {
+    match walk {
+        Some(d) if walk != prev => match d {
+            Dir::N | Dir::S => OrderNav::Step(d == Dir::S),
+            Dir::E | Dir::W => OrderNav::Close,
+            _ => OrderNav::Keep,
+        },
+        _ => OrderNav::Keep,
+    }
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -194,23 +213,20 @@ fn play(
     }
     let mut out = vec![];
     if g.order_menu.is_some() {
-        if walk != *menu_dir && matches!(walk, Some(Dir::N | Dir::S)) {
-            g.order_sel = (g.order_sel
-                + if walk == Some(Dir::S) {
-                    1
-                } else {
-                    ORDER_ROWS.len() - 1
-                })
-                % ORDER_ROWS.len();
-        }
+        let nav = order_nav(*menu_dir, walk);
         *menu_dir = walk;
-        if k.dig || p.dig {
-            out.extend(g.pick_order(g.order_sel));
+        match nav {
+            OrderNav::Step(down) => {
+                let n = ORDER_ROWS.len();
+                g.order_sel = (g.order_sel + if down { 1 } else { n - 1 }) % n;
+            }
+            OrderNav::Close => g.order_menu = None,
+            OrderNav::Keep => {}
         }
-        // Walking sideways leaves the workshop.
-        if matches!(walk, Some(Dir::E | Dir::W)) {
-            g.order_menu = None;
-        } else {
+        if g.order_menu.is_some() {
+            if k.dig || p.dig {
+                out.extend(g.pick_order(g.order_sel));
+            }
             for m in out {
                 client.send(m);
             }
@@ -220,6 +236,14 @@ fn play(
     *menu_dir = None;
     if k.use_ || p.use_ {
         out.extend(g.use_());
+        if g.order_menu.is_some() {
+            // Just opened: the held direction is not a new press; do nothing else.
+            *menu_dir = walk;
+            for m in out {
+                client.send(m);
+            }
+            return;
+        }
     }
     if let Some(d) = walk {
         out.extend(g.try_move(d, now));
@@ -299,6 +323,21 @@ mod tests {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyF);
         assert!(keyboard_intent(&keys, &ButtonInput::default()).use_);
+    }
+
+    #[test]
+    fn order_menu_closes_only_on_a_new_sideways_press() {
+        // Held toward the workshop (the press that opened it): stays open.
+        assert_eq!(order_nav(Some(Dir::E), Some(Dir::E)), OrderNav::Keep);
+        assert_eq!(order_nav(Some(Dir::W), Some(Dir::W)), OrderNav::Keep);
+        // A fresh press closes it, even straight from another held direction.
+        assert_eq!(order_nav(None, Some(Dir::W)), OrderNav::Close);
+        assert_eq!(order_nav(Some(Dir::N), Some(Dir::E)), OrderNav::Close);
+        // N/S step only on a new press.
+        assert_eq!(order_nav(None, Some(Dir::S)), OrderNav::Step(true));
+        assert_eq!(order_nav(Some(Dir::S), Some(Dir::S)), OrderNav::Keep);
+        assert_eq!(order_nav(None, Some(Dir::N)), OrderNav::Step(false));
+        assert_eq!(order_nav(Some(Dir::E), None), OrderNav::Keep);
     }
 
     #[test]
