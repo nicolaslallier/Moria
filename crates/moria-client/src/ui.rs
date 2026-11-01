@@ -6,6 +6,7 @@ use crate::game::{
     ACTIONS, BUILDS, Game, ORDER_ROWS, Screen, Session, ability_rows, build_text, clock_label,
     level_label, mode_label, recipe_label, resource_bar, stock_text, workshop_label,
 };
+use crate::lang::{en, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
@@ -24,6 +25,8 @@ struct LoginForm {
     name: String,
     password: String,
     invite: String,
+    /// English instead of French.
+    en: bool,
 }
 
 #[derive(Resource)]
@@ -49,7 +52,9 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (top_bar, hud, action_bar, build_menu, order_menu, status)
+                (
+                    top_bar, hud, action_bar, build_menu, order_menu, status, pause_menu,
+                )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
@@ -106,6 +111,13 @@ fn load_prefs() -> LoginForm {
         .flatten()
         .find_map(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
+    let f = parse_prefs(&text);
+    set_en(f.en);
+    f
+}
+
+/// Lines: address, name, language (`en` or `fr`).
+fn parse_prefs(text: &str) -> LoginForm {
     let mut l = text.lines().map(str::to_owned);
     LoginForm {
         addr: l
@@ -114,13 +126,16 @@ fn load_prefs() -> LoginForm {
             .unwrap_or_else(|| "127.0.0.1:7777".into()),
         name: l.next().unwrap_or_default(),
         password: String::new(),
-        invite: String::new(), // an older prefs file's 3rd line (the invite) is ignored
+        invite: String::new(),
+        // An older file's 3rd line is the invite: anything but `en` means French.
+        en: l.next().is_some_and(|s| s == "en"),
     }
 }
 
 /// Never contains the password or the invite code.
 fn prefs_text(f: &LoginForm) -> String {
-    format!("{}\n{}\n", f.addr, f.name)
+    let lang = if f.en { "en" } else { "fr" };
+    format!("{}\n{}\n{lang}\n", f.addr, f.name)
 }
 
 fn save_prefs(f: &LoginForm) {
@@ -183,33 +198,37 @@ fn login(
 ) -> Result {
     backdrop(&mut ctx, &images, &art.castle)?;
     let connecting = client.net.is_some();
-    centered("Moria — Connexion").show(ctx.ctx_mut()?, |ui| {
+    centered(tr("Moria — Connexion", "Moria — Login")).show(ctx.ctx_mut()?, |ui| {
         egui::Grid::new("login").num_columns(2).show(ui, |ui| {
-            ui.label("Serveur");
+            ui.label(tr("Serveur", "Server"));
             ui.text_edit_singleline(&mut form.addr);
             ui.end_row();
-            ui.label("Nom");
+            ui.label(tr("Nom", "Name"));
             ui.text_edit_singleline(&mut form.name);
             ui.end_row();
-            ui.label("Mot de passe");
+            ui.label(tr("Mot de passe", "Password"));
             ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
             ui.end_row();
-            ui.label("Code d'invitation");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.invite)
-                    .hint_text("seulement pour créer un compte"),
-            );
+            ui.label(tr("Code d'invitation", "Invite code"));
+            ui.add(egui::TextEdit::singleline(&mut form.invite).hint_text(tr(
+                "seulement pour créer un compte",
+                "only to create an account",
+            )));
             ui.end_row();
         });
+        lang_picker(ui, &mut form);
         error_label(ui, &client.session);
         if connecting {
-            ui.label("Connexion en cours…");
+            ui.label(tr("Connexion en cours…", "Connecting…"));
             return;
         }
         let create = ui.horizontal(|ui| {
-            if ui.button("Se connecter").clicked() {
+            if ui.button(tr("Se connecter", "Log in")).clicked() {
                 Some(false)
-            } else if ui.button("Créer un compte").clicked() {
+            } else if ui
+                .button(tr("Créer un compte", "Create an account"))
+                .clicked()
+            {
                 Some(true)
             } else {
                 None
@@ -241,30 +260,31 @@ fn create_hero(
 ) -> Result {
     backdrop(&mut ctx, &images, &art.castle)?;
     let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(form.race).id()));
-    centered("Création du héros").show(ctx.ctx_mut()?, |ui| {
+    centered(tr("Création du héros", "Create your hero")).show(ctx.ctx_mut()?, |ui| {
         egui::ComboBox::from_label("Race")
-            .selected_text(form.race.label_fr())
+            .selected_text(word(form.race.label_fr()))
             .show_ui(ui, |ui| {
                 for r in Race::ALL {
-                    ui.selectable_value(&mut form.race, r, r.label_fr());
+                    ui.selectable_value(&mut form.race, r, word(r.label_fr()));
                 }
             });
-        egui::ComboBox::from_label("Classe")
-            .selected_text(form.class.label_fr())
+        egui::ComboBox::from_label(tr("Classe", "Class"))
+            .selected_text(word(form.class.label_fr()))
             .show_ui(ui, |ui| {
                 for c in Class::ALL {
-                    ui.selectable_value(&mut form.class, c, c.label_fr());
+                    ui.selectable_value(&mut form.class, c, word(c.label_fr()));
                 }
             });
         ui.image(egui::load::SizedTexture::new(portrait, [192.0, 192.0]));
         let a = roll_abilities(form.race, form.class);
+        let (s, w) = if en() { ("STR", "WIS") } else { ("FOR", "SAG") };
         ui.label(format!(
-            "FOR {}  DEX {}  CON {}  INT {}  SAG {}  CHA {}",
+            "{s} {}  DEX {}  CON {}  INT {}  {w} {}  CHA {}",
             a.str, a.dex, a.con, a.int, a.wis, a.cha
         ));
         if form.sent {
-            ui.label("Création en cours…");
-        } else if ui.button("Créer le héros").clicked() {
+            ui.label(tr("Création en cours…", "Creating…"));
+        } else if ui.button(tr("Créer le héros", "Create the hero")).clicked() {
             client.send(ClientMsg::CreateHero {
                 race: form.race,
                 class: form.class,
@@ -286,11 +306,18 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
         return Ok(());
     }
     let r = g.resources;
-    centered("Construire").show(ctx.ctx_mut()?, |ui| {
-        ui.label(format!(
-            "Disponible : {} pierre · {} bois · {} or · {} lingots · {} portes en fer",
-            r.stone, r.wood, r.gold, r.iron, r.iron_door
-        ));
+    centered(tr("Construire", "Build")).show(ctx.ctx_mut()?, |ui| {
+        ui.label(if en() {
+            format!(
+                "Available: {} stone · {} wood · {} gold · {} ingots · {} iron doors",
+                r.stone, r.wood, r.gold, r.iron, r.iron_door
+            )
+        } else {
+            format!(
+                "Disponible : {} pierre · {} bois · {} or · {} lingots · {} portes en fer",
+                r.stone, r.wood, r.gold, r.iron, r.iron_door
+            )
+        });
         ui.separator();
         let mut picked = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -305,8 +332,14 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
             g.pick_build(i);
         }
         ui.separator();
-        ui.small("Clavier : flèches + Espace · 3 ou Échap : fermer");
-        ui.small("Manette : croix/stick + A/✕ · bouton gauche (X/□) ou B/○ : fermer");
+        ui.small(tr(
+            "Clavier : flèches + Espace · 3 ou Échap : fermer",
+            "Keyboard: arrows + Space · 3 or Esc: close",
+        ));
+        ui.small(tr(
+            "Manette : croix/stick + A/✕ · bouton gauche (X/□) ou B/○ : fermer",
+            "Gamepad: D-pad/stick + A/✕ · left button (X/□) or B/○: close",
+        ));
     });
     Ok(())
 }
@@ -334,19 +367,25 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     let r = g.spare();
     let queued = g.mountain.orders.get(&at).copied().unwrap_or(0);
     let mut picked = None;
-    centered(workshop_label(tile)).show(ctx, |ui| {
+    centered(word(workshop_label(tile))).show(ctx, |ui| {
         ui.label(build_text(kind, recipe_label(kind)));
         ui.label(stock_text(kind, r));
-        ui.label(format!("Commande en cours : {queued}"));
+        ui.label(format!(
+            "{}{queued}",
+            tr("Commande en cours : ", "Current order: ")
+        ));
         if !r.covers(&kind.cost()) {
             ui.colored_label(
                 egui::Color32::LIGHT_RED,
-                "En attente : il manque de la matière",
+                tr(
+                    "En attente : il manque de la matière",
+                    "Waiting: not enough materials",
+                ),
             );
         }
         ui.separator();
         for (i, &(label, _)) in ORDER_ROWS.iter().enumerate() {
-            let b = egui::Button::new(label).selected(i == g.order_sel);
+            let b = egui::Button::new(word(label)).selected(i == g.order_sel);
             let r = ui.add(b);
             // Space picks the row (see `play`): a focused button would click too.
             r.surrender_focus();
@@ -354,8 +393,14 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
                 picked = Some(i);
             }
         }
-        ui.small("Clavier : N/S + Espace · Échap : fermer");
-        ui.small("Manette : croix/stick + A/✕ · B/○ : fermer");
+        ui.small(tr(
+            "Clavier : N/S + Espace · Échap : fermer",
+            "Keyboard: N/S + Space · Esc: close",
+        ));
+        ui.small(tr(
+            "Manette : croix/stick + A/✕ · B/○ : fermer",
+            "Gamepad: D-pad/stick + A/✕ · B/○: close",
+        ));
     });
     let i = picked?;
     g.order_sel = i;
@@ -379,8 +424,8 @@ fn action_bar(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
 
 fn action_buttons(ui: &mut egui::Ui, g: &mut Game) {
     for &(label, a) in ACTIONS {
-        let b =
-            egui::Button::new(egui::RichText::new(label).heading()).selected(g.action_active(a));
+        let b = egui::Button::new(egui::RichText::new(word(label)).heading())
+            .selected(g.action_active(a));
         let r = ui.add(b);
         // Space digs: a focused button would also take it as a click.
         r.surrender_focus();
@@ -412,15 +457,19 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, below_bar(ctx)])
         .resizable(false)
         .show(ctx, |ui| {
-            ui.heading(format!("Statut — {}", h.name));
+            ui.heading(format!("{}{}", tr("Statut — ", "Status — "), h.name));
             ui.horizontal(|ui| {
                 ui.image(egui::load::SizedTexture::new(portrait, [96.0, 96.0]));
                 ui.vertical(|ui| {
-                    ui.label(format!("{} {}", h.race.label_fr(), h.class.label_fr()));
+                    ui.label(format!(
+                        "{} {}",
+                        word(h.race.label_fr()),
+                        word(h.class.label_fr())
+                    ));
                     ui.label(level_label(h.pos.z));
                     egui::Grid::new("abilities").show(ui, |ui| {
                         for (name, score, m) in ability_rows(h.abilities) {
-                            ui.label(name);
+                            ui.label(word(name));
                             ui.label(score.to_string());
                             ui.label(m);
                             ui.end_row();
@@ -429,7 +478,7 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
                 });
             });
             ui.separator();
-            ui.strong(format!("Nains ({})", rows.len()));
+            ui.strong(format!("{} ({})", tr("Nains", "Dwarves"), rows.len()));
             egui::ScrollArea::vertical()
                 .max_height(240.0)
                 .show(ui, |ui| {
@@ -442,7 +491,10 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
                         }
                     });
                 });
-            ui.small("C ou Échap : fermer · manette : Select ou B/○");
+            ui.small(tr(
+                "C ou Échap : fermer · manette : Select ou B/○",
+                "C or Esc: close · gamepad: Select or B/○",
+            ));
         });
 }
 
@@ -480,7 +532,14 @@ fn bar_window(ctx: &egui::Context, g: &Game) -> egui::Rect {
                 ui.allocate_ui_with_layout(row, rtl, |ui| {
                     ui.label(clock_label(g.tick));
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new(format!("Nains {}", g.dwarves.len())).strong());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            tr("Nains", "Dwarves"),
+                            g.dwarves.len()
+                        ))
+                        .strong(),
+                    );
                     ui.add_space(24.0);
                     let wrap = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
                     ui.with_layout(wrap, |ui| {
@@ -493,7 +552,7 @@ fn bar_window(ctx: &egui::Context, g: &Game) -> egui::Rect {
                             };
                             job.append("■ ", 0.0, fmt(egui::Color32::from_rgb(r, gr, b)));
                             let strong = ui.visuals().strong_text_color();
-                            job.append(&format!("{what} {n}"), 0.0, fmt(strong));
+                            job.append(&format!("{} {n}", word(what)), 0.0, fmt(strong));
                             ui.add(egui::Label::new(job).extend());
                             ui.add_space(12.0);
                         }
@@ -519,36 +578,114 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
         .show(ctx, |ui| {
             let level = level_label(g.current_z());
             if g.browse_z.is_some() {
-                ui.label(format!("{level} (héros : {})", level_label(g.hero.pos.z)));
+                ui.label(format!(
+                    "{level} ({}{})",
+                    tr("héros : ", "hero: "),
+                    level_label(g.hero.pos.z)
+                ));
             } else {
                 ui.label(level);
             }
             ui.label(format!(
                 "{} — {} {}",
                 g.hero.name,
-                g.hero.race.label_fr(),
-                g.hero.class.label_fr()
+                word(g.hero.race.label_fr()),
+                word(g.hero.class.label_fr())
             ));
             ui.label(mode_label(g.mode));
-            ui.small(
+            ui.small(tr(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler",
-            );
-            ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler · Échap : menu",
+                "WASD (ZQSD on AZERTY)/arrows: walk · Space: dig or chop (in build mode: build) · < > or Q/E (A/E on AZERTY): stairs or level \
+                 · X: next mode · 1, 2, 3, 4 or bottom bar: dig, stairs, build, chop · C: status · F: use (door, workshop) · left-drag: designate · right-click: cancel · Esc: menu",
+            ));
+            ui.small(tr(
+                "Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
-                 · bouton gauche (X/□) : menu construire · RT (R2) : utiliser · Select : statut");
+                 · bouton gauche (X/□) : menu construire · RT (R2) : utiliser · Select : statut · Start : menu",
+                "Gamepad: stick/D-pad: walk · bottom button (A/✕): dig/build \
+                 · LB/RB (L1/R1): up/down · top button (Y/△): mode \
+                 · left button (X/□): build menu · RT (R2): use · Select: status · Start: menu",
+            ));
         });
     Ok(())
 }
 
 fn disconnected(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
-    centered("Déconnecté").show(ctx.ctx_mut()?, |ui| {
+    centered(tr("Déconnecté", "Disconnected")).show(ctx.ctx_mut()?, |ui| {
         error_label(ui, &client.session);
-        if ui.button("Reconnecter").clicked() {
+        if ui.button(tr("Reconnecter", "Reconnect")).clicked() {
             client.session = Session::default();
             client.net = None;
         }
     });
+    Ok(())
+}
+
+/// French / English; the choice is kept in the prefs file.
+fn lang_picker(ui: &mut egui::Ui, form: &mut LoginForm) {
+    ui.horizontal(|ui| {
+        ui.label(tr("Langue", "Language"));
+        let mut en = form.en;
+        ui.radio_value(&mut en, false, "Français");
+        ui.radio_value(&mut en, true, "English");
+        if en != form.en {
+            form.en = en;
+            set_en(en);
+            save_prefs(form);
+        }
+    });
+}
+
+/// Escape menu: back to the login screen, save, language, quit. The world keeps running.
+fn pause_menu(
+    mut ctx: EguiContexts,
+    mut client: ResMut<Client>,
+    mut form: ResMut<LoginForm>,
+    mut exit: MessageWriter<AppExit>,
+    mut saved: Local<bool>,
+) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if !g.pause {
+        *saved = false;
+        return Ok(());
+    }
+    let (mut leave, mut save) = (false, false);
+    centered(tr("Menu", "Menu")).show(ctx.ctx_mut()?, |ui| {
+        ui.vertical_centered_justified(|ui| {
+            if ui.button(tr("Reprendre (Échap)", "Resume (Esc)")).clicked() {
+                g.pause = false;
+            }
+            leave = ui
+                .button(tr("Retour au menu principal", "Back to main menu"))
+                .clicked();
+            save = ui.button(tr("Sauvegarder", "Save")).clicked();
+            if *saved {
+                ui.label(tr(
+                    "Carte sauvegardée. Le serveur sauvegarde le monde toutes les 30 s.",
+                    "Map saved. The server saves the world every 30 s.",
+                ));
+            }
+            ui.separator();
+            lang_picker(ui, &mut form);
+            ui.separator();
+            if ui.button(tr("Quitter le jeu", "Quit the game")).clicked() {
+                // `memory_sync` saves the map on exit.
+                exit.write(AppExit::Success);
+            }
+        });
+    });
+    if save {
+        client.session.save_now = true;
+        *saved = true;
+    }
+    if leave {
+        // Dropping the handle closes the connection; `memory_sync` saves the map.
+        client.session.leave();
+        client.net = None;
+    }
     Ok(())
 }
 
@@ -822,8 +959,17 @@ mod tests {
             name: "Gimli".into(),
             password: "motdepasse".into(),
             invite: "mellon".into(),
+            en: true,
         };
         let t = prefs_text(&f);
-        assert_eq!(t, "1.2.3.4:7777\nGimli\n");
+        assert_eq!(t, "1.2.3.4:7777\nGimli\nen\n");
+    }
+
+    #[test]
+    fn prefs_keep_the_language_and_ignore_an_old_invite_line() {
+        assert!(parse_prefs("a\nb\nen\n").en);
+        assert!(!parse_prefs("a\nb\nfr\n").en);
+        assert!(!parse_prefs("a\nb\nmellon\n").en); // older file: 3rd line was the invite
+        assert!(!parse_prefs("").en);
     }
 }

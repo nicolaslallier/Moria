@@ -3,6 +3,7 @@
 mod art;
 mod game;
 mod input;
+mod lang;
 mod light;
 mod net;
 mod render;

@@ -1,5 +1,6 @@
 //! Blocking TCP on two std threads; the Bevy side only touches the channels.
 
+use crate::lang::{en, tr};
 use moria_core::protocol::{ClientMsg, ServerMsg, encode, read_frame};
 use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
@@ -31,14 +32,18 @@ pub fn connect(addr: String) -> NetHandle {
         let stream = match open(&addr) {
             Ok(s) => s,
             Err(e) => {
-                let _ = ev_tx.send(NetEvent::Disconnected(format!(
-                    "Connexion impossible à {addr} : {e}"
-                )));
+                let _ = ev_tx.send(NetEvent::Disconnected(if en() {
+                    format!("Cannot connect to {addr}: {e}")
+                } else {
+                    format!("Connexion impossible à {addr} : {e}")
+                }));
                 return;
             }
         };
         let Ok(mut wr) = stream.try_clone() else {
-            let _ = ev_tx.send(NetEvent::Disconnected("Erreur réseau locale".into()));
+            let _ = ev_tx.send(NetEvent::Disconnected(
+                tr("Erreur réseau locale", "Local network error").into(),
+            ));
             return;
         };
         thread::spawn(move || {
@@ -63,11 +68,19 @@ pub fn connect(addr: String) -> NetHandle {
                 }
                 Err(e) => NetEvent::Disconnected(match e.kind() {
                     ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        "Le serveur ne répond plus".into()
+                        tr("Le serveur ne répond plus", "The server stopped answering").into()
                     }
-                    ErrorKind::UnexpectedEof => "Le serveur a fermé la connexion".into(),
-                    ErrorKind::InvalidData => "Données invalides reçues du serveur".into(),
-                    _ => format!("Connexion perdue : {e}"),
+                    ErrorKind::UnexpectedEof => tr(
+                        "Le serveur a fermé la connexion",
+                        "The server closed the connection",
+                    )
+                    .into(),
+                    ErrorKind::InvalidData => tr(
+                        "Données invalides reçues du serveur",
+                        "Invalid data received from the server",
+                    )
+                    .into(),
+                    _ => format!("{}{e}", tr("Connexion perdue : ", "Connection lost: ")),
                 }),
             };
             let end = matches!(ev, NetEvent::Disconnected(_));

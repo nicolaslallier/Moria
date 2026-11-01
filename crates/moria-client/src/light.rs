@@ -173,7 +173,7 @@ impl MemorySync {
             return;
         };
         self.since += dt;
-        if self.since >= Self::EVERY {
+        if std::mem::take(&mut s.save_now) || self.since >= Self::EVERY {
             self.since = 0.0;
             save(f, &g.explored);
         }
@@ -292,6 +292,19 @@ mod tests {
         s.handle(NetEvent::Disconnected("perdu".into()));
         sync.step(1.0, false, &mut s, files(&d));
         assert!(disk(&d, 1).seen(p(2))); // (d) saved on end
+    }
+
+    #[test]
+    fn save_now_writes_the_running_map_at_once() {
+        let d = tmp("now");
+        let (mut s, mut sync) = (Session::default(), MemorySync::default());
+        on(&mut s, 1);
+        sync.step(0.0, false, &mut s, files(&d));
+        mark(&mut s, 1);
+        s.save_now = true;
+        sync.step(0.0, false, &mut s, files(&d));
+        assert!(disk(&d, 1).seen(p(1)));
+        assert!(!s.save_now);
     }
 
     #[test]
