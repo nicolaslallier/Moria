@@ -408,8 +408,8 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             }
             let r = g.resources;
             ui.label(format!(
-                "Pierre {} / Bois {} / Or {} / Mithril {}",
-                r.stone, r.wood, r.gold, r.mithril
+                "Pierre {} / Bois {} / Or {} / Mithril {} / Minerai de fer {} / Charbon {} / Lingots {} / Portes en fer {}",
+                r.stone, r.wood, r.gold, r.mithril, r.iron_ore, r.coal, r.iron, r.iron_door
             ));
             ui.label(format!(
                 "{} — {} {}",
