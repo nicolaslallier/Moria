@@ -354,7 +354,7 @@ mod tests {
             mountain.designate(a, b, DesignationKind::Dig);
             mountain.designate(a, b, DesignationKind::Chop);
         }
-        assert!(mountain.designations.len() > 10_000, "not a worst case");
+        assert_eq!(mountain.designations.len(), crate::MAX_DESIGNATIONS);
         let view = FortressView {
             mountain,
             hero: HeroView {
@@ -499,6 +499,35 @@ mod tests {
             }
             assert!(gold > 0 && mith > 0);
         }
+    }
+
+    /// NATS refuses messages over its max_payload (1 MiB by default); keep half of it spare.
+    #[test]
+    fn worst_case_ai_view_fits_in_half_a_nats_message() {
+        use crate::ai::{AiView, DwarfView, MAX_DWARVES_PER_VIEW};
+        use crate::{DesignationKind, DwarfId, TilePos};
+        let mut mountain = generate(1).mountains.remove(&MountainId(0)).unwrap();
+        let (w, h, d) = mountain.size();
+        for z in 0..d {
+            let (a, b) = (TilePos::new(0, 0, z), TilePos::new(w - 1, h - 1, z));
+            mountain.designate(a, b, DesignationKind::Dig);
+        }
+        let far = TilePos::new(w - 1, h - 1, d - 1);
+        let view = AiView {
+            mountain,
+            tick: u64::MAX,
+            dwarves: (0..MAX_DWARVES_PER_VIEW as u32)
+                .map(|i| DwarfView {
+                    id: DwarfId(i),
+                    pos: far,
+                    idle: true,
+                })
+                .collect(),
+            claimed: vec![far; MAX_DWARVES_PER_VIEW],
+            occupied: vec![far; MAX_DWARVES_PER_VIEW + 1],
+        };
+        let n = postcard::to_allocvec(&view).unwrap().len();
+        assert!(n < 512 * 1024, "{n}");
     }
 
     #[test]
