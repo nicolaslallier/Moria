@@ -5,6 +5,20 @@ use moria_bus::{Bus, Queue};
 use moria_core::ai::{AiView, Assignments, KEY_ASSIGN, KEY_VIEW};
 use std::{future::Future, time::Duration};
 
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Continue,
+    Reconnect,
+}
+
+/// Any publish error (dead channel included) forces a fresh connection.
+fn next_step(publish: Result<(), anyhow::Error>) -> Step {
+    match publish {
+        Ok(()) => Step::Continue,
+        Err(_) => Step::Reconnect,
+    }
+}
+
 /// Serve views until `shutdown` resolves; reconnects (2 s backoff) whenever the bus drops.
 pub async fn run(amqp_url: String, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
     tokio::pin!(shutdown);
@@ -68,11 +82,16 @@ pub async fn run(amqp_url: String, shutdown: impl Future<Output = ()>) -> anyhow
             };
             match postcard::to_allocvec(&out) {
                 Ok(b) => {
-                    if let Err(e) = bus.publish(KEY_ASSIGN, b, false).await {
-                        tracing::warn!("publication echouee: {e}");
-                        if !bus.is_connected() {
-                            break;
+                    let res = bus.publish(KEY_ASSIGN, b, false).await;
+                    if let Err(e) = &res {
+                        tracing::warn!("publication echouee ({e}), reconnexion dans 2 s");
+                    }
+                    if next_step(res) == Step::Reconnect {
+                        tokio::select! {
+                            _ = &mut shutdown => return Ok(()),
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         }
+                        break;
                     }
                 }
                 Err(e) => tracing::error!("encodage impossible: {e}"),
@@ -83,7 +102,21 @@ pub async fn run(amqp_url: String, shutdown: impl Future<Output = ()>) -> anyhow
 
 #[cfg(test)]
 mod tests {
+    use super::{Step, next_step};
     use moria_core::ai::{KEY_ASSIGN, KEY_VIEW};
+
+    #[test]
+    fn publish_ok_continues() {
+        assert_eq!(next_step(Ok(())), Step::Continue);
+    }
+
+    #[test]
+    fn any_publish_error_reconnects() {
+        assert_eq!(
+            next_step(Err(anyhow::anyhow!("canal ferme"))),
+            Step::Reconnect
+        );
+    }
 
     #[test]
     fn keys_are_the_documented_ones() {
