@@ -3,8 +3,10 @@
 
 use crate::net::NetEvent;
 use bevy::prelude::States;
+use moria_core::GROUND_Z;
 use moria_core::protocol::{ClientMsg, FortressView, HeroView, Reject, ServerMsg, TickDelta};
 use moria_core::{DesignationKind, Dir, DwarfId, Mountain, Resources, TilePos};
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
@@ -15,7 +17,7 @@ pub const MOVE_COOLDOWN: f64 = 0.22;
 /// 10 ticks (~1 s) keeps good predictions on links up to ~700 ms RTT.
 const PENDING_TICKS: u64 = 10;
 
-/// Bounds on an untrusted snapshot, well above the real 48×48×8.
+/// Bounds on an untrusted snapshot, above the real 176×96×12.
 fn valid_view(v: &FortressView) -> bool {
     let (w, h, d) = v.mountain.size();
     v.mountain.is_consistent()
@@ -67,6 +69,45 @@ pub fn drag_msg(
     }
 }
 
+/// Level name for the HUD: 0 is the ground, positive above it (z grows downward).
+pub fn level_label(z: u8) -> String {
+    match z.cmp(&GROUND_Z) {
+        Ordering::Equal => "Niveau 0 (sol)".into(),
+        Ordering::Less => format!("Niveau +{}", GROUND_Z - z),
+        Ordering::Greater => format!("Niveau -{}", z - GROUND_Z),
+    }
+}
+
+/// "1 pierre", "3 bois".
+fn cost_fr(r: Resources) -> String {
+    [(r.stone, "pierre"), (r.wood, "bois")]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Build-menu row: "Lit en bois (3 bois)".
+pub fn build_text(k: DesignationKind, label: &str) -> String {
+    format!("{label} ({})", cost_fr(k.cost()))
+}
+
+/// HUD line for the current mode.
+pub fn mode_label(k: DesignationKind) -> String {
+    match k {
+        DesignationKind::Dig => "Mode : Creuser".into(),
+        DesignationKind::Stairs => "Mode : Escalier".into(),
+        DesignationKind::Chop => "Mode : Couper (arbres)".into(),
+        _ => BUILDS
+            .iter()
+            .find(|b| b.0 == k)
+            .map_or_else(String::new, |&(k, l)| {
+                format!("Mode : {}", build_text(k, l))
+            }),
+    }
+}
+
 pub struct Game {
     pub mountain: Mountain,
     pub hero: HeroView,
@@ -89,12 +130,15 @@ pub struct Game {
     ticks: u64,
 }
 
-/// Everything the player can build: mode, label, stone cost.
-pub const BUILDS: &[(DesignationKind, &str, u32)] = &[
-    (DesignationKind::Wall, "Mur", 1),
-    (DesignationKind::Bed, "Lit", 1),
-    (DesignationKind::Table, "Table", 1),
-    (DesignationKind::Chair, "Chaise", 1),
+/// Everything the player can build: mode and label; the cost is `kind.cost()`.
+pub const BUILDS: &[(DesignationKind, &str)] = &[
+    (DesignationKind::Wall, "Mur"),
+    (DesignationKind::Bed, "Lit"),
+    (DesignationKind::Table, "Table"),
+    (DesignationKind::Chair, "Chaise"),
+    (DesignationKind::WoodBed, "Lit en bois"),
+    (DesignationKind::WoodTable, "Table en bois"),
+    (DesignationKind::WoodChair, "Chaise en bois"),
 ];
 
 impl Game {
@@ -104,10 +148,10 @@ impl Game {
         self.build_sel = (self.build_sel + if down { 1 } else { n - 1 }) % n;
     }
 
-    /// Picks build `i` if the stone covers it: sets the mode and closes the menu.
+    /// Picks build `i` if the resources cover it: sets the mode and closes the menu.
     pub fn pick_build(&mut self, i: usize) {
-        if let Some(&(kind, _, cost)) = BUILDS.get(i)
-            && self.resources.stone >= cost
+        if let Some(&(kind, _)) = BUILDS.get(i)
+            && self.resources.covers(&kind.cost())
         {
             self.mode = kind;
             self.build_menu = false;
@@ -194,11 +238,12 @@ impl Game {
         }
         let to = self.mountain.move_dest(self.hero.pos, dir)?;
         self.last_move = now;
-        self.hero.pos = to;
-        self.pending.push_back((self.hero.pos, self.ticks));
-        if matches!(dir, Dir::Up | Dir::Down) {
+        // Stairs or a slope: the view follows the hero to its new level.
+        if to.z != self.hero.pos.z {
             self.browse_z = None;
         }
+        self.hero.pos = to;
+        self.pending.push_back((self.hero.pos, self.ticks));
         Some(ClientMsg::Move(dir))
     }
 
@@ -217,18 +262,18 @@ impl Game {
         None
     }
 
-    /// Hero action toward the last move direction: in a build mode build on floor (with
-    /// stone), else dig a solid tile or furniture.
+    /// Hero action toward the last move direction: in a build mode build on floor or grass
+    /// (given the resources), else dig a solid tile or furniture, or chop a tree.
     pub fn dig(&self) -> Option<ClientMsg> {
         let target = self.hero.pos.step(self.last_dir);
-        if self.mode.builds().is_some()
-            && self.mountain.diggable(target, self.mode)
-            && self.resources.stone > 0
+        let m = &self.mountain;
+        if self.mode.is_build()
+            && m.diggable(target, self.mode)
+            && self.resources.covers(&self.mode.cost())
         {
             Some(ClientMsg::Build(self.last_dir, self.mode))
         } else {
-            self.mountain
-                .diggable(target, DesignationKind::Dig)
+            (m.diggable(target, DesignationKind::Dig) || m.diggable(target, DesignationKind::Chop))
                 .then_some(ClientMsg::Dig(self.last_dir))
         }
     }
@@ -316,14 +361,18 @@ mod tests {
         }
         m.set(p(1, 1, 0), Tile::Stair);
         m.set(p(1, 1, 1), Tile::Stair);
+        game_on(m, p(2, 1, 0))
+    }
+
+    fn game_on(mountain: Mountain, pos: TilePos) -> Game {
         Game::new(FortressView {
-            mountain: m,
+            mountain,
             hero: HeroView {
                 name: "Gimli".into(),
                 race: Race::Dwarf,
                 class: Class::Fighter,
                 abilities: roll_abilities(Race::Dwarf, Class::Fighter),
-                pos: p(2, 1, 0),
+                pos,
             },
             dwarves: vec![],
             resources: Resources::default(),
@@ -686,5 +735,114 @@ mod tests {
         assert!(s.handle(NetEvent::Msg(ServerMsg::Reject(Reject::BadInvite))));
         assert_eq!(s.screen, Screen::Login);
         assert_eq!(s.error.as_deref(), Some("Code d'invitation invalide"));
+    }
+
+    #[test]
+    fn level_labels() {
+        use moria_core::GROUND_Z;
+        assert_eq!(level_label(GROUND_Z), "Niveau 0 (sol)");
+        assert_eq!(level_label(GROUND_Z - 2), "Niveau +2");
+        assert_eq!(level_label(GROUND_Z + 3), "Niveau -3");
+    }
+
+    #[test]
+    fn prediction_climbs_slope() {
+        // 4×1×3: sky at z 0, rock below; grass (0,0,1), slope (1,0,1), hilltop (2,0,0).
+        let mut m = Mountain::new(MountainId(0), 4, 1, 3, Tile::Rock);
+        for x in 0..4 {
+            m.set(p(x, 0, 0), Tile::Sky);
+        }
+        m.set(p(0, 0, 1), Tile::Grass);
+        m.set(p(1, 0, 1), Tile::Slope);
+        m.set(p(2, 0, 0), Tile::Grass);
+        let mut g = game_on(m, p(0, 0, 1));
+        assert_eq!(g.try_move(Dir::E, 10.0), Some(ClientMsg::Move(Dir::E)));
+        assert_eq!(g.hero.pos, p(1, 0, 1));
+        // Browsing elsewhere: climbing the hill brings the view back to the hero.
+        g.browse_z = Some(2);
+        assert_eq!(g.try_move(Dir::E, 11.0), Some(ClientMsg::Move(Dir::E)));
+        assert_eq!(g.hero.pos, p(2, 0, 0));
+        assert_eq!(g.current_z(), 0);
+        // And down again.
+        g.browse_z = Some(2);
+        assert_eq!(g.try_move(Dir::W, 12.0), Some(ClientMsg::Move(Dir::W)));
+        assert_eq!(g.hero.pos, p(1, 0, 1));
+        assert_eq!(g.current_z(), 1);
+    }
+
+    #[test]
+    fn chop_mode_designates_chop() {
+        let mut g = game();
+        g.mode = g.mode.toggled().toggled();
+        assert_eq!(g.mode, DesignationKind::Chop);
+        assert_eq!(mode_label(g.mode), "Mode : Couper (arbres)");
+        assert_eq!(
+            drag_msg((3, 1), (1, 1), g.current_z(), Some(g.mode)),
+            ClientMsg::Designate {
+                a: p(1, 1, 0),
+                b: p(3, 1, 0),
+                kind: DesignationKind::Chop
+            }
+        );
+        // Space toward a tree chops it (the server turns a hero Dig on a tree into Chop).
+        g.mountain.set(p(3, 1, 0), Tile::Tree);
+        g.last_dir = Dir::E;
+        assert_eq!(g.dig(), Some(ClientMsg::Dig(Dir::E)));
+    }
+
+    #[test]
+    fn build_menu_lists_wood() {
+        let rows: Vec<String> = BUILDS.iter().map(|&(k, l)| build_text(k, l)).collect();
+        assert_eq!(
+            rows,
+            [
+                "Mur (1 pierre)",
+                "Lit (1 pierre)",
+                "Table (1 pierre)",
+                "Chaise (1 pierre)",
+                "Lit en bois (3 bois)",
+                "Table en bois (4 bois)",
+                "Chaise en bois (2 bois)",
+            ]
+        );
+        assert_eq!(
+            mode_label(DesignationKind::WoodBed),
+            "Mode : Lit en bois (3 bois)"
+        );
+        // Wood builds need wood, not stone.
+        let mut g = game();
+        g.build_menu = true;
+        g.resources.stone = 9;
+        g.pick_build(4);
+        assert!(g.build_menu);
+        g.resources.wood = 3;
+        g.pick_build(4);
+        assert_eq!(g.mode, DesignationKind::WoodBed);
+        g.last_dir = Dir::E; // (3,1) is floor
+        assert_eq!(
+            g.dig(),
+            Some(ClientMsg::Build(Dir::E, DesignationKind::WoodBed))
+        );
+        g.resources.wood = 2;
+        assert_eq!(g.dig(), None);
+    }
+
+    #[test]
+    fn full_size_snapshot_is_valid() {
+        let mut w = moria_core::world::generate(1);
+        let mountain = w.mountains.remove(&MountainId(0)).unwrap();
+        let mut at = moria_core::world::entrance_tiles();
+        let view = FortressView {
+            mountain,
+            hero: HeroView {
+                pos: at.next().unwrap(),
+                ..game().hero
+            },
+            dwarves: at.take(3).zip(0..).map(|(p, i)| (DwarfId(i), p)).collect(),
+            resources: Resources::default(),
+        };
+        let mut s = Session::default();
+        assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));
+        assert_eq!(s.screen, Screen::Playing);
     }
 }

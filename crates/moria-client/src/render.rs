@@ -5,34 +5,10 @@ use crate::art::Art;
 use crate::game::Screen;
 use crate::input::Drag;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use moria_core::{DesignationKind, Tile, TilePos};
 
 pub const TILE: f32 = 48.0;
-
-/// Ores share the stone background, with colored veins in their own texture.
-fn tile_look(t: Tile, art: &Art) -> (Handle<Image>, Color) {
-    match t {
-        Tile::Rock => (art.rock.clone(), Color::WHITE),
-        Tile::Floor => (art.floor.clone(), Color::WHITE),
-        Tile::Gold => (art.gold.clone(), Color::WHITE),
-        Tile::Mithril => (art.mithril.clone(), Color::WHITE),
-        Tile::Stair => (art.stair.clone(), Color::WHITE),
-        Tile::Wall => (art.wall.clone(), Color::WHITE),
-        Tile::Bed => (art.bed.clone(), Color::WHITE),
-        Tile::Table => (art.table.clone(), Color::WHITE),
-        Tile::Chair => (art.chair.clone(), Color::WHITE),
-        // Placeholders (tinted indoor textures); Task 7 draws the real ones.
-        Tile::Grass => (art.floor.clone(), Color::srgb(0.4, 0.8, 0.3)),
-        Tile::Tree => (art.wall.clone(), Color::srgb(0.1, 0.5, 0.15)),
-        Tile::Water => (art.floor.clone(), Color::srgb(0.2, 0.4, 0.9)),
-        Tile::Slope => (art.floor.clone(), Color::srgb(0.6, 0.55, 0.3)),
-        Tile::Soil => (art.rock.clone(), Color::srgb(0.7, 0.5, 0.3)),
-        Tile::Sky => (art.floor.clone(), Color::srgb(0.5, 0.7, 1.0)),
-        Tile::WoodBed => (art.bed.clone(), Color::srgb(0.9, 0.7, 0.4)),
-        Tile::WoodTable => (art.table.clone(), Color::srgb(0.9, 0.7, 0.4)),
-        Tile::WoodChair => (art.chair.clone(), Color::srgb(0.9, 0.7, 0.4)),
-    }
-}
 
 pub fn to_world(x: i16, y: i16) -> Vec2 {
     Vec2::new(f32::from(x) * TILE, -f32::from(y) * TILE)
@@ -141,10 +117,11 @@ fn sync_tiles(client: Res<Client>, art: Res<Art>, mut q: Query<(&mut TileSprite,
         if tile != t.shown {
             t.shown = tile;
             (s.image, s.color) = match tile {
-                Some(t) => tile_look(t, &art),
+                Some(t) => (art.tile(t), Color::WHITE),
                 None => (Handle::default(), Color::BLACK),
             };
-            if tile.is_some_and(|tile| tile != Tile::Stair) {
+            // Slopes keep their orientation, stairs are the user's art, sky stays flat.
+            if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky)) {
                 let variation = ((i32::from(t.x) * 37 + i32::from(t.y) * 61).rem_euclid(11)) as f32;
                 let light = 0.88 + variation * 0.012;
                 s.color = Color::srgb(light, light, light);
@@ -209,19 +186,28 @@ fn follow_camera(client: Res<Client>, mut cam: Query<&mut Transform, With<Camera
 }
 
 /// Recomputed from neighbors so digging and level changes reveal the new edges immediately.
-fn draw_relief(client: Res<Client>, mut gizmos: Gizmos) {
+/// Only the tiles on screen (the camera is on the hero), so a 176×96 level stays cheap.
+fn draw_relief(
+    client: Res<Client>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut gizmos: Gizmos,
+) {
     let Some(g) = &client.session.game else {
         return;
     };
     let z = g.current_z();
     let (w, h, _) = g.mountain.size();
+    let rx = (window.width() / TILE / 2.0) as i16 + 2;
+    let ry = (window.height() / TILE / 2.0) as i16 + 2;
+    let (hx, hy) = (g.hero.pos.x, g.hero.pos.y);
     let half = TILE / 2.0;
-    for y in 0..h {
-        for x in 0..w {
+    for y in (hy - ry).max(0)..(hy + ry).min(h) {
+        for x in (hx - rx).max(0)..(hx + rx).min(w) {
+            // Trees are not cliffs: no stone face around them.
             if !g
                 .mountain
                 .get(TilePos::new(x, y, z))
-                .is_some_and(Tile::is_solid)
+                .is_some_and(|t| t.is_solid() && t != Tile::Tree)
             {
                 continue;
             }
@@ -272,7 +258,7 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
         gizmos.circle_2d(at, TILE * 0.47, Color::srgb(0.94, 0.73, 0.35));
         gizmos.circle_2d(at, TILE * 0.49, Color::srgba(0.94, 0.73, 0.35, 0.3));
     }
-    // TilePos orders by x first, so a z-range is not contiguous; the map is small.
+    // TilePos orders by x first, so a z-range is not contiguous; a scan of all designations.
     for (p, k) in g.mountain.designations.iter().filter(|(p, _)| p.z == z) {
         let color = match k {
             DesignationKind::Dig => Color::srgb(1.0, 0.9, 0.0),

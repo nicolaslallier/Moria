@@ -1,5 +1,5 @@
 //! Images baked into the binary: the release ships a lone executable, no assets folder.
-//! Heads and portraits use the user's art; stone and floor are generated in `terrain`.
+//! Heads, portraits and stairs use the user's art; every other tile is generated in `terrain`.
 //! The bytes go into Bevy's `embedded://` source, so decoding runs on the asset
 //! task pool instead of blocking startup.
 
@@ -7,6 +7,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::asset::io::embedded::EmbeddedAssetRegistry;
 use bevy::image::ImageLoaderSettings;
 use bevy::prelude::*;
+use moria_core::Tile;
 use moria_core::srd::Race;
 use std::path::{Path, PathBuf};
 
@@ -59,14 +60,8 @@ fn slug(r: Race) -> &'static str {
 
 #[derive(Resource)]
 pub struct Art {
-    pub rock: Handle<Image>,
-    pub floor: Handle<Image>,
-    pub gold: Handle<Image>,
-    pub mithril: Handle<Image>,
-    pub wall: Handle<Image>,
-    pub bed: Handle<Image>,
-    pub table: Handle<Image>,
-    pub chair: Handle<Image>,
+    /// Baked textures, one per `terrain::BAKED` tile.
+    terrain: Vec<(Tile, Handle<Image>)>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
     pub castle: Handle<Image>,
@@ -82,6 +77,14 @@ fn race_index(r: Race) -> usize {
 impl Art {
     pub fn head(&self, r: Race) -> Handle<Image> {
         self.heads[race_index(r)].clone()
+    }
+
+    /// The tile's texture; the stairs (not baked) fall back to their art.
+    pub fn tile(&self, t: Tile) -> Handle<Image> {
+        self.terrain
+            .iter()
+            .find(|e| e.0 == t)
+            .map_or_else(|| self.stair.clone(), |e| e.1.clone())
     }
 
     pub fn portrait(&self, r: Race) -> Handle<Image> {
@@ -115,14 +118,9 @@ impl FromWorld for Art {
             .into();
         let mut images = world.resource_mut::<Assets<Image>>();
         Art {
-            rock: images.add(crate::terrain::image(moria_core::Tile::Rock)),
-            floor: images.add(crate::terrain::image(moria_core::Tile::Floor)),
-            gold: images.add(crate::terrain::image(moria_core::Tile::Gold)),
-            mithril: images.add(crate::terrain::image(moria_core::Tile::Mithril)),
-            wall: images.add(crate::terrain::image(moria_core::Tile::Wall)),
-            bed: images.add(crate::terrain::image(moria_core::Tile::Bed)),
-            table: images.add(crate::terrain::image(moria_core::Tile::Table)),
-            chair: images.add(crate::terrain::image(moria_core::Tile::Chair)),
+            terrain: crate::terrain::BAKED
+                .map(|t| (t, images.add(crate::terrain::image(t))))
+                .into(),
             stair,
             worker_head,
             castle,
