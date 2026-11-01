@@ -13,13 +13,13 @@ services:
 
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
-    image: ghcr.io/nicolaslallier/moria-worldgen:sha-d19bc51602d88af310d722bfad2b7162d3f4cc62
+    image: ghcr.io/nicolaslallier/moria-worldgen:sha-e802f74b10a99fb1f96c18d6d0cffaba8ca0f9af
     volumes: ["moria-data:/data"]
     command: ["--out", "/data/world.bin"]
     restart: "no"
 
   server:
-    image: ghcr.io/nicolaslallier/moria-server:sha-d19bc51602d88af310d722bfad2b7162d3f4cc62
+    image: ghcr.io/nicolaslallier/moria-server:sha-e802f74b10a99fb1f96c18d6d0cffaba8ca0f9af
     # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
     stop_grace_period: 30s
     # 9464 : /metrics pour Prometheus (stack Infra, via host.docker.internal:9464).
@@ -36,7 +36,7 @@ services:
       worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
-    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-d19bc51602d88af310d722bfad2b7162d3f4cc62
+    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-e802f74b10a99fb1f96c18d6d0cffaba8ca0f9af
     environment:
       NATS_URL: nats://nats:4222
     restart: unless-stopped
