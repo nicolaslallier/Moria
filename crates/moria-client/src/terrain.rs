@@ -127,10 +127,10 @@ fn outdoor(tile: Tile, x: i32, y: i32, noise: i32) -> Option<[i32; 3]> {
             let wave = ((x as f32 * 0.2 + (y as f32 * 0.35).sin() * 3.0).sin() * 12.0) as i32;
             [38 + wave, 82 + wave, 150 + wave - noise]
         }
-        // Earthy grass darkening toward the top, with contour ridges: reads as a rise.
+        // Earthy grass brightening toward the east (+x), with contour ridges: reads as a rise.
         Tile::Slope => {
-            let ridge = if y % 16 < 3 { -26 } else { 0 };
-            let rise = y / 4;
+            let ridge = if x % 16 < 3 { -26 } else { 0 };
+            let rise = x / 4;
             [90 + rise + ridge, 112 + rise + ridge, 56 + rise / 2 + ridge]
         }
         Tile::Soil => {
@@ -269,5 +269,18 @@ mod tests {
         ] {
             assert!(warmth(wood) > warmth(stone) + 96 * 96 * 10, "{wood:?}");
         }
+    }
+
+    #[test]
+    fn slope_rises_toward_the_east() {
+        // Generated slopes climb toward +x, so the texture must brighten left to right.
+        let data = pixels(Tile::Slope);
+        let sum = |cols: std::ops::Range<usize>| -> u32 {
+            (0..96)
+                .flat_map(|y| cols.clone().map(move |x| (y, x)))
+                .map(|(y, x)| u32::from(data[(y * 96 + x) * 4]))
+                .sum()
+        };
+        assert!(sum(0..8) < sum(88..96), "{} vs {}", sum(0..8), sum(88..96));
     }
 }

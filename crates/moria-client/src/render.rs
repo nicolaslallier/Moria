@@ -187,6 +187,11 @@ fn follow_camera(client: Res<Client>, mut cam: Query<&mut Transform, With<Camera
 
 /// Recomputed from neighbors so digging and level changes reveal the new edges immediately.
 /// Only the tiles on screen (the camera is on the hero), so a 176×96 level stays cheap.
+/// Stone faces cast a cliff edge; trees and furniture are solid but not cliffs.
+fn casts_relief(t: Tile) -> bool {
+    t.is_solid() && t != Tile::Tree && !t.is_furniture()
+}
+
 fn draw_relief(
     client: Res<Client>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -205,11 +210,10 @@ fn draw_relief(
     let half = TILE / 2.0;
     for y in (hy - ry).max(0)..(hy + ry).min(h) {
         for x in (hx - rx).max(0)..(hx + rx).min(w) {
-            // Trees are not cliffs: no stone face around them.
             if !g
                 .mountain
                 .get(TilePos::new(x, y, z))
-                .is_some_and(|t| t.is_solid() && t != Tile::Tree)
+                .is_some_and(casts_relief)
             {
                 continue;
             }
@@ -284,5 +288,19 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
         let (wa, wb) = (to_world(a.0, a.1), to_world(b.0, b.1));
         let size = (wa - wb).abs() + Vec2::splat(TILE);
         gizmos.rect_2d((wa + wb) / 2.0, size, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_stone_casts_relief() {
+        assert!(casts_relief(Tile::Rock));
+        assert!(!casts_relief(Tile::Tree));
+        for t in Tile::ALL.into_iter().filter(|t| t.is_furniture()) {
+            assert!(!casts_relief(t), "{t:?}");
+        }
     }
 }
