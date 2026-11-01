@@ -17,6 +17,8 @@ pub struct Metrics {
     pub accounts: AtomicI64,
     pub fortresses: AtomicI64,
     pub nats_connected: AtomicI64,
+    /// Bus link state (not exported): `nats_connected` also requires a fresh inventory.
+    pub bus_up: AtomicI64,
     pub ticks: AtomicU64,
     pub tick_nanos: AtomicU64,
     pub tick_overruns: AtomicU64,
@@ -25,6 +27,7 @@ pub struct Metrics {
     pub assignments_received: AtomicU64,
     pub assignments_rejected: AtomicU64,
     pub save_failures: AtomicU64,
+    pub inventory_dropped: AtomicU64,
 }
 
 pub static M: Metrics = Metrics {
@@ -33,6 +36,7 @@ pub static M: Metrics = Metrics {
     accounts: AtomicI64::new(0),
     fortresses: AtomicI64::new(0),
     nats_connected: AtomicI64::new(0),
+    bus_up: AtomicI64::new(0),
     ticks: AtomicU64::new(0),
     tick_nanos: AtomicU64::new(0),
     tick_overruns: AtomicU64::new(0),
@@ -41,6 +45,7 @@ pub static M: Metrics = Metrics {
     assignments_received: AtomicU64::new(0),
     assignments_rejected: AtomicU64::new(0),
     save_failures: AtomicU64::new(0),
+    inventory_dropped: AtomicU64::new(0),
 };
 
 pub fn inc(c: &AtomicU64) {
@@ -128,6 +133,12 @@ pub fn render(m: &Metrics) -> String {
         "Sauvegardes du monde echouees.",
         c(&m.save_failures),
     );
+    put(
+        "moria_inventory_dropped_total",
+        "counter",
+        "Lots d'inventaire perdus (file du pont pleine).",
+        c(&m.inventory_dropped),
+    );
     s
 }
 
@@ -174,7 +185,7 @@ mod tests {
         assert!(out.contains("moria_sessions 3\n"));
         assert!(out.contains("moria_ticks_total 1\n"));
         assert!(out.contains("moria_tick_seconds_total 0.25\n"));
-        assert_eq!(out.matches("# TYPE ").count(), 13);
+        assert_eq!(out.matches("# TYPE ").count(), 14);
     }
 
     #[tokio::test]
