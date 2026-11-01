@@ -13,18 +13,18 @@ docker compose up -d
 docker compose logs server    # attendre « serveur prêt sur 0.0.0.0:7777 »
 ```
 
-Toutes les commandes `docker compose` exigent `MORIA_INVITE` et `MORIA_AMQP_PASSWORD` (variables exportée ou fichier `.env` non commité) : sans elle, Compose refuse de démarrer.
+Toutes les commandes `docker compose` exigent `MORIA_INVITE` et `MORIA_AMQP_PASSWORD` (variables exportées ou fichier `.env` non commité) : sans elles, Compose refuse de démarrer.
 
 Le monde est généré automatiquement au premier démarrage (service `worldgen`, qui s'arrête ensuite). Aux démarrages suivants il détecte le monde existant (« monde déjà présent, rien à faire ») et ne l'écrase jamais.
 
-Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-data` (`docker compose down -v`). **Cela détruit définitivement le monde et toutes les forteresses.**
+Pour régénérer un monde : arrêter la stack puis supprimer le volume `moria-data` (`docker compose down -v`). **Cela détruit définitivement le monde et toutes les forteresses.** Réinitialiser le monde (suppression de `world.bin` ou `down -v`) doit s'accompagner de la suppression de `inventory.bin` / du volume `moria-inventory` : sinon l'inventaire conserve le stock et les drapeaux `seeded` de l'ancien monde et les ressources de départ du nouveau sont ignorées.
 
 ## Déploiement avec Portainer (192.168.2.10)
 
 1. Portainer > Stacks > Add stack > **Repository**.
 2. Repository URL : `https://github.com/nicolaslallier/Moria`, branche `main`, Compose path : `docker-compose.yml`. Si le dépôt est privé, activer « Authentication » et fournir un jeton GitHub (token) à Portainer.
 3. Dans « Environment variables », ajouter `MORIA_INVITE` (**obligatoire**, voir ci-dessous) et `MORIA_AMQP_PASSWORD` (**obligatoire**, mot de passe de l'utilisateur RabbitMQ `moria`, URL-safe : lettres et chiffres seulement, car il est inséré dans `AMQP_URL`) : sans elles, le déploiement échoue.
-4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il n'est plus publié directement : le nginx de la pile Infra expose `192.168.2.10:7777` (proxy TCP, `nginx/stream.d/moria.conf` dans Infra, limite de 4 connexions par IP) et joint le serveur sur `infra-net`. Ordre : d'abord le changement Infra qui crée le vhost et l'utilisateur `moria` sur RabbitMQ, puis cette stack, puis le reste d'Infra qui prend le port 7777. Au premier déploiement, le pull de l'image `inventory` peut échouer et être réessayé quelques minutes, jusqu'à ce que le commit du bot CI épingle le vrai tag. Le port `9464` (métriques Prometheus, lues par la stack Infra) est aussi publié, pour le réseau local uniquement . Les variables `AMQP_URL` (défaut de dev `amqp://moria:moria@rabbitmq:5672/moria`) sont construites par le compose à partir de `MORIA_AMQP_PASSWORD`.
+4. Déployer : les images sont construites, le monde est généré, puis le serveur démarre. Il n'est plus publié directement : le nginx de la pile Infra expose `192.168.2.10:7777` (proxy TCP, `nginx/stream.d/moria.conf` dans Infra, limite de 4 connexions par IP) et joint le serveur sur `infra-net`. Ordre : d'abord le changement Infra qui crée le vhost et l'utilisateur `moria` sur RabbitMQ, puis cette stack, puis le reste d'Infra qui prend le port 7777. Au premier déploiement, le pull de l'image `inventory` peut échouer et être réessayé quelques minutes, jusqu'à ce que le commit du bot CI épingle le vrai tag. Le port `9464` (métriques Prometheus, lues par la stack Infra) est aussi publié, pour le réseau local uniquement. `amqp://moria:moria@rabbitmq:5672/moria` n'est que le repli des binaires quand `AMQP_URL` n'est pas défini ; le compose le définit toujours, à partir de `MORIA_AMQP_PASSWORD`. Après la migration depuis NATS, un conteneur `nats` orphelin de l'ancienne pile peut subsister sur l'hôte (Portainer ne supprime pas toujours les orphelins) : le retirer avec `docker rm`.
 5. Logs : l'Alloy de la pile Infra collecte le stdout des conteneurs de cet hôte ; dans Grafana (https://grafana.infra.famillelallier.net), Explore > Loki, requête `{compose_project="moria"}` (filtrer par `compose_service`). Le nom de stack Portainer doit rester `moria`.
 
 ## Mise à jour vers le dehors et le bois
