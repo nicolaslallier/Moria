@@ -72,6 +72,9 @@ pub struct Dwarf {
     pub id: DwarfId,
     pub pos: TilePos,
     pub task: Option<DwarfTask>,
+    /// Missed a meal: works no more until it has eaten. Not saved (a restart feeds everyone).
+    #[serde(skip)]
+    pub hungry: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -375,6 +378,7 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
             id: DwarfId(i),
             pos,
             task: None,
+            hungry: false,
         })
         .collect();
     w.next_dwarf += 3;
@@ -384,7 +388,10 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
             owner: player,
             hero: None,
             dwarves,
-            resources: Resources::default(),
+            resources: Resources {
+                food: 12,
+                ..Default::default()
+            },
         },
     );
     Some(id)
@@ -450,6 +457,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            hungry: vec![],
             tick: 0,
         };
         let n = encode(&view).len();
@@ -715,6 +723,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            hungry: vec![],
             tick: 0,
         };
         let n = encode(&v).len();
@@ -738,6 +747,7 @@ mod tests {
             let id = claim_mountain(&mut w, PlayerId(p)).unwrap();
             let f = &w.fortresses[&id];
             assert_eq!(f.dwarves.len(), 3);
+            assert_eq!(f.resources.food, 12, "a day of food for three dwarves");
             assert!(f.hero.is_none());
             for (i, d) in f.dwarves.iter().enumerate() {
                 assert_eq!(Some(d.pos), entrance_tiles().nth(i));

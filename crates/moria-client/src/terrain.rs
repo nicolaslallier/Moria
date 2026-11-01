@@ -116,6 +116,14 @@ fn outdoor(tile: Tile, x: i32, y: i32, noise: i32) -> Option<[i32; 3]> {
         }
         Tile::Tree if r2 < 44 * 44 => [36, 70, 34],
         Tile::Tree => grass(x, y),
+        // Ploughed soil in rows, with green sprouts along each furrow.
+        Tile::Field if y % 12 < 6 && x % 8 < 3 => [74, 132, 52],
+        Tile::Field if y % 12 < 6 => [118, 84, 52],
+        Tile::Field => [92, 64, 40],
+        // Ripe wheat: golden rows with bright ears.
+        Tile::Crop if y % 12 < 8 && (x + y / 3) % 5 == 0 => [246, 214, 110],
+        Tile::Crop if y % 12 < 8 => [214, 172, 66],
+        Tile::Crop => [128, 98, 50],
         // Seen from above: a black-and-white body, its pink muzzle toward the east, on grass.
         Tile::Cow => {
             let body = (x - 44).pow(2) * 9 + (y - 48).pow(2) * 25 < 26 * 26 * 9;
@@ -337,7 +345,10 @@ mod tests {
             Tile::StoneDoorLocked,
             Tile::IronDoorLocked,
             Tile::Cow,
+            Tile::Field,
+            Tile::Crop,
         ];
+        assert_ne!(pixels(Tile::Field, false), pixels(Tile::Crop, false));
         for t in new {
             let data = pixels(t, false);
             assert_eq!(data.len(), 96 * 96 * 4);

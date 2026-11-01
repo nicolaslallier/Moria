@@ -8,7 +8,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -89,6 +89,8 @@ pub struct FortressView {
     pub hero: HeroView,
     pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
+    /// Dwarves that missed a meal and do not work.
+    pub hungry: Vec<DwarfId>,
     /// World tick, so the client knows the game hour on connect.
     pub tick: u64,
 }
@@ -104,6 +106,8 @@ pub struct TickDelta {
     pub resources: Resources,
     /// Changed order counts per workshop; `0` = order gone.
     pub orders: Vec<(TilePos, u8)>,
+    /// Dwarves that missed a meal and do not work (the full list, every tick).
+    pub hungry: Vec<DwarfId>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

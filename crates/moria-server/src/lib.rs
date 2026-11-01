@@ -480,6 +480,12 @@ impl State {
             },
             dwarves: f.dwarves.iter().map(sim::dwarf_view).collect(),
             resources: f.resources,
+            hungry: f
+                .dwarves
+                .iter()
+                .filter(|d| d.hungry)
+                .map(|d| d.id)
+                .collect(),
             tick: self.w.tick,
         };
         self.send(player, ServerMsg::Snapshot(Box::new(v)));
@@ -509,7 +515,7 @@ impl State {
                 .map(|d| DwarfView {
                     id: d.id,
                     pos: d.pos,
-                    idle: d.task.is_none(),
+                    idle: d.task.is_none() && !d.hungry,
                 })
                 .collect(),
             claimed: sim::claimed(&self.w, m),

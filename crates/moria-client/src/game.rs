@@ -142,6 +142,9 @@ pub fn resource_bar(r: Resources) -> [(u32, &'static str, [u8; 3]); 9] {
 
 /// "1 pierre", "3 bois".
 fn cost_fr(r: Resources) -> String {
+    if r == Resources::default() {
+        return word("gratuit").into();
+    }
     named(r)
         .iter()
         .filter(|(n, _)| *n > 0)
@@ -211,7 +214,8 @@ pub fn job_label(job: Option<DwarfJob>) -> String {
     let what = match kind {
         Dig => tr("Creuse", "Digging").into(),
         Stairs => tr("Taille un escalier", "Carving stairs").into(),
-        Chop => tr("Coupe du bois", "Chopping wood").into(),
+        Chop => tr("Coupe ou récolte", "Chopping or harvesting").into(),
+        Farm => tr("Sème un champ", "Sowing a field").into(),
         Smelt => tr("Fond du fer", "Smelting iron").into(),
         Smith => tr("Forge une porte", "Forging a door").into(),
         Wall | Bed | Table | Chair | WoodBed | WoodTable | WoodChair | Candle | Torch | Lamp
@@ -245,6 +249,8 @@ pub struct Game {
     pub hero: HeroView,
     pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
+    /// Dwarves that missed a meal and do not work.
+    pub hungry: Vec<moria_core::DwarfId>,
     /// World tick, drives the day/night cycle.
     pub tick: u64,
     /// Tiles the hero has seen lit.
@@ -302,6 +308,7 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
     (DesignationKind::WoodDoor, "Porte en bois"),
     (DesignationKind::StoneDoor, "Porte en pierre"),
     (DesignationKind::IronDoor, "Porte en fer"),
+    (DesignationKind::Farm, "Champ"),
 ];
 
 /// Order-menu rows: label and quantity to add (0 cancels the order).
@@ -411,6 +418,7 @@ impl Game {
             hero: v.hero,
             dwarves: v.dwarves,
             resources: v.resources,
+            hungry: v.hungry,
             tick: v.tick,
             explored: Explored::new(w, h, d),
             memory: None,
@@ -449,7 +457,11 @@ impl Game {
                 (
                     format!("{}{}", tr("Nain n°", "Dwarf #"), id.0),
                     level_label(p.z),
-                    job_label(job),
+                    if self.hungry.contains(&id) {
+                        tr("Affamé", "Hungry").into()
+                    } else {
+                        job_label(job)
+                    },
                 )
             })
             .collect()
@@ -515,6 +527,7 @@ impl Game {
         self.dwarves
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
+        self.hungry.clone_from(&d.hungry);
         self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -856,6 +869,7 @@ pub(crate) mod tests {
 
     fn game_on(mountain: Mountain, pos: TilePos) -> Game {
         Game::new(FortressView {
+            hungry: vec![],
             mountain,
             hero: HeroView {
                 name: "Gimli".into(),
@@ -872,6 +886,7 @@ pub(crate) mod tests {
 
     fn tick(hero_pos: TilePos) -> TickDelta {
         TickDelta {
+            hungry: vec![],
             tick: 1,
             hero_pos,
             dwarves: vec![],
@@ -1024,6 +1039,7 @@ pub(crate) mod tests {
         let view = |m: Mountain| {
             let g = game();
             NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+                hungry: vec![],
                 mountain: m,
                 hero: g.hero,
                 dwarves: vec![],
@@ -1079,6 +1095,7 @@ pub(crate) mod tests {
             let mut m = g.mountain;
             m.id = MountainId(id);
             NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+                hungry: vec![],
                 mountain: m,
                 hero: g.hero,
                 dwarves: vec![],
@@ -1205,7 +1222,9 @@ pub(crate) mod tests {
         d.designations_removed = vec![p(0, 0, 0)];
         d.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
         d.resources.stone = 4;
+        d.hungry = vec![DwarfId(1)];
         g.apply_tick(&d);
+        assert_eq!(g.hungry, vec![DwarfId(1)]);
         assert_eq!(g.map_rev, 1);
         assert_eq!(g.mountain.get(p(4, 1, 0)), Some(Tile::Floor));
         assert_eq!(
@@ -1259,7 +1278,7 @@ pub(crate) mod tests {
             g.dwarf_rows(),
             vec![
                 ("Nain n°1".into(), level_label(0), "Inactif".into()),
-                ("Nain n°2".into(), level_label(0), "Coupe du bois".into()),
+                ("Nain n°2".into(), level_label(0), "Coupe ou récolte".into()),
                 (
                     "Nain n°3".into(),
                     level_label(1),
@@ -1280,6 +1299,8 @@ pub(crate) mod tests {
         assert_eq!(job_label(None), "Inactif");
         assert_eq!(job_label(at(DesignationKind::Dig)), "Creuse");
         assert_eq!(job_label(at(DesignationKind::Stairs)), "Taille un escalier");
+        assert_eq!(job_label(at(DesignationKind::Chop)), "Coupe ou récolte");
+        assert_eq!(job_label(at(DesignationKind::Farm)), "Sème un champ");
         assert_eq!(
             job_label(at(DesignationKind::WoodBed)),
             "Construit : Lit en bois"
@@ -1289,6 +1310,19 @@ pub(crate) mod tests {
             working: false,
         });
         assert_eq!(job_label(walking), "En route : Construit : Mur");
+    }
+
+    #[test]
+    fn a_hungry_dwarf_says_so() {
+        let mut g = game();
+        g.dwarves = vec![
+            (DwarfId(1), p(1, 1, 0), None),
+            (DwarfId(2), p(1, 1, 0), None),
+        ];
+        g.hungry = vec![DwarfId(2)];
+        let jobs: Vec<_> = g.dwarf_rows().into_iter().map(|r| r.2).collect();
+        assert_eq!(jobs, ["Inactif", "Affamé"]);
+        assert!(BUILDS.contains(&(DesignationKind::Farm, "Champ")));
     }
 
     #[test]
@@ -1329,6 +1363,7 @@ pub(crate) mod tests {
         assert_eq!(s.screen, Screen::CreateHero);
         let g = game();
         let view = FortressView {
+            hungry: vec![],
             mountain: g.mountain,
             hero: g.hero,
             dwarves: vec![],
@@ -1477,6 +1512,7 @@ pub(crate) mod tests {
                 "Porte en bois (3 bois)",
                 "Porte en pierre (3 pierre)",
                 "Porte en fer (1 porte en fer forgée)",
+                "Champ (gratuit)",
             ]
         );
         assert_eq!(
@@ -1507,6 +1543,7 @@ pub(crate) mod tests {
         let mountain = w.mountains.remove(&MountainId(0)).unwrap();
         let mut at = moria_core::world::entrance_tiles();
         let view = FortressView {
+            hungry: vec![],
             mountain,
             hero: HeroView {
                 pos: at.next().unwrap(),
@@ -1529,6 +1566,7 @@ pub(crate) mod tests {
     fn new_snapshot_keeps_explored() {
         let g = game();
         let view = FortressView {
+            hungry: vec![],
             mountain: g.mountain.clone(),
             hero: g.hero.clone(),
             dwarves: vec![],

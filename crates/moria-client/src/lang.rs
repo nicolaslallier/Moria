@@ -44,6 +44,8 @@ fn english(fr: &str) -> Option<&'static str> {
         "Porte en bois" => "Wooden door",
         "Porte en pierre" => "Stone door",
         "Porte en fer" => "Iron door",
+        "Champ" => "Field",
+        "gratuit" => "free",
         "Lingot de fer" => "Iron ingot",
         // Bottom bar and order menu.
         "Creuser [1]" => "Dig [1]",

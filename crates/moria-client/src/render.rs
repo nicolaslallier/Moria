@@ -462,6 +462,7 @@ fn draw_outlines(client: Res<Client>, drag: Res<Drag>, mut gizmos: Gizmos) {
             DesignationKind::Stairs => Color::srgb(0.0, 0.9, 0.9),
             DesignationKind::Wall => Color::srgb(1.0, 0.5, 0.2),
             DesignationKind::Chop => Color::srgb(0.3, 0.9, 0.3),
+            DesignationKind::Farm => Color::srgb(0.9, 0.8, 0.35),
             DesignationKind::Bed
             | DesignationKind::Table
             | DesignationKind::Chair

@@ -56,6 +56,10 @@ tiles! {
     IronDoorLocked,
     /// Grazes on the grass outdoors; blocks the way. Butchered (`Chop`) for food.
     Cow,
+    /// A sown field on the ground level: walkable, ripens into `Crop` by itself.
+    Field,
+    /// A ripe field: harvested (`Chop`) for food, which leaves it sown again.
+    Crop,
 }
 
 #[derive(
@@ -139,6 +143,8 @@ pub enum DesignationKind {
     Smelt,
     /// Work at a workshop: forge an iron door.
     Smith,
+    /// Sow a field on grass of the ground level; free.
+    Farm,
 }
 
 impl DesignationKind {
@@ -174,6 +180,7 @@ impl DesignationKind {
             Self::WoodDoor => Some(Tile::WoodDoor),
             Self::StoneDoor => Some(Tile::StoneDoor),
             Self::IronDoor => Some(Tile::IronDoor),
+            Self::Farm => Some(Tile::Field),
         }
     }
 
@@ -210,7 +217,7 @@ impl DesignationKind {
 
     pub fn cost(self) -> Resources {
         let (stone, wood, gold) = match self {
-            Self::Dig | Self::Stairs | Self::Chop => (0, 0, 0),
+            Self::Dig | Self::Stairs | Self::Chop | Self::Farm => (0, 0, 0),
             Self::Wall | Self::Bed | Self::Table | Self::Chair => (1, 0, 0),
             Self::WoodTable => (0, 4, 0),
             Self::WoodBed => (0, 3, 0),
@@ -353,7 +360,8 @@ impl Tile {
             Tile::Mithril => 25,
             Tile::Soil | Tile::Slope => 8,
             Tile::Tree | Tile::Cow => 20,
-            Tile::Floor | Tile::Stair | Tile::Grass | Tile::Water | Tile::Sky => 0,
+            Tile::Crop => 10,
+            Tile::Floor | Tile::Stair | Tile::Grass | Tile::Water | Tile::Sky | Tile::Field => 0,
         }
     }
 
@@ -367,6 +375,7 @@ impl Tile {
             Tile::Coal => r.coal = 1,
             Tile::Tree => r.wood = 3,
             Tile::Cow => r.food = 4,
+            Tile::Crop => r.food = 2,
             Tile::Wall => return DesignationKind::Wall.cost(),
             Tile::Bed => return DesignationKind::Bed.cost(),
             Tile::Table => return DesignationKind::Table.cost(),
@@ -442,6 +451,8 @@ mod tests {
             StoneDoorLocked,
             IronDoorLocked,
             Cow,
+            Field,
+            Crop,
         ];
         assert_eq!(Tile::ALL, expected);
         for (i, t) in expected.iter().enumerate() {
@@ -456,7 +467,7 @@ mod tests {
         let expected = [
             Dig, Stairs, Wall, Bed, Table, Chair, Chop, WoodBed, WoodTable, WoodChair, Candle,
             Torch, Lamp, Campfire, Hearth, Stove, Forge, Anvil, WoodDoor, StoneDoor, IronDoor,
-            Smelt, Smith,
+            Smelt, Smith, Farm,
         ];
         for (i, k) in expected.iter().enumerate() {
             assert_eq!(postcard::to_allocvec(k).unwrap(), [i as u8], "{k:?}");
