@@ -6,32 +6,11 @@ use bevy::{
 };
 use moria_core::Tile;
 
-/// Every tile drawn from `pixels`; the stairs use the user's art instead.
-pub const BAKED: [Tile; 17] = [
-    Tile::Rock,
-    Tile::Gold,
-    Tile::Mithril,
-    Tile::Floor,
-    Tile::Wall,
-    Tile::Bed,
-    Tile::Table,
-    Tile::Chair,
-    Tile::Grass,
-    Tile::Tree,
-    Tile::Water,
-    Tile::Slope,
-    Tile::Soil,
-    Tile::Sky,
-    Tile::WoodBed,
-    Tile::WoodTable,
-    Tile::WoodChair,
-];
-
-/// Compile-time exhaustive (no wildcard): a new `Tile` variant fails to build until it is
-/// classified here, and a baked one must also be added to `BAKED`.
-pub fn is_baked(t: Tile) -> bool {
+/// The generated texture of every tile but the stairs (user art). Exhaustive, no wildcard:
+/// a new `Tile` variant fails to compile until it is given a texture or `None` here.
+pub fn bake(t: Tile) -> Option<Image> {
     match t {
-        Tile::Stair => false,
+        Tile::Stair => None,
         Tile::Rock
         | Tile::Gold
         | Tile::Mithril
@@ -48,7 +27,7 @@ pub fn is_baked(t: Tile) -> bool {
         | Tile::Sky
         | Tile::WoodBed
         | Tile::WoodTable
-        | Tile::WoodChair => true,
+        | Tile::WoodChair => Some(image(t)),
     }
 }
 
@@ -209,9 +188,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn baked_list_matches_the_exhaustive_mapping() {
-        assert!(BAKED.iter().all(|&t| is_baked(t)));
-        assert!(!is_baked(Tile::Stair));
+    fn only_the_stairs_are_not_baked() {
+        for t in Tile::ALL {
+            assert_eq!(bake(t).is_none(), t == Tile::Stair, "{t:?}");
+        }
     }
 
     #[test]

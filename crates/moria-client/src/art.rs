@@ -60,7 +60,7 @@ fn slug(r: Race) -> &'static str {
 
 #[derive(Resource)]
 pub struct Art {
-    /// Baked textures, one per `terrain::BAKED` tile.
+    /// Baked textures, one per `terrain::bake` tile.
     terrain: std::collections::HashMap<Tile, Handle<Image>>,
     pub stair: Handle<Image>,
     pub worker_head: Handle<Image>,
@@ -79,14 +79,9 @@ impl Art {
         self.heads[race_index(r)].clone()
     }
 
-    /// The tile's texture: the stairs use the user's art, the rest are baked.
-    /// `is_baked` is an exhaustive match, so a new `Tile` cannot silently get the stair art.
+    /// The tile's texture; only the stairs (not baked) use their own art. Never panics.
     pub fn tile(&self, t: Tile) -> Handle<Image> {
-        if crate::terrain::is_baked(t) {
-            self.terrain[&t].clone()
-        } else {
-            self.stair.clone()
-        }
+        self.terrain.get(&t).unwrap_or(&self.stair).clone()
     }
 
     pub fn portrait(&self, r: Race) -> Handle<Image> {
@@ -120,9 +115,9 @@ impl FromWorld for Art {
             .into();
         let mut images = world.resource_mut::<Assets<Image>>();
         Art {
-            terrain: crate::terrain::BAKED
-                .map(|t| (t, images.add(crate::terrain::image(t))))
+            terrain: Tile::ALL
                 .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
                 .collect(),
             stair,
             worker_head,
@@ -137,6 +132,26 @@ impl FromWorld for Art {
 mod tests {
     use super::*;
     use bevy::image::{CompressedImageFormats, ImageSampler, ImageType};
+
+    #[test]
+    fn every_tile_has_art() {
+        let mut images = Assets::<Image>::default();
+        let (stair, other) = (images.add(Image::default()), images.add(Image::default()));
+        let art = Art {
+            terrain: Tile::ALL
+                .into_iter()
+                .filter_map(|t| Some((t, images.add(crate::terrain::bake(t)?))))
+                .collect(),
+            stair: stair.clone(),
+            worker_head: other.clone(),
+            castle: other,
+            heads: vec![],
+            portraits: vec![],
+        };
+        for t in Tile::ALL {
+            assert_eq!(art.tile(t) == stair, t == Tile::Stair, "{t:?}");
+        }
+    }
 
     #[test]
     fn every_embedded_image_decodes() {
