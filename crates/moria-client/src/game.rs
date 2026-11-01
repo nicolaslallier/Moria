@@ -233,8 +233,6 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
 pub const ORDER_ROWS: [(&str, u8); 3] = [("+1", 1), ("+5", 5), ("Annuler la commande", 0)];
 
 /// What a workshop makes.
-// Used by the order menu (next task).
-#[allow(dead_code)]
 pub fn recipe_label(k: DesignationKind) -> &'static str {
     match k {
         DesignationKind::Smelt => "Lingot de fer",

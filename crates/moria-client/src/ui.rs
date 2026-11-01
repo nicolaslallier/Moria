@@ -3,14 +3,15 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, Screen, Session, ability_rows, build_text, clock_label, level_label,
-    mode_label,
+    ACTIONS, BUILDS, Game, ORDER_ROWS, Screen, Session, ability_rows, build_text, clock_label,
+    level_label, mode_label, recipe_label,
 };
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
+use moria_core::DesignationKind;
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
 use std::path::PathBuf;
@@ -49,7 +50,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (hud, action_bar, build_menu, status).run_if(in_state(Screen::Playing)),
+                (hud, action_bar, build_menu, order_menu, status).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -286,17 +287,19 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let r = g.resources;
     centered("Construire").show(ctx.ctx_mut()?, |ui| {
         ui.label(format!(
-            "Pierre disponible : {} · Bois disponible : {} · Or disponible : {}",
-            r.stone, r.wood, r.gold
+            "Disponible : {} pierre · {} bois · {} or · {} lingots · {} portes en fer",
+            r.stone, r.wood, r.gold, r.iron, r.iron_door
         ));
         ui.separator();
         let mut picked = None;
-        for (i, &(kind, label)) in BUILDS.iter().enumerate() {
-            let b = egui::Button::new(build_text(kind, label)).selected(i == g.build_sel);
-            if ui.add_enabled(r.covers(&kind.cost()), b).clicked() {
-                picked = Some(i);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, &(kind, label)) in BUILDS.iter().enumerate() {
+                let b = egui::Button::new(build_text(kind, label)).selected(i == g.build_sel);
+                if ui.add_enabled(r.covers(&kind.cost()), b).clicked() {
+                    picked = Some(i);
+                }
             }
-        }
+        });
         if let Some(i) = picked {
             g.pick_build(i);
         }
@@ -305,6 +308,61 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
         ui.small("Manette : croix/stick + A/✕ · bouton gauche (X/□) ou B/○ : fermer");
     });
     Ok(())
+}
+
+fn order_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    let msg = order_window(ctx.ctx_mut()?, g);
+    if let Some(m) = msg {
+        client.send(m);
+    }
+    Ok(())
+}
+
+/// Workshop window: recipe, stock, standing order and the order buttons.
+fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
+    let dir = g.order_menu?;
+    let at = g.hero.pos.step(dir);
+    let Some(kind) = g.mountain.get(at).and_then(|t| t.recipe()) else {
+        g.order_menu = None;
+        return None;
+    };
+    let title = if kind == DesignationKind::Smelt {
+        "Forge"
+    } else {
+        "Enclume"
+    };
+    let r = g.resources;
+    let queued = g.mountain.orders.get(&at).copied().unwrap_or(0);
+    let mut picked = None;
+    centered(title).show(ctx, |ui| {
+        ui.label(build_text(kind, recipe_label(kind)));
+        ui.label(format!(
+            "En réserve : {} minerai de fer · {} charbon · {} lingots",
+            r.iron_ore, r.coal, r.iron
+        ));
+        ui.label(format!("Commande en cours : {queued}"));
+        if !r.covers(&kind.cost()) {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                "En attente : il manque de la matière",
+            );
+        }
+        ui.separator();
+        for (i, &(label, _)) in ORDER_ROWS.iter().enumerate() {
+            let b = egui::Button::new(label).selected(i == g.order_sel);
+            if ui.add(b).clicked() {
+                picked = Some(i);
+            }
+        }
+        ui.small("Clavier : N/S + Espace · Échap : fermer");
+        ui.small("Manette : croix/stick + A/✕ · B/○ : fermer");
+    });
+    let i = picked?;
+    g.order_sel = i;
+    g.pick_order(i)
 }
 
 /// Bottom bar: one button per action, the current one highlighted.
@@ -421,11 +479,11 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             ui.label(clock_label(g.tick));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · glisser clic gauche : désigner · clic droit : annuler",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
-                 · bouton gauche (X/□) : menu construire · Select : statut");
+                 · bouton gauche (X/□) : menu construire · RT (R2) : utiliser · Select : statut");
         });
     Ok(())
 }
@@ -502,6 +560,49 @@ mod tests {
             assert_eq!(ctx.memory(|m| m.focused()), None);
         }
         assert!(g.status);
+    }
+
+    /// All text painted by `order_window` for a forge east of the hero.
+    fn order_text(res: moria_core::Resources) -> String {
+        use moria_core::{Dir, Tile};
+        let mut g = crate::game::tests::game();
+        g.resources = res;
+        let e = g.hero.pos.step(Dir::E);
+        g.mountain.set(e, Tile::Forge);
+        g.order_menu = Some(Dir::E);
+        let ctx = egui::Context::default();
+        // Two frames: a new window is laid out hidden on its first.
+        let mut text = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                order_window(ui.ctx(), &mut g);
+            });
+            out.textures_delta.clear();
+            text = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        text
+    }
+
+    #[test]
+    fn order_window_warns_when_short_of_matter() {
+        let none = moria_core::Resources::default();
+        assert!(order_text(none).contains("En attente"));
+        let ok = moria_core::Resources {
+            iron_ore: 2,
+            coal: 1,
+            ..none
+        };
+        let t = order_text(ok);
+        assert!(!t.contains("En attente"));
+        assert!(t.contains("Forge"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Screen, drag_msg};
+use crate::game::{ORDER_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
@@ -48,6 +48,7 @@ struct Intent {
     build_menu: bool,
     close_menu: bool,
     status: bool,
+    use_: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -74,6 +75,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         build_menu: keys.just_pressed(KeyCode::Digit3),
         close_menu: keys.just_pressed(KeyCode::Escape),
         status: keys.just_pressed(KeyCode::KeyC),
+        use_: keys.just_pressed(KeyCode::KeyF),
     }
 }
 
@@ -136,6 +138,7 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         build_menu: any(GamepadButton::West),
         close_menu: any(GamepadButton::East),
         status: any(GamepadButton::Select),
+        use_: any(GamepadButton::RightTrigger2),
         ..default()
     }
 }
@@ -167,6 +170,7 @@ fn play(
         g.pick_action(None);
     } else if k.close_menu || p.close_menu {
         g.build_menu = false;
+        g.order_menu = None;
         g.status = false;
     }
     if k.status || p.status {
@@ -188,8 +192,35 @@ fn play(
         }
         return;
     }
-    *menu_dir = None;
     let mut out = vec![];
+    if g.order_menu.is_some() {
+        if walk != *menu_dir && matches!(walk, Some(Dir::N | Dir::S)) {
+            g.order_sel = (g.order_sel
+                + if walk == Some(Dir::S) {
+                    1
+                } else {
+                    ORDER_ROWS.len() - 1
+                })
+                % ORDER_ROWS.len();
+        }
+        *menu_dir = walk;
+        if k.dig || p.dig {
+            out.extend(g.pick_order(g.order_sel));
+        }
+        // Walking sideways leaves the workshop.
+        if matches!(walk, Some(Dir::E | Dir::W)) {
+            g.order_menu = None;
+        } else {
+            for m in out {
+                client.send(m);
+            }
+            return;
+        }
+    }
+    *menu_dir = None;
+    if k.use_ || p.use_ {
+        out.extend(g.use_());
+    }
     if let Some(d) = walk {
         out.extend(g.try_move(d, now));
     }
@@ -261,6 +292,13 @@ mod tests {
         keys.press(KeyCode::Digit4);
         let i = keyboard_intent(&keys, &ButtonInput::default());
         assert_eq!(i.mode, Some(DesignationKind::Chop));
+    }
+
+    #[test]
+    fn key_f_is_use() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyF);
+        assert!(keyboard_intent(&keys, &ButtonInput::default()).use_);
     }
 
     #[test]
