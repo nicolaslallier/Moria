@@ -108,6 +108,20 @@ fn named(r: Resources) -> [(u32, &'static str); 7] {
     ]
 }
 
+/// Top resource bar: count, name, RGB colour of its marker.
+pub fn resource_bar(r: Resources) -> [(u32, &'static str, [u8; 3]); 8] {
+    [
+        (r.stone, "Pierre", [160, 160, 160]),
+        (r.wood, "Bois", [170, 110, 60]),
+        (r.gold, "Or", [240, 200, 40]),
+        (r.mithril, "Mithril", [170, 220, 255]),
+        (r.iron_ore, "Minerai de fer", [190, 90, 60]),
+        (r.coal, "Charbon", [110, 110, 120]),
+        (r.iron, "Lingots", [200, 205, 215]),
+        (r.iron_door, "Portes en fer", [120, 150, 190]),
+    ]
+}
+
 /// "1 pierre", "3 bois".
 fn cost_fr(r: Resources) -> String {
     named(r)
@@ -612,6 +626,37 @@ pub(crate) mod tests {
     use super::*;
     use moria_core::srd::{Abilities, Class, Race, roll_abilities};
     use moria_core::{DwarfId, MountainId, Tile};
+
+    #[test]
+    fn resource_bar_shows_every_resource_in_order() {
+        let r = Resources {
+            stone: 1,
+            wood: 2,
+            gold: 3,
+            mithril: 4,
+            iron_ore: 5,
+            coal: 6,
+            iron: 7,
+            iron_door: 8,
+        };
+        let bar: Vec<_> = resource_bar(r)
+            .iter()
+            .map(|&(n, what, _)| (n, what))
+            .collect();
+        assert_eq!(
+            bar,
+            [
+                (1, "Pierre"),
+                (2, "Bois"),
+                (3, "Or"),
+                (4, "Mithril"),
+                (5, "Minerai de fer"),
+                (6, "Charbon"),
+                (7, "Lingots"),
+                (8, "Portes en fer"),
+            ]
+        );
+    }
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)

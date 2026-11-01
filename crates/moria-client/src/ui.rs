@@ -4,7 +4,7 @@ use crate::Client;
 use crate::art::Art;
 use crate::game::{
     ACTIONS, BUILDS, Game, ORDER_ROWS, Screen, Session, ability_rows, build_text, clock_label,
-    level_label, mode_label, recipe_label, stock_text, workshop_label,
+    level_label, mode_label, recipe_label, resource_bar, stock_text, workshop_label,
 };
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
@@ -49,7 +49,8 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                (hud, action_bar, build_menu, order_menu, status).run_if(in_state(Screen::Playing)),
+                (top_bar, hud, action_bar, build_menu, order_menu, status)
+                    .run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -407,7 +408,7 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
     let h = &g.hero;
     egui::Window::new("Statut")
         .title_bar(false)
-        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, BELOW_BAR])
         .resizable(false)
         .show(ctx, |ui| {
             ui.heading(format!("Statut — {}", h.name));
@@ -444,6 +445,42 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
         });
 }
 
+/// Top margin of the corner windows, so they do not cover the resource bar.
+const BELOW_BAR: f32 = 32.0;
+
+/// Full-width bar on top, StarCraft style: resources on the left, dwarves and clock on the right.
+/// An `Area`, not a `Panel`: egui then counts the pointer as over it, so clicks do not reach the map.
+fn top_bar(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    let Some(g) = &client.session.game else {
+        return Ok(());
+    };
+    let ctx = ctx.ctx_mut()?;
+    let width = ctx.content_rect().width();
+    egui::Area::new("ressources".into())
+        .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
+        .show(ctx, |ui| {
+            egui::Frame::side_top_panel(&ctx.global_style()).show(ui, |ui| {
+                ui.set_width(width - 16.0); // the frame's 8 px side margins
+                ui.horizontal(|ui| {
+                    for (n, what, [r, gr, b]) in resource_bar(g.resources) {
+                        let swatch = egui::Color32::from_rgb(r, gr, b);
+                        ui.label(egui::RichText::new("■").color(swatch));
+                        ui.label(egui::RichText::new(format!("{what} {n}")).strong());
+                        ui.add_space(12.0);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(clock_label(g.tick));
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("Nains {}", g.dwarves.len())).strong(),
+                        );
+                    });
+                });
+            });
+        });
+    Ok(())
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -451,7 +488,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     egui::Window::new("hud")
         .title_bar(false)
         .resizable(false)
-        .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
+        .anchor(egui::Align2::LEFT_TOP, [8.0, BELOW_BAR])
         .show(ctx.ctx_mut()?, |ui| {
             let level = level_label(g.current_z());
             if g.browse_z.is_some() {
@@ -459,11 +496,6 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             } else {
                 ui.label(level);
             }
-            let r = g.resources;
-            ui.label(format!(
-                "Pierre {} / Bois {} / Or {} / Mithril {} / Minerai de fer {} / Charbon {} / Lingots {} / Portes en fer {}",
-                r.stone, r.wood, r.gold, r.mithril, r.iron_ore, r.coal, r.iron, r.iron_door
-            ));
             ui.label(format!(
                 "{} — {} {}",
                 g.hero.name,
@@ -471,7 +503,6 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 g.hero.class.label_fr()
             ));
             ui.label(mode_label(g.mode));
-            ui.label(clock_label(g.tick));
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
                  · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler",
