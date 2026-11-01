@@ -172,6 +172,7 @@ mod tests {
         let h = connect(l.local_addr().unwrap().to_string());
         let (mut s, _) = l.accept().unwrap();
         let v = FortressView {
+            hungry: vec![],
             mountain: Mountain::new(MountainId(0), 2, 2, 1, Tile::Floor),
             hero: HeroView {
                 name: "Gimli".into(),

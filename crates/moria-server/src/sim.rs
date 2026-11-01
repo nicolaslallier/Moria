@@ -2,6 +2,7 @@
 //! `apply_command` / `apply_assignments` between ticks and `step` once per tick.
 
 use moria_core::ai::Assignments;
+use moria_core::light::DAY_TICKS;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
 use moria_core::srd::hero_dig_ticks;
@@ -17,6 +18,12 @@ const STAIRS_EXTRA_TICKS: u16 = 10;
 const WALL_BUILD_TICKS: u16 = 15;
 /// Ticks between two grazing steps of the herd.
 const COW_EVERY: u64 = 10;
+/// Each dwarf eats one food four times a game day.
+const EAT_EVERY: u64 = DAY_TICKS / 4;
+/// Ticks between two growth checks; a field ripens with odds 1 in `RIPEN_ODDS` at each,
+/// so in about a sixth of a day: one field feeds about two dwarves, walking included.
+const GROW_EVERY: u64 = 100;
+const RIPEN_ODDS: u64 = 60;
 const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
 
 /// The dwarf as clients see it: an empty path means it is at its work spot.
@@ -239,7 +246,22 @@ pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
     // ponytail: per-designation check; with spare wood for one table the AI may still pick
     // several (the server keeps one). Send the spare in AiView if that ever matters.
     m.designations.retain(|_, k| spare.covers(&k.cost()));
+    // Famine: while anyone is hungry, everyone goes after food.
+    if f.dwarves.iter().any(|d| d.hungry) {
+        m.designations.retain(|&p, &mut k| food_work(mt, p, k));
+    }
     m
+}
+
+/// Work that brings in food: harvesting or grubbing up a crop, butchering a cow, sowing.
+fn food_work(m: &Mountain, p: TilePos, kind: DesignationKind) -> bool {
+    use DesignationKind as K;
+    matches!(
+        (kind, m.get(p)),
+        (K::Chop, Some(Tile::Crop | Tile::Cow))
+            | (K::Dig, Some(Tile::Crop))
+            | (K::Farm, Some(Tile::Grass))
+    )
 }
 
 /// Starts digging (`Dig`, a tree is chopped) or building the tile toward `d`.
@@ -249,12 +271,13 @@ fn start_dig(h: &mut Hero, mt: &Mountain, d: Dir, kind: DesignationKind) {
     }
     let t = h.pos.step(d);
     let kind = match kind {
-        DesignationKind::Dig if matches!(mt.get(t), Some(Tile::Tree | Tile::Cow)) => {
+        DesignationKind::Dig if matches!(mt.get(t), Some(Tile::Tree | Tile::Cow | Tile::Crop)) => {
             DesignationKind::Chop
         }
         k => k,
     };
     if mt.diggable(t, kind)
+        && !(kind == DesignationKind::Dig && mt.get(t) == Some(Tile::Field)) // one key, a lost field
         && h.dig
             .as_ref()
             .is_none_or(|j| j.target != t || j.kind != kind)
@@ -324,7 +347,8 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
             .dwarves
             .iter()
             .any(|d| d.task.as_ref().is_some_and(|t| t.target == target));
-        let under_occupant = kind != DesignationKind::Dig
+        // Digging and harvesting leave the tile walkable: someone on it is no obstacle.
+        let under_occupant = !matches!(kind, DesignationKind::Dig | DesignationKind::Chop)
             && !kind.is_work()
             && (f.hero.as_ref().is_some_and(|h| h.pos == target)
                 || f.dwarves.iter().any(|d| d.pos == target));
@@ -334,7 +358,7 @@ pub fn apply_assignments(w: &mut World, a: &Assignments) {
         let Some(d) = f
             .dwarves
             .iter_mut()
-            .find(|d| d.id == id && d.task.is_none())
+            .find(|d| d.id == id && d.task.is_none() && (!d.hungry || food_work(mt, target, kind)))
         else {
             continue;
         };
@@ -381,6 +405,43 @@ fn dig_at(
     Some(res)
 }
 
+/// Every `t` tile of the ground level.
+fn on_ground(m: &Mountain, t: Tile) -> Vec<TilePos> {
+    let ground = |x, y| TilePos::new(x, y, GROUND_Z);
+    m.rect(ground(0, 0), ground(i16::MAX, i16::MAX))
+        .into_iter()
+        .filter(|&q| m.get(q) == Some(t))
+        .collect()
+}
+
+/// ponytail: a hash of a tile and a step number (splitmix64 finalizer) stands in for an RNG.
+/// Deterministic and stateless; a seeded RNG if it ever shows patterns.
+fn mix(q: TilePos, n: u64) -> u64 {
+    let mut h = ((q.x as u64) << 40 ^ (q.y as u64) << 20 ^ n).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    h = (h ^ h >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ h >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ h >> 31
+}
+
+/// Sown fields of the ground level may ripen. A ripe one asks for its harvest, and asks
+/// again if that was cancelled or the designations were full.
+fn grow(m: &mut Mountain, n: u64, tiles: &mut Vec<(TilePos, Tile)>, ch: &mut Changes) {
+    for q in on_ground(m, Tile::Field) {
+        if mix(q, n).is_multiple_of(RIPEN_ODDS) {
+            m.set(q, Tile::Crop);
+            tiles.push((q, Tile::Crop));
+        }
+    }
+    // Past the designation cap: crops are bounded by the ground, and a famine hides every
+    // other designation, so a capped harvest would never come.
+    for q in on_ground(m, Tile::Crop) {
+        if let std::collections::btree_map::Entry::Vacant(e) = m.designations.entry(q) {
+            e.insert(DesignationKind::Chop);
+            ch.designations.insert(q, Some(DesignationKind::Chop));
+        }
+    }
+}
+
 /// Each cow on the ground level may step onto a free neighbouring grass tile. A cow that is
 /// designated, or being butchered by the hero, stands still so its job is not lost.
 fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)>) {
@@ -392,20 +453,9 @@ fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)
     let pinned = |m: &Mountain, q| m.work_at(q).is_some() || hero_target == Some(q);
     let occupied =
         |q| f.hero.as_ref().is_some_and(|h| h.pos == q) || f.dwarves.iter().any(|d| d.pos == q);
-    let ground = |x, y| TilePos::new(x, y, GROUND_Z);
-    let herd: Vec<_> = m
-        .rect(ground(0, 0), ground(i16::MAX, i16::MAX))
-        .into_iter()
-        .filter(|&q| m.get(q) == Some(Tile::Cow))
-        .collect();
-    for c in herd {
-        // ponytail: a hash (splitmix64 finalizer), not an RNG; half the time the cow stays.
-        let mut h =
-            ((c.x as u64) << 40 ^ (c.y as u64) << 20 ^ n).wrapping_add(0x9e37_79b9_7f4a_7c15);
-        h = (h ^ h >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h = (h ^ h >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
-        h ^= h >> 31;
-        let Some(&d) = Dir::HORIZONTAL.get((h >> 61) as usize) else {
+    for c in on_ground(m, Tile::Cow) {
+        // Half the time the cow stays.
+        let Some(&d) = Dir::HORIZONTAL.get((mix(c, n) >> 61) as usize) else {
             continue;
         };
         let to = c.step(d);
@@ -431,6 +481,24 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         };
         // Designation changes of this step; the last write on a tile wins.
         let (mut tiles, mut ch) = (vec![], Changes::default());
+
+        // Meals: each dwarf needs one every EAT_EVERY ticks. A hungry dwarf drops its work
+        // and eats as soon as there is food.
+        let meal = tick != 0 && tick.is_multiple_of(EAT_EVERY); // a new world starts fed
+        for d in f.dwarves.iter_mut() {
+            d.hungry |= meal;
+            if d.hungry && f.resources.food > 0 {
+                f.resources.food -= 1;
+                d.hungry = false;
+            } else if d.hungry
+                && !d
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| food_work(m, t.target, t.kind))
+            {
+                d.task = None; // a hungry dwarf only goes after food
+            }
+        }
 
         let hero_spare = hero_spare(f);
         if let Some(h) = f.hero.as_mut() {
@@ -507,6 +575,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         if tick.is_multiple_of(COW_EVERY) {
             graze(m, f, tick / COW_EVERY, &mut tiles);
         }
+        if tick.is_multiple_of(GROW_EVERY) {
+            grow(m, tick / GROW_EVERY, &mut tiles, &mut ch);
+        }
 
         for i in 0..f.dwarves.len() {
             let Some(mut task) = f.dwarves[i].task.take() else {
@@ -543,11 +614,12 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     _ => WALL_BUILD_TICKS, // builds
                 };
                 if task.progress >= needed {
-                    let blocked = task.kind != DesignationKind::Dig
-                        && !task.kind.is_work()
-                        && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
-                            || f.dwarves.iter().any(|d| d.pos == task.target))
-                        || !f.resources.covers(&task.kind.cost());
+                    let blocked =
+                        !matches!(task.kind, DesignationKind::Dig | DesignationKind::Chop)
+                            && !task.kind.is_work()
+                            && (f.hero.as_ref().is_some_and(|h| h.pos == task.target)
+                                || f.dwarves.iter().any(|d| d.pos == task.target))
+                            || !f.resources.covers(&task.kind.cost());
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked && task.kind.is_work() {
@@ -585,6 +657,12 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 designations_removed: vec![],
                 resources: f.resources,
                 orders: vec![], // filled from `ch` below
+                hungry: f
+                    .dwarves
+                    .iter()
+                    .filter(|d| d.hungry)
+                    .map(|d| d.id)
+                    .collect(),
             };
             ch.merge_into(&mut d);
             out.insert(id, d);
@@ -623,6 +701,8 @@ mod tests {
             pending_move: None,
             pending_dig: None,
         });
+        // No starting food: these tests count resources from zero; meals have their own tests.
+        w.fortresses.get_mut(&M).unwrap().resources = Resources::default();
         w
     }
     fn hero(w: &World) -> &Hero {
@@ -1079,6 +1159,7 @@ mod tests {
             id: DwarfId(7),
             pos: p(1, 1, 0),
             task,
+            hungry: false,
         };
         let job = |working| {
             Some(DwarfJob {
@@ -1534,6 +1615,212 @@ mod tests {
             seen.insert(c);
         }
         assert!(seen.len() > 20, "the cow only visits {} tiles", seen.len());
+    }
+
+    #[test]
+    fn dwarves_eat_at_meal_time() {
+        let mut w = setup();
+        w.tick = EAT_EVERY;
+        res(&mut w).food = 5;
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(
+            w.fortresses[&M].resources.food, 2,
+            "three dwarves, one meal each"
+        );
+        assert!(d.hungry.is_empty());
+        step(&mut w);
+        assert_eq!(
+            w.fortresses[&M].resources.food, 2,
+            "no second meal before the next"
+        );
+    }
+
+    #[test]
+    fn a_hungry_dwarf_stops_working_until_it_has_eaten() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = p(5, 1, 0);
+        assign(&mut w, 1, rock);
+        assert!(w.fortresses[&M].dwarves[1].task.is_some());
+        w.tick = EAT_EVERY;
+        res(&mut w).food = 1; // enough for the first dwarf only
+        let ids: Vec<_> = w.fortresses[&M].dwarves.iter().map(|d| d.id).collect();
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(d.hungry, ids[1..]);
+        assert!(
+            w.fortresses[&M].dwarves[1].task.is_none(),
+            "dropped its dig"
+        );
+        assign(&mut w, 1, rock);
+        assert!(
+            w.fortresses[&M].dwarves[1].task.is_none(),
+            "takes no new job"
+        );
+        assert!(
+            !view_mountain(&w.mountains[&M], &w.fortresses[&M])
+                .designations
+                .contains_key(&rock),
+            "in a famine the AI only sees food work"
+        );
+        res(&mut w).food = 5;
+        let d = step(&mut w).remove(&M).unwrap();
+        assert!(d.hungry.is_empty(), "both ate as soon as food came");
+        assert_eq!(w.fortresses[&M].resources.food, 3);
+        assign(&mut w, 1, rock);
+        assert!(w.fortresses[&M].dwarves[1].task.is_some(), "back to work");
+    }
+
+    #[test]
+    fn hungry_dwarves_still_bring_in_the_harvest() {
+        let mut w = setup();
+        let c = p(-3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        w.mountains
+            .get_mut(&M)
+            .unwrap()
+            .set(c.step(Dir::E), Tile::Grass);
+        designate(&mut w, c, DesignationKind::Chop);
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = c.step(Dir::E);
+        w.tick = EAT_EVERY;
+        step(&mut w); // no food: everyone is hungry
+        assert!(w.fortresses[&M].dwarves.iter().all(|d| d.hungry));
+        assert!(
+            view_mountain(&w.mountains[&M], &w.fortresses[&M])
+                .designations
+                .contains_key(&c),
+            "the AI still sees the harvest"
+        );
+        assign(&mut w, 0, c);
+        assert!(
+            w.fortresses[&M].dwarves[0].task.is_some(),
+            "food work is taken"
+        );
+        // A passer-by on the crop does not spoil the harvest.
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = c;
+        for _ in 0..Tile::Crop.dig_ticks() {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, c), Tile::Field);
+        let f = &w.fortresses[&M];
+        assert_eq!(
+            f.resources.food + f.dwarves.iter().filter(|d| !d.hungry).count() as u32,
+            2
+        );
+    }
+
+    #[test]
+    fn a_famine_still_sows_and_reaps() {
+        let mut w = setup();
+        let (g, c) = (p(-3, 1, 0), p(-3, 3, 0));
+        for q in [g, g.step(Dir::E), c, c.step(Dir::E)] {
+            w.mountains.get_mut(&M).unwrap().set(q, Tile::Grass);
+        }
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        designate(&mut w, g, DesignationKind::Farm);
+        designate(&mut w, c, DesignationKind::Dig);
+        w.tick = EAT_EVERY;
+        step(&mut w);
+        assert!(w.fortresses[&M].dwarves.iter().all(|d| d.hungry));
+        let view = view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert!(view.designations.contains_key(&g), "sowing is food work");
+        assert!(
+            view.designations.contains_key(&c),
+            "so is grubbing up a crop"
+        );
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = g.step(Dir::E);
+        assign(&mut w, 0, g);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some());
+    }
+
+    #[test]
+    fn a_crop_asks_for_its_harvest_even_when_designations_are_full() {
+        let mut m = Mountain::new(M, 80, 80, GROUND_Z + 1, Tile::Rock);
+        m.designate(
+            TilePos::new(0, 0, 0),
+            TilePos::new(79, 79, 0),
+            DesignationKind::Dig,
+        );
+        assert_eq!(m.designations.len(), MAX_DESIGNATIONS);
+        let c = TilePos::new(1, 1, GROUND_Z);
+        m.set(c, Tile::Crop);
+        grow(&mut m, 0, &mut vec![], &mut Changes::default());
+        assert_eq!(m.designations.get(&c), Some(&DesignationKind::Chop));
+    }
+
+    #[test]
+    fn the_hero_does_not_trample_a_field() {
+        let mut w = setup();
+        w.mountains
+            .get_mut(&M)
+            .unwrap()
+            .set(p(3, 1, 0), Tile::Field);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert!(hero(&w).dig.is_none());
+    }
+
+    #[test]
+    fn hero_harvests_a_crop() {
+        let mut w = setup();
+        set_str(&mut w, 10);
+        let c = p(3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        apply_command(&mut w, M, Command::Dig(Dir::E));
+        assert_eq!(
+            hero(&w).dig.as_ref().map(|j| j.kind),
+            Some(DesignationKind::Chop)
+        );
+        for _ in 0..hero_dig_ticks(Tile::Crop.dig_ticks(), &hero(&w).abilities) {
+            step(&mut w);
+        }
+        assert_eq!(tile(&w, c), Tile::Field);
+        assert_eq!(w.fortresses[&M].resources.food, 2);
+    }
+
+    #[test]
+    fn an_unasked_crop_asks_again() {
+        let mut m = Mountain::new(M, 4, 4, GROUND_Z + 1, Tile::Grass);
+        let c = TilePos::new(1, 1, GROUND_Z);
+        m.set(c, Tile::Crop); // e.g. its harvest was cancelled
+        let (mut tiles, mut ch) = (vec![], Changes::default());
+        grow(&mut m, 0, &mut tiles, &mut ch);
+        assert_eq!(m.designations.get(&c), Some(&DesignationKind::Chop));
+        assert_eq!(ch.designations.get(&c), Some(&Some(DesignationKind::Chop)));
+    }
+
+    #[test]
+    fn fields_ripen_and_call_for_harvest() {
+        let mut m = Mountain::new(M, 10, 10, GROUND_Z + 1, Tile::Grass);
+        let fields: Vec<_> = m.rect(TilePos::new(0, 0, GROUND_Z), TilePos::new(9, 9, GROUND_Z));
+        for &q in &fields {
+            m.set(q, Tile::Field);
+        }
+        let ripe = |m: &Mountain| {
+            fields
+                .iter()
+                .filter(|&&q| m.get(q) == Some(Tile::Crop))
+                .count()
+        };
+        let (mut tiles, mut ch) = (vec![], Changes::default());
+        grow(&mut m, 0, &mut tiles, &mut ch);
+        assert!(ripe(&m) <= 10, "a field takes its time: {}", ripe(&m));
+        for n in 1..200 {
+            grow(&mut m, n, &mut tiles, &mut ch);
+        }
+        assert!(
+            ripe(&m) >= 60,
+            "most fields ripen within a few hours: {}",
+            ripe(&m)
+        );
+        for &q in fields.iter().filter(|&&q| m.get(q) == Some(Tile::Crop)) {
+            assert_eq!(
+                m.designations.get(&q),
+                Some(&DesignationKind::Chop),
+                "harvest asked"
+            );
+            assert_eq!(ch.designations.get(&q), Some(&Some(DesignationKind::Chop)));
+            assert!(tiles.contains(&(q, Tile::Crop)));
+        }
     }
 
     #[test]

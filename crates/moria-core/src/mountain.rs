@@ -71,7 +71,9 @@ impl Mountain {
     pub fn walkable(&self, p: TilePos) -> bool {
         self.get(p).is_some_and(|t| {
             !t.is_locked_door()
-                && (t.is_floor_like() || matches!(t, Tile::Stair | Tile::Slope) || t.is_furniture())
+                && (t.is_floor_like()
+                    || matches!(t, Tile::Stair | Tile::Slope | Tile::Field | Tile::Crop)
+                    || t.is_furniture())
         })
     }
 
@@ -180,10 +182,12 @@ impl Mountain {
             // Never strand someone on a hill: keep its last slope and the ground under its exits.
             K::Dig => {
                 ((t.is_solid() && t != Tile::Tree)
+                    || matches!(t, Tile::Field | Tile::Crop)
                     || (t == Tile::Slope && !self.is_last_way_down(p)))
                     && !self.holds_up_a_way_down(p)
             }
-            K::Chop => matches!(t, Tile::Tree | Tile::Cow),
+            K::Chop => matches!(t, Tile::Tree | Tile::Cow | Tile::Crop),
+            K::Farm => t == Tile::Grass && p.z == GROUND_Z,
             K::Smelt => t == Tile::Forge,
             K::Smith => t == Tile::Anvil,
             K::Stairs => stairs_ok(t) && p.z + 1 < self.d && !self.holds_up_a_way_down(p),
@@ -221,7 +225,11 @@ impl Mountain {
         for p in self.rect(a, b) {
             // Cheap cap check first: a full mountain skips the per-tile rules (and their search).
             let full = self.designations.len() >= MAX_DESIGNATIONS;
-            if (!full || self.designations.contains_key(&p)) && self.diggable(p, kind) {
+            // A dragged dig leaves fields alone; grubbing one up takes a one-tile designation.
+            let field = kind == DesignationKind::Dig
+                && a != b
+                && matches!(self.get(p), Some(Tile::Field | Tile::Crop));
+            if (!full || self.designations.contains_key(&p)) && !field && self.diggable(p, kind) {
                 self.designations.insert(p, kind);
                 n += 1;
             }
@@ -247,7 +255,11 @@ impl Mountain {
         let mut res = self.get(p)?.yield_();
         match kind {
             DesignationKind::Smelt | DesignationKind::Smith => return None,
+            DesignationKind::Dig if matches!(self.get(p), Some(Tile::Field | Tile::Crop)) => {
+                self.set(p, Tile::Grass)
+            }
             DesignationKind::Dig => self.set(p, self.ground_at(p)),
+            DesignationKind::Chop if self.get(p) == Some(Tile::Crop) => self.set(p, Tile::Field),
             DesignationKind::Chop => self.set(p, Tile::Grass),
             // The stone cost is paid by the caller, which holds the resources.
             DesignationKind::Wall
@@ -267,7 +279,8 @@ impl Mountain {
             | DesignationKind::Anvil
             | DesignationKind::WoodDoor
             | DesignationKind::StoneDoor
-            | DesignationKind::IronDoor => self.set(p, kind.builds()?),
+            | DesignationKind::IronDoor
+            | DesignationKind::Farm => self.set(p, kind.builds()?),
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
@@ -575,6 +588,59 @@ mod tests {
         let r = m.dig(c, DesignationKind::Chop).unwrap();
         assert_eq!(r.food, 4);
         assert_eq!(m.get(c), Some(Tile::Grass));
+    }
+
+    #[test]
+    fn fields_are_sown_on_ground_grass_and_harvested_for_food() {
+        // The hill's plain is z 2 here, but fields only go on GROUND_Z: build one that deep.
+        let mut m = Mountain::new(MountainId(0), 4, 4, GROUND_Z + 1, Tile::Grass);
+        let (a, up) = (p(1, 1, GROUND_Z), p(1, 1, GROUND_Z - 1));
+        assert!(m.diggable(a, DesignationKind::Farm));
+        assert!(
+            !m.diggable(up, DesignationKind::Farm),
+            "only the ground level"
+        );
+        m.set(p(2, 1, GROUND_Z), Tile::Floor);
+        assert!(
+            !m.diggable(p(2, 1, GROUND_Z), DesignationKind::Farm),
+            "not on floor"
+        );
+        assert_eq!(m.dig(a, DesignationKind::Farm), Some(Resources::default()));
+        assert_eq!(m.get(a), Some(Tile::Field));
+        assert!(m.walkable(a), "a field is walked across");
+        assert!(
+            !m.diggable(a, DesignationKind::Chop),
+            "nothing to harvest yet"
+        );
+        m.set(a, Tile::Crop);
+        assert!(m.walkable(a));
+        let r = m.dig(a, DesignationKind::Chop).unwrap();
+        assert_eq!(r.food, 2);
+        assert_eq!(m.get(a), Some(Tile::Field), "harvest leaves the field sown");
+        // Digging grubs a field up for good; a ripe one gives its food first.
+        assert_eq!(m.dig(a, DesignationKind::Dig), Some(Resources::default()));
+        assert_eq!(m.get(a), Some(Tile::Grass));
+        m.set(a, Tile::Crop);
+        assert_eq!(m.dig(a, DesignationKind::Dig).map(|r| r.food), Some(2));
+        assert_eq!(m.get(a), Some(Tile::Grass));
+    }
+
+    #[test]
+    fn a_dig_rectangle_spares_fields() {
+        let mut m = Mountain::new(MountainId(0), 4, 4, GROUND_Z + 1, Tile::Grass);
+        let (field, rock) = (p(1, 1, GROUND_Z), p(2, 1, GROUND_Z));
+        m.set(field, Tile::Field);
+        m.set(rock, Tile::Rock);
+        assert_eq!(m.designate(field, rock, DesignationKind::Dig), 1);
+        assert!(
+            !m.designations.contains_key(&field),
+            "a dragged dig leaves the crops alone"
+        );
+        assert_eq!(
+            m.designate(field, field, DesignationKind::Dig),
+            1,
+            "one tile on purpose"
+        );
     }
 
     #[test]

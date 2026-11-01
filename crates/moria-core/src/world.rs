@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 4;
+pub const SAVE_VERSION: u32 = 5;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -72,6 +72,8 @@ pub struct Dwarf {
     pub id: DwarfId,
     pub pos: TilePos,
     pub task: Option<DwarfTask>,
+    /// Missed a meal: only goes after food until it has eaten.
+    pub hungry: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -375,6 +377,7 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
             id: DwarfId(i),
             pos,
             task: None,
+            hungry: false,
         })
         .collect();
     w.next_dwarf += 3;
@@ -384,7 +387,10 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
             owner: player,
             hero: None,
             dwarves,
-            resources: Resources::default(),
+            resources: Resources {
+                food: 12,
+                ..Default::default()
+            },
         },
     );
     Some(id)
@@ -450,6 +456,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            hungry: vec![],
             tick: 0,
         };
         let n = encode(&view).len();
@@ -715,6 +722,7 @@ mod tests {
             },
             dwarves: vec![],
             resources: Resources::default(),
+            hungry: vec![],
             tick: 0,
         };
         let n = encode(&v).len();
@@ -738,6 +746,7 @@ mod tests {
             let id = claim_mountain(&mut w, PlayerId(p)).unwrap();
             let f = &w.fortresses[&id];
             assert_eq!(f.dwarves.len(), 3);
+            assert_eq!(f.resources.food, 12, "a day of food for three dwarves");
             assert!(f.hero.is_none());
             for (i, d) in f.dwarves.iter().enumerate() {
                 assert_eq!(Some(d.pos), entrance_tiles().nth(i));
@@ -756,7 +765,9 @@ mod tests {
     #[test]
     fn save_load_roundtrip() {
         let mut w = generate(3);
-        claim_mountain(&mut w, PlayerId(1));
+        let m = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        // A restart must not feed a hungry dwarf for free.
+        w.fortresses.get_mut(&m).unwrap().dwarves[0].hungry = true;
         let p = tmpdir("rt").join("w.bin");
         save(&w, &p).unwrap();
         assert_eq!(load(&p).unwrap(), w);

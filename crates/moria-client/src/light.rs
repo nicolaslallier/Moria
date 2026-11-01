@@ -243,6 +243,7 @@ mod tests {
         let mut g = game();
         g.mountain.id = MountainId(id);
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(FortressView {
+            hungry: vec![],
             mountain: g.mountain,
             hero: g.hero,
             dwarves: vec![],

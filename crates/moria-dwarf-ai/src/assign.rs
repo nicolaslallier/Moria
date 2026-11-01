@@ -1,6 +1,6 @@
 use moria_core::ai::{AiView, MAX_DWARVES_PER_VIEW};
 use moria_core::path::distances_from;
-use moria_core::{Dir, DwarfId, TilePos};
+use moria_core::{DesignationKind, Dir, DwarfId, TilePos};
 use moria_core::{MAX_DESIGNATIONS, MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
 use std::collections::HashSet;
 
@@ -40,12 +40,17 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
     let claimed: HashSet<TilePos> = view.claimed.iter().copied().collect();
     let occupied: HashSet<TilePos> = view.occupied.iter().copied().collect();
     // BTreeMap keys are already sorted by TilePos. The server rejects undiggable targets.
-    // Workshop work runs under an occupant; map changes wait for the tile to clear.
+    // Workshop work, digging and harvesting run under an occupant (the tile stays walkable);
+    // builds wait for the tile to clear.
     let tasks: Vec<TilePos> = m
         .designations
         .iter()
         .filter(|&(&t, &k)| {
-            m.diggable(t, k) && !claimed.contains(&t) && (k.is_work() || !occupied.contains(&t))
+            m.diggable(t, k)
+                && !claimed.contains(&t)
+                && (k.is_work()
+                    || matches!(k, DesignationKind::Dig | DesignationKind::Chop)
+                    || !occupied.contains(&t))
         })
         .map(|(&t, _)| t)
         .collect();
@@ -361,9 +366,10 @@ mod tests {
     }
 
     #[test]
-    fn task_under_occupant_not_assigned() {
+    fn build_under_occupant_not_assigned() {
         let mut m = corridor(10);
-        let t = task(&mut m, 4);
+        let t = p(4, 1);
+        assert_eq!(m.designate(t, t, DesignationKind::Wall), 1);
         assert!(assign(&view(m, vec![dw(1, 1, true)], vec![], vec![t])).is_empty());
     }
 
@@ -410,6 +416,16 @@ mod tests {
             pos: TilePos::new(x, y, z),
             idle: true,
         }
+    }
+
+    #[test]
+    fn a_harvest_under_someone_is_still_assigned() {
+        let mut m = outdoors();
+        let crop = TilePos::new(4, 2, 1);
+        m.set(crop, Tile::Crop);
+        m.designate(crop, crop, DesignationKind::Chop);
+        let v = view(m, vec![at(1, 2, 2, 1)], vec![], vec![crop]);
+        assert_eq!(assign(&v), vec![(DwarfId(1), crop)]);
     }
 
     #[test]

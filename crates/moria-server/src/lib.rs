@@ -480,6 +480,12 @@ impl State {
             },
             dwarves: f.dwarves.iter().map(sim::dwarf_view).collect(),
             resources: f.resources,
+            hungry: f
+                .dwarves
+                .iter()
+                .filter(|d| d.hungry)
+                .map(|d| d.id)
+                .collect(),
             tick: self.w.tick,
         };
         self.send(player, ServerMsg::Snapshot(Box::new(v)));
