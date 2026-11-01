@@ -1,4 +1,5 @@
 pub mod geo;
+pub mod inventory;
 pub mod light;
 pub mod mountain;
 pub mod tile;
