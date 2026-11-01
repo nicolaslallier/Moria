@@ -1,7 +1,7 @@
 use moria_core::ai::{AiView, MAX_DWARVES_PER_VIEW};
 use moria_core::path::distances_from;
 use moria_core::{Dir, DwarfId, TilePos};
-use moria_core::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
+use moria_core::{MAX_DESIGNATIONS, MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W};
 use std::collections::HashSet;
 
 /// A deserialized view is untrusted: postcard bypasses `Mountain`'s invariants.
@@ -17,7 +17,7 @@ pub fn validate(view: &AiView) -> Result<(), &'static str> {
     if view.dwarves.len() > MAX_DWARVES_PER_VIEW {
         return Err("trop de nains");
     }
-    if m.designations.len() > w as usize * h as usize * d as usize {
+    if m.designations.len() > MAX_DESIGNATIONS {
         return Err("trop de designations");
     }
     let ok = view.dwarves.iter().all(|d| m.in_bounds(d.pos))
@@ -52,8 +52,9 @@ pub fn assign(view: &AiView) -> Vec<(DwarfId, TilePos)> {
         return vec![];
     }
     // Dwarves don't block each other: empty `blocked`.
-    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x walkable tiles: BFS over ~12k
-    // outdoor tiles on the 176x96x12 map plus whatever is dug); if that gets too slow, run a single multi-source BFS from the tasks' work spots instead.
+    // ponytail: one full BFS per idle dwarf per view (<= 64 dwarves x walkable tiles: ~12k
+    // outdoor tiles on the 176x96x12 map plus whatever is dug), then a <= 64 x MAX_DESIGNATIONS
+    // matrix; if that gets too slow, run one multi-source BFS from the tasks' work spots.
     let no_block = HashSet::new();
     let dist: Vec<Vec<Option<u32>>> = dwarves
         .iter()
@@ -87,15 +88,17 @@ fn solve(dist: &[Vec<Option<u32>>]) -> Vec<Option<usize>> {
     let nt = dist.first().map_or(0, Vec::len);
     let mut got: Vec<Option<usize>> = vec![None; nd];
     let mut taken = vec![false; nt];
-    // Greedy: globally shortest pair first; (d, t) index order breaks ties.
-    while let Some((_, d, t)) = (0..nd)
-        .filter(|&d| got[d].is_none())
-        .flat_map(|d| (0..nt).filter(|&t| !taken[t]).map(move |t| (d, t)))
-        .filter_map(|(d, t)| dist[d][t].map(|c| (c, d, t)))
-        .min()
-    {
-        got[d] = Some(t);
-        taken[t] = true;
+    // Greedy: globally shortest pair first; (d, t) index order breaks ties. One sort of all
+    // pairs, O(nd*nt log), instead of a fresh min scan per assignment.
+    let mut pairs: Vec<(u32, usize, usize)> = (0..nd)
+        .flat_map(|d| (0..nt).filter_map(move |t| dist[d][t].map(|c| (c, d, t))))
+        .collect();
+    pairs.sort_unstable();
+    for (_, d, t) in pairs {
+        if got[d].is_none() && !taken[t] {
+            got[d] = Some(t);
+            taken[t] = true;
+        }
     }
     // Improvement: pairwise swaps and moves to free tasks, only on strict gain.
     // Each step lowers the total, so this terminates.
@@ -286,6 +289,19 @@ mod tests {
         );
         let trunc: Mountain = postcard::from_bytes(&postcard::to_allocvec(&raw).unwrap()).unwrap();
         assert!(validate(&view(trunc, vec![], vec![], vec![])).is_err());
+    }
+
+    #[test]
+    fn too_many_designations_rejected() {
+        // 4800 tiles, all designated: within the map, over the cap.
+        let mut m = Mountain::new(MountainId(0), 80, 60, 1, Tile::Rock);
+        // A forged view bypasses `designate` and its cap.
+        for x in 0..80 {
+            for y in 0..60 {
+                m.designations.insert(p(x, y), DesignationKind::Dig);
+            }
+        }
+        assert!(validate(&view(m, vec![], vec![], vec![])).is_err());
     }
 
     #[test]

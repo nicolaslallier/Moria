@@ -151,6 +151,8 @@ fn hero_spare(f: &Fortress) -> Resources {
 /// The mountain as the dwarf AI sees it: builds the spare resources can't pay are hidden.
 pub fn view_mountain(mt: &Mountain, f: &Fortress) -> Mountain {
     let spare = spare(f);
+    // ponytail: a full clone (~200 KB of tiles, <= MAX_DESIGNATIONS entries) per view, i.e.
+    // per tick; share an Arc<Mountain> with copy-on-write if it ever shows up in a profile.
     let mut m = mt.clone();
     // ponytail: per-designation check; with spare wood for one table the AI may still pick
     // several (the server keeps one). Send the spare in AiView if that ever matters.
