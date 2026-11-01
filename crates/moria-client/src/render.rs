@@ -236,8 +236,8 @@ fn sync_tiles(
             Some(t) => (art.tile(t, on_grass), Color::srgb(b, b, b)),
             None => (Handle::default(), Color::BLACK),
         };
-        // Slopes keep their orientation, stairs are the user's art, sky stays flat.
-        if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky)) {
+        // Slopes and cows keep their orientation, stairs are the user's art, sky stays flat.
+        if tile.is_some_and(|t| !matches!(t, Tile::Stair | Tile::Slope | Tile::Sky | Tile::Cow)) {
             let variation = ((i32::from(at.x) * 37 + i32::from(at.y) * 61).rem_euclid(11)) as f32;
             let light = (0.88 + variation * 0.012) * b;
             s.color = Color::srgb(light, light, light);

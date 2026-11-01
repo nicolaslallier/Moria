@@ -399,11 +399,13 @@ fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)
         .filter(|&q| m.get(q) == Some(Tile::Cow))
         .collect();
     for c in herd {
-        // ponytail: a hash, not an RNG; half the time the cow stays. Seeded RNG if it shows.
-        let h = (c.x as u64).wrapping_mul(73_856_093)
-            ^ (c.y as u64).wrapping_mul(19_349_663)
-            ^ n.wrapping_mul(83_492_791);
-        let Some(&d) = Dir::HORIZONTAL.get((h % 8) as usize) else {
+        // ponytail: a hash (splitmix64 finalizer), not an RNG; half the time the cow stays.
+        let mut h =
+            ((c.x as u64) << 40 ^ (c.y as u64) << 20 ^ n).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ h >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ h >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        let Some(&d) = Dir::HORIZONTAL.get((h >> 61) as usize) else {
             continue;
         };
         let to = c.step(d);
@@ -1514,6 +1516,24 @@ mod tests {
             assert_eq!(cows(&w), herd, "a moving cow is neither lost nor cloned");
         }
         assert!(seen.contains(&(c, Tile::Grass)) && seen.contains(&(c.step(Dir::N), Tile::Cow)));
+    }
+
+    #[test]
+    fn a_free_cow_roams_the_meadow() {
+        let f = setup().fortresses[&M].clone(); // hero and dwarves sit off this small meadow
+        let mut m = Mountain::new(M, 41, 41, GROUND_Z + 1, Tile::Grass);
+        let mut c = TilePos::new(20, 20, GROUND_Z);
+        m.set(c, Tile::Cow);
+        let mut seen = HashSet::from([c]);
+        for n in 0..300 {
+            let mut tiles = vec![];
+            graze(&mut m, &f, n, &mut tiles);
+            if let Some(&(to, _)) = tiles.iter().find(|t| t.1 == Tile::Cow) {
+                c = to;
+            }
+            seen.insert(c);
+        }
+        assert!(seen.len() > 20, "the cow only visits {} tiles", seen.len());
     }
 
     #[test]
