@@ -3,9 +3,9 @@
 
 use moria_core::ai::Assignments;
 use moria_core::path::{find_path, work_spot_goal};
-use moria_core::protocol::{ClientMsg, TickDelta};
+use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
 use moria_core::srd::hero_dig_ticks;
-use moria_core::world::{DigJob, DwarfTask, Fortress, Hero, World};
+use moria_core::world::{DigJob, Dwarf, DwarfTask, Fortress, Hero, World};
 use moria_core::{DesignationKind, Dir, Mountain, MountainId, Resources, Tile, TilePos};
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,6 +13,15 @@ const MOVE_COOLDOWN: u8 = 2;
 const STAIRS_EXTRA_TICKS: u16 = 10;
 const WALL_BUILD_TICKS: u16 = 15;
 const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
+
+/// The dwarf as clients see it: an empty path means it is at its work spot.
+pub fn dwarf_view(d: &Dwarf) -> DwarfState {
+    let job = d.task.as_ref().map(|t| DwarfJob {
+        kind: t.kind,
+        working: t.path.is_empty(),
+    });
+    (d.id, d.pos, job)
+}
 
 /// `ClientMsg` minus the handshake messages.
 #[derive(Clone, Debug, PartialEq)]
@@ -433,12 +442,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             let mut d = TickDelta {
                 tick: w.tick,
                 hero_pos: h.pos,
-                dwarves: f.dwarves.iter().map(|d| (d.id, d.pos)).collect(),
-                dwarf_jobs: f
-                    .dwarves
-                    .iter()
-                    .filter_map(|d| Some((d.id, d.task.as_ref()?.kind)))
-                    .collect(),
+                dwarves: f.dwarves.iter().map(dwarf_view).collect(),
                 tiles,
                 designations_added: vec![],
                 designations_removed: vec![],
@@ -840,7 +844,33 @@ mod tests {
             },
         );
         let d = step(&mut w).remove(&M).unwrap();
-        assert_eq!(d.dwarf_jobs, vec![(id, DesignationKind::Wall)]);
+        assert_eq!(d.dwarves[0].2.map(|j| j.kind), Some(DesignationKind::Wall));
+        assert!(d.dwarves[1..].iter().all(|x| x.2.is_none()), "idle: no job");
+    }
+
+    /// Walking to the work spot is not working yet.
+    #[test]
+    fn dwarf_view_tells_walking_from_working() {
+        let task = |path| DwarfTask {
+            target: p(5, 2, 0),
+            kind: DesignationKind::Dig,
+            path,
+            progress: 0,
+        };
+        let d = |task| Dwarf {
+            id: DwarfId(7),
+            pos: p(1, 1, 0),
+            task,
+        };
+        let job = |working| {
+            Some(DwarfJob {
+                kind: DesignationKind::Dig,
+                working,
+            })
+        };
+        assert_eq!(dwarf_view(&d(None)), (DwarfId(7), p(1, 1, 0), None));
+        assert_eq!(dwarf_view(&d(Some(task(vec![])))).2, job(true));
+        assert_eq!(dwarf_view(&d(Some(task(vec![p(2, 1, 0)])))).2, job(false));
     }
 
     #[test]

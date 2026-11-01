@@ -317,14 +317,20 @@ fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> R
         return Ok(());
     }
     let portrait = ctx.add_image(EguiTextureHandle::Weak(art.portrait(g.hero.race).id()));
+    status_window(ctx.ctx_mut()?, g, portrait);
+    Ok(())
+}
+
+/// No title bar: its collapse and close buttons could hold focus, and Space digs.
+fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
     let rows = g.dwarf_rows();
     let h = &g.hero;
     egui::Window::new("Statut")
-        .open(&mut g.status)
+        .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
         .resizable(false)
-        .show(ctx.ctx_mut()?, |ui| {
-            ui.heading(&h.name);
+        .show(ctx, |ui| {
+            ui.heading(format!("Statut — {}", h.name));
             ui.horizontal(|ui| {
                 ui.image(egui::load::SizedTexture::new(portrait, [96.0, 96.0]));
                 ui.vertical(|ui| {
@@ -354,9 +360,8 @@ fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> R
                         }
                     });
                 });
-            ui.small("C ou Échap : fermer · manette : Select");
+            ui.small("C ou Échap : fermer · manette : Select ou B/○");
         });
-    Ok(())
 }
 
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
@@ -436,6 +441,39 @@ mod tests {
         }
         assert_eq!(g.mode, moria_core::DesignationKind::Chop);
         assert!(!g.build_menu);
+    }
+
+    /// Space digs: no status-window control may hold focus and take it as a click.
+    #[test]
+    fn status_window_never_takes_focus() {
+        let mut g = crate::game::tests::game();
+        g.status = true;
+        let ctx = egui::Context::default();
+        let key = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for k in [
+            egui::Key::Tab,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Space,
+        ] {
+            let input = egui::RawInput {
+                events: vec![key(k)],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                status_window(ui.ctx(), &mut g, egui::TextureId::default())
+            })
+            .textures_delta
+            .clear();
+            assert_eq!(ctx.memory(|m| m.focused()), None);
+        }
+        assert!(g.status);
     }
 
     #[test]

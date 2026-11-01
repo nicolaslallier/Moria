@@ -66,11 +66,21 @@ pub struct HeroView {
     pub pos: TilePos,
 }
 
+/// What a busy dwarf is doing; `working` is false while it walks to the work spot.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DwarfJob {
+    pub kind: DesignationKind,
+    pub working: bool,
+}
+
+/// A dwarf as clients see it; `None` is idle.
+pub type DwarfState = (DwarfId, TilePos, Option<DwarfJob>);
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FortressView {
     pub mountain: Mountain,
     pub hero: HeroView,
-    pub dwarves: Vec<(DwarfId, TilePos)>,
+    pub dwarves: Vec<DwarfState>,
     pub resources: Resources,
 }
 
@@ -78,9 +88,7 @@ pub struct FortressView {
 pub struct TickDelta {
     pub tick: u64,
     pub hero_pos: TilePos,
-    pub dwarves: Vec<(DwarfId, TilePos)>,
-    /// What each busy dwarf is doing; idle dwarves are absent.
-    pub dwarf_jobs: Vec<(DwarfId, DesignationKind)>,
+    pub dwarves: Vec<DwarfState>,
     pub tiles: Vec<(TilePos, Tile)>,
     pub designations_added: Vec<(TilePos, DesignationKind)>,
     pub designations_removed: Vec<TilePos>,
