@@ -94,7 +94,10 @@ impl Mountain {
             let q_up = q.step(Dir::Up);
             return self.walkable(q_up).then_some(q_up);
         }
-        if self.get(q) == Some(Tile::Sky) {
+        // Mirror of the climb: only descend where the slope leads straight back up here.
+        if self.get(q) == Some(Tile::Sky)
+            && self.get(from.step(Dir::Down)).is_some_and(Tile::is_solid)
+        {
             let q_down = q.step(Dir::Down);
             return (self.get(q_down) == Some(Tile::Slope)).then_some(q_down);
         }
@@ -175,10 +178,9 @@ impl Mountain {
             DesignationKind::Stairs => {
                 self.set(p, Tile::Stair);
                 let below = p.step(Dir::Down);
-                if let Some(t) = self
-                    .get(below)
-                    .filter(|t| (t.is_solid() && *t != Tile::Tree) || t.is_floor_like())
-                {
+                if let Some(t) = self.get(below).filter(|t| {
+                    (t.is_solid() && *t != Tile::Tree && !t.is_furniture()) || t.is_floor_like()
+                }) {
                     res.add(t.yield_());
                     self.set(below, Tile::Stair);
                     // A designation there could never be dug any more.
@@ -456,6 +458,47 @@ mod tests {
         assert!(m.diggable(g, DesignationKind::WoodBed));
         assert!(m.diggable(g, DesignationKind::Wall));
         assert!(m.diggable(g, DesignationKind::Stairs));
+    }
+
+    #[test]
+    fn slope_moves_are_symmetric() {
+        let m = hill();
+        let top = p(6, 5, 1);
+        let foot = m.move_dest(top, Dir::W).unwrap();
+        assert_eq!(m.move_dest(foot, Dir::E), Some(top));
+        let up = m.move_dest(p(5, 5, 2), Dir::E).unwrap();
+        assert_eq!(m.move_dest(up, Dir::W), Some(p(5, 5, 2)));
+        // Soil under the hilltop dug out: climbing back is impossible, so no descent.
+        let mut m = hill();
+        m.set(p(6, 5, 2), Tile::Floor);
+        assert_eq!(m.move_dest(top, Dir::W), None);
+        assert_eq!(m.move_dest(p(5, 5, 2), Dir::E), Some(p(6, 5, 2)));
+    }
+
+    #[test]
+    fn stairs_do_not_eat_furniture_below() {
+        let mut m = rock();
+        m.set(p(1, 1, 1), Tile::Bed);
+        let r = m.dig(p(1, 1, 0), DesignationKind::Stairs).unwrap();
+        assert_eq!(r.stone, 1);
+        assert_eq!(m.get(p(1, 1, 0)), Some(Tile::Stair));
+        assert_eq!(m.get(p(1, 1, 1)), Some(Tile::Bed));
+    }
+
+    #[test]
+    fn slope_at_z0_cannot_climb() {
+        let mut m = Mountain::new(MountainId(0), 3, 1, 2, Tile::Grass);
+        m.set(p(0, 0, 0), Tile::Slope);
+        m.set(p(1, 0, 0), Tile::Soil);
+        assert_eq!(m.move_dest(p(0, 0, 0), Dir::E), None);
+    }
+
+    #[test]
+    fn underground_slope_cannot_climb() {
+        let mut m = rock();
+        m.set(p(1, 1, 1), Tile::Slope);
+        m.set(p(2, 1, 0), Tile::Floor);
+        assert_eq!(m.move_dest(p(1, 1, 1), Dir::E), None);
     }
 
     #[test]
