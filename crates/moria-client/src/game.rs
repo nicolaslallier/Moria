@@ -97,7 +97,7 @@ pub fn level_label(z: u8) -> String {
 
 /// "1 pierre", "3 bois".
 fn cost_fr(r: Resources) -> String {
-    [(r.stone, "pierre"), (r.wood, "bois")]
+    [(r.stone, "pierre"), (r.wood, "bois"), (r.gold, "or")]
         .iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, what)| format!("{n} {what}"))
@@ -200,6 +200,12 @@ pub const BUILDS: &[(DesignationKind, &str)] = &[
     (DesignationKind::WoodBed, "Lit en bois"),
     (DesignationKind::WoodTable, "Table en bois"),
     (DesignationKind::WoodChair, "Chaise en bois"),
+    (DesignationKind::Candle, "Chandelle"),
+    (DesignationKind::Torch, "Torche"),
+    (DesignationKind::Lamp, "Lampe"),
+    (DesignationKind::Campfire, "Feu de bois"),
+    (DesignationKind::Hearth, "Foyer"),
+    (DesignationKind::Stove, "Poêle"),
 ];
 
 /// Bottom-bar buttons with their key; `None` is the build menu.
@@ -1090,6 +1096,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lights_are_in_the_build_menu() {
+        for (k, l) in [
+            (DesignationKind::Torch, "Torche"),
+            (DesignationKind::Stove, "Poêle"),
+        ] {
+            assert!(BUILDS.contains(&(k, l)));
+        }
+        let mut g = game();
+        g.resources.gold = 0;
+        g.resources.stone = 5;
+        let lamp = BUILDS
+            .iter()
+            .position(|b| b.0 == DesignationKind::Lamp)
+            .unwrap();
+        g.pick_build(lamp);
+        assert_ne!(g.mode, DesignationKind::Lamp); // no gold, no lamp
+    }
+
+    #[test]
     fn build_menu_lists_wood() {
         let rows: Vec<String> = BUILDS.iter().map(|&(k, l)| build_text(k, l)).collect();
         assert_eq!(
@@ -1102,6 +1127,12 @@ pub(crate) mod tests {
                 "Lit en bois (3 bois)",
                 "Table en bois (4 bois)",
                 "Chaise en bois (2 bois)",
+                "Chandelle (1 bois)",
+                "Torche (1 bois)",
+                "Lampe (1 pierre + 1 or)",
+                "Feu de bois (3 bois)",
+                "Foyer (4 pierre)",
+                "Poêle (3 pierre + 2 bois)",
             ]
         );
         assert_eq!(

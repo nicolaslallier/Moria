@@ -163,10 +163,41 @@ fn furniture(tile: Tile, x: i32, y: i32) -> Option<[i32; 3]> {
             (28, 22, 68, 72, dark),
             (32, 34, 64, 68, top), // seat; the dark strip above is the back
         ],
-        // Placeholder until the light tiles get their art.
-        Tile::Candle | Tile::Torch | Tile::Lamp | Tile::Campfire | Tile::Hearth | Tile::Stove => {
-            &[(40, 40, 56, 56, top)]
-        }
+        Tile::Candle => &[
+            (42, 52, 54, 64, [210, 204, 190]), // holder
+            (45, 36, 51, 56, [236, 228, 200]), // wax
+            (46, 26, 50, 36, [255, 196, 64]),  // flame
+        ],
+        Tile::Torch => &[
+            (44, 30, 52, 84, [96, 60, 32]),  // pole
+            (38, 14, 58, 36, [214, 92, 28]), // fire
+            (44, 18, 52, 30, [255, 204, 72]),
+        ],
+        Tile::Lamp => &[
+            (34, 28, 62, 68, [58, 54, 50]),    // iron frame
+            (38, 34, 58, 62, [255, 212, 96]),  // glass
+            (44, 42, 52, 54, [255, 246, 190]), // wick
+        ],
+        Tile::Campfire => &[
+            (16, 62, 80, 74, [96, 60, 32]), // logs
+            (24, 70, 72, 80, [76, 46, 24]),
+            (28, 30, 68, 64, [214, 82, 24]), // flames
+            (38, 20, 58, 56, [255, 170, 48]),
+            (44, 34, 52, 52, [255, 236, 130]),
+        ],
+        Tile::Hearth => &[
+            (8, 14, 88, 82, [104, 98, 88]), // stone surround
+            (20, 26, 76, 82, [28, 24, 22]), // firebox
+            (30, 48, 66, 78, [214, 82, 24]),
+            (38, 40, 58, 74, [255, 170, 48]),
+        ],
+        Tile::Stove => &[
+            (22, 18, 74, 78, [34, 34, 38]), // iron body
+            (28, 24, 68, 72, [58, 58, 64]),
+            (36, 40, 60, 62, [28, 24, 22]),   // door
+            (40, 48, 56, 58, [255, 150, 48]), // glow
+            (44, 8, 52, 20, [120, 120, 126]), // chimney
+        ],
         _ => &[],
     };
     boxes
@@ -261,6 +292,23 @@ mod tests {
             (Tile::WoodChair, Tile::Chair),
         ] {
             assert!(warmth(wood) > warmth(stone) + 96 * 96 * 10, "{wood:?}");
+        }
+    }
+
+    #[test]
+    fn each_light_has_its_own_look() {
+        let lights = [
+            Tile::Candle,
+            Tile::Torch,
+            Tile::Lamp,
+            Tile::Campfire,
+            Tile::Hearth,
+            Tile::Stove,
+        ];
+        for (i, a) in lights.iter().enumerate() {
+            for b in &lights[i + 1..] {
+                assert_ne!(pixels(*a, false), pixels(*b, false), "{a:?} vs {b:?}");
+            }
         }
     }
 
