@@ -45,7 +45,7 @@ pub fn plugin(app: &mut App) {
             (
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
-                hud.run_if(in_state(Screen::Playing)),
+                (hud, build_menu).run_if(in_state(Screen::Playing)),
                 disconnected.run_if(in_state(Screen::Disconnected)),
             ),
         );
@@ -248,6 +248,34 @@ fn create_hero(
     Ok(())
 }
 
+/// Everything the player can build: mode, label, stone cost.
+const BUILDS: &[(DesignationKind, &str, u32)] = &[(DesignationKind::Wall, "Mur", 1)];
+
+fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if !g.build_menu {
+        return Ok(());
+    }
+    let stone = g.resources.stone;
+    centered("Construire").show(ctx.ctx_mut()?, |ui| {
+        ui.label(format!("Pierre disponible : {stone}"));
+        ui.separator();
+        for &(kind, label, cost) in BUILDS {
+            let text = format!("{label} — {cost} pierre");
+            let b = ui.add_enabled(stone >= cost, egui::Button::new(text));
+            if b.clicked() {
+                g.mode = kind;
+                g.build_menu = false;
+            }
+        }
+        ui.separator();
+        ui.small("3 ou Échap : fermer");
+    });
+    Ok(())
+}
+
 fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
     let Some(g) = &client.session.game else {
         return Ok(());
@@ -281,7 +309,7 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
             });
             ui.small(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser (en mode Mur : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X, 1, 2, 3 : mode · glisser clic gauche : désigner · clic droit : annuler",
+                 · X, 1, 2 : mode · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
                  · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode");

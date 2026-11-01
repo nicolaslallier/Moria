@@ -75,6 +75,8 @@ pub struct Game {
     /// Last horizontal direction pressed; Space digs that way.
     pub last_dir: Dir,
     pub mode: DesignationKind,
+    /// Build menu (key 3) open.
+    pub build_menu: bool,
     /// `Some` while the player browses another level than the hero's.
     pub browse_z: Option<u8>,
     last_move: f64,
@@ -95,6 +97,7 @@ impl Game {
             resources: v.resources,
             last_dir: Dir::E,
             mode: DesignationKind::Dig,
+            build_menu: false,
             browse_z: None,
             last_move: f64::NEG_INFINITY,
             pending: VecDeque::new(),

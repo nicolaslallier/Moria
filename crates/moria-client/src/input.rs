@@ -45,6 +45,8 @@ struct Intent {
     dig: bool,
     toggle: bool,
     mode: Option<DesignationKind>,
+    build_menu: bool,
+    close_menu: bool,
 }
 
 fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
@@ -63,11 +65,11 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             Some(DesignationKind::Dig)
         } else if keys.just_pressed(KeyCode::Digit2) {
             Some(DesignationKind::Stairs)
-        } else if keys.just_pressed(KeyCode::Digit3) {
-            Some(DesignationKind::Wall)
         } else {
             None
         },
+        build_menu: keys.just_pressed(KeyCode::Digit3),
+        close_menu: keys.just_pressed(KeyCode::Escape),
     }
 }
 
@@ -127,7 +129,7 @@ fn gamepad_intent(pads: &Query<&Gamepad>, prev: &mut Option<Dir>) -> Intent {
         down: any(GamepadButton::RightTrigger),
         dig: any(GamepadButton::South),
         toggle: any(GamepadButton::North),
-        mode: None,
+        ..default()
     }
 }
 
@@ -165,8 +167,14 @@ fn play(
     if k.dig || p.dig {
         out.extend(g.dig());
     }
+    if k.build_menu {
+        g.build_menu = !g.build_menu;
+    } else if k.close_menu {
+        g.build_menu = false;
+    }
     if let Some(m) = k.mode {
         g.mode = m;
+        g.build_menu = false;
     } else if k.toggle || p.toggle {
         g.mode = g.mode.toggled();
     }
