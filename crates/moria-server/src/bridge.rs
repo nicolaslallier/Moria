@@ -26,8 +26,15 @@ pub fn accept(a: &Assignments, known: &BTreeSet<MountainId>) -> bool {
     true
 }
 
+/// A legal assignment is ~1 KB (64 dwarves x ~14 bytes + header).
+const MAX_ASSIGNMENT_BYTES: usize = 4096;
+
 /// Postcard-decodes untrusted bytes and applies `accept`.
 pub fn decode_assignments(bytes: &[u8], known: &BTreeSet<MountainId>) -> Option<Assignments> {
+    if bytes.len() > MAX_ASSIGNMENT_BYTES {
+        tracing::warn!("assignations ignorees: {} octets", bytes.len());
+        return None;
+    }
     match postcard::from_bytes::<Assignments>(bytes) {
         Ok(a) if accept(&a, known) => Some(a),
         Ok(_) => None,
@@ -56,7 +63,7 @@ pub async fn run(
                 continue;
             }
         };
-        tracing::info!("pont IA connecte a {url}");
+        tracing::info!("pont IA connecte a {}", moria_bus::redact_url(&url));
         M.nats_connected.store(1, Relaxed);
         loop {
             tokio::select! {
@@ -127,5 +134,20 @@ mod tests {
         assert!(decode_assignments(&[0xff; 5], &known).is_none());
         assert!(decode_assignments(&enc(MAX_DWARVES_PER_VIEW + 1), &known).is_none());
         assert!(decode_assignments(&enc(MAX_DWARVES_PER_VIEW), &known).is_some());
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected_before_decoding() {
+        let known = BTreeSet::from([MountainId(0)]);
+        let mut b = postcard::to_allocvec(&Assignments {
+            mountain: MountainId(0),
+            tick: 0,
+            list: vec![],
+        })
+        .unwrap();
+        b.resize(MAX_ASSIGNMENT_BYTES + 1, 0);
+        // trailing bytes would decode fine, so only the cap can reject this
+        assert!(postcard::from_bytes::<Assignments>(&b).is_ok());
+        assert!(decode_assignments(&b, &known).is_none());
     }
 }

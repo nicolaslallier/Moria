@@ -1,6 +1,6 @@
 //! Fin wrapper autour de `lapin` : un exchange topic `moria`, des messages opaques.
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use futures::{Stream, StreamExt};
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
@@ -12,6 +12,18 @@ use moria_core::inventory::EXCHANGE;
 use std::time::Duration;
 
 const PUBLISH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Retire le `user:motdepasse@` d'une URL pour la journaliser (separe au DERNIER `@` de l'autorite).
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    // ponytail: dernier '@' de toute l'URL ; un '@' dans le vhost sur-redacterait (sans risque).
+    match rest.rfind('@') {
+        Some(i) => format!("{scheme}://{}", &rest[i + 1..]),
+        None => url.to_string(),
+    }
+}
 
 pub struct Bus {
     conn: Connection,
@@ -56,7 +68,14 @@ impl Bus {
     pub async fn connect(url: &str) -> anyhow::Result<Bus> {
         let conn = Connection::connect(url, ConnectionProperties::default())
             .await
-            .context("connexion AMQP impossible")?;
+            .map_err(|e| {
+                // lapin peut citer l'URL (mot de passe compris) : on la masque.
+                anyhow::anyhow!(
+                    "connexion AMQP impossible a {}: {}",
+                    redact_url(url),
+                    e.to_string().replace(url, &redact_url(url))
+                )
+            })?;
         let chan = conn.create_channel().await?;
         chan.exchange_declare(
             EXCHANGE.into(),
@@ -244,5 +263,31 @@ mod tests {
     async fn within_passes_through_a_ready_result() {
         let r = within(PUBLISH_CONFIRM_TIMEOUT, async { Ok(7) }).await;
         assert_eq!(r.unwrap(), 7);
+    }
+
+    #[test]
+    fn redact_url_strips_user_and_password() {
+        assert_eq!(
+            redact_url("amqp://moria:s3cr3t@rabbitmq:5672/moria"),
+            "amqp://rabbitmq:5672/moria"
+        );
+    }
+
+    #[test]
+    fn redact_url_handles_at_sign_in_password() {
+        assert_eq!(
+            redact_url("amqp://moria:p@ss:w@rd@rabbitmq:5672/moria"),
+            "amqp://rabbitmq:5672/moria"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_plain_urls_alone() {
+        assert_eq!(
+            redact_url("amqp://rabbitmq:5672/moria"),
+            "amqp://rabbitmq:5672/moria"
+        );
+        assert_eq!(redact_url("garbage"), "garbage");
+        assert_eq!(redact_url(""), "");
     }
 }
