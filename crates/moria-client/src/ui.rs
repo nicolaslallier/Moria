@@ -2,7 +2,7 @@
 
 use crate::Client;
 use crate::art::Art;
-use crate::game::{Screen, Session};
+use crate::game::{BUILDS, Screen, Session};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
@@ -248,9 +248,6 @@ fn create_hero(
     Ok(())
 }
 
-/// Everything the player can build: mode, label, stone cost.
-const BUILDS: &[(DesignationKind, &str, u32)] = &[(DesignationKind::Wall, "Mur", 1)];
-
 fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let Some(g) = &mut client.session.game else {
         return Ok(());
@@ -262,16 +259,20 @@ fn build_menu(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     centered("Construire").show(ctx.ctx_mut()?, |ui| {
         ui.label(format!("Pierre disponible : {stone}"));
         ui.separator();
-        for &(kind, label, cost) in BUILDS {
+        let mut picked = None;
+        for (i, &(_, label, cost)) in BUILDS.iter().enumerate() {
             let text = format!("{label} — {cost} pierre");
-            let b = ui.add_enabled(stone >= cost, egui::Button::new(text));
-            if b.clicked() {
-                g.mode = kind;
-                g.build_menu = false;
+            let b = egui::Button::new(text).selected(i == g.build_sel);
+            if ui.add_enabled(stone >= cost, b).clicked() {
+                picked = Some(i);
             }
         }
+        if let Some(i) = picked {
+            g.pick_build(i);
+        }
         ui.separator();
-        ui.small("3 ou Échap : fermer");
+        ui.small("Clavier : flèches + Espace · 3 ou Échap : fermer");
+        ui.small("Manette : croix/stick + A/✕ · bouton gauche (X/□) ou B/○ : fermer");
     });
     Ok(())
 }
@@ -312,7 +313,8 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                  · X, 1, 2 : mode · 3 : menu construire · glisser clic gauche : désigner · clic droit : annuler",
             );
             ui.small("Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
-                 · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode");
+                 · LB/RB (L1/R1) : monter/descendre · bouton du haut (Y/△) : mode \
+                 · bouton gauche (X/□) : menu construire");
         });
     Ok(())
 }
