@@ -186,8 +186,9 @@ impl Mountain {
     pub fn designate(&mut self, a: TilePos, b: TilePos, kind: DesignationKind) -> usize {
         let mut n = 0;
         for p in self.rect(a, b) {
+            // Cheap cap check first: a full mountain skips the per-tile rules (and their search).
             let full = self.designations.len() >= MAX_DESIGNATIONS;
-            if self.diggable(p, kind) && !(full && !self.designations.contains_key(&p)) {
+            if (!full || self.designations.contains_key(&p)) && self.diggable(p, kind) {
                 self.designations.insert(p, kind);
                 n += 1;
             }
