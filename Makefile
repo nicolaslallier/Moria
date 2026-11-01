@@ -13,9 +13,10 @@ help: ## Affiche cette aide
 # Créé une seule fois si absent (ignoré par git). Pour changer le code : éditer .env.
 .env:
 	@echo "MORIA_INVITE=$$(openssl rand -hex 8)" > $@
+	@echo "MORIA_AMQP_PASSWORD=dev" >> $@
 	@echo "Créé .env avec un code d'invitation aléatoire : $$(cut -d= -f2 $@)"
 
-up: .env ## Construit et démarre la stack (nats, worldgen, server, dwarf-ai)
+up: .env ## Construit et démarre la stack (rabbitmq local, worldgen, server, dwarf-ai, inventory)
 	docker compose up -d --build
 	@echo "Attendre « serveur prêt » : make logs"
 
