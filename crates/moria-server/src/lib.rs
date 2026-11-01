@@ -515,7 +515,7 @@ impl State {
                 .map(|d| DwarfView {
                     id: d.id,
                     pos: d.pos,
-                    idle: d.task.is_none() && !d.hungry,
+                    idle: d.task.is_none(),
                 })
                 .collect(),
             claimed: sim::claimed(&self.w, m),

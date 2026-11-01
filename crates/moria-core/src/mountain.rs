@@ -182,6 +182,7 @@ impl Mountain {
             // Never strand someone on a hill: keep its last slope and the ground under its exits.
             K::Dig => {
                 ((t.is_solid() && t != Tile::Tree)
+                    || matches!(t, Tile::Field | Tile::Crop)
                     || (t == Tile::Slope && !self.is_last_way_down(p)))
                     && !self.holds_up_a_way_down(p)
             }
@@ -250,6 +251,9 @@ impl Mountain {
         let mut res = self.get(p)?.yield_();
         match kind {
             DesignationKind::Smelt | DesignationKind::Smith => return None,
+            DesignationKind::Dig if matches!(self.get(p), Some(Tile::Field | Tile::Crop)) => {
+                self.set(p, Tile::Grass)
+            }
             DesignationKind::Dig => self.set(p, self.ground_at(p)),
             DesignationKind::Chop if self.get(p) == Some(Tile::Crop) => self.set(p, Tile::Field),
             DesignationKind::Chop => self.set(p, Tile::Grass),
@@ -606,10 +610,15 @@ mod tests {
         );
         m.set(a, Tile::Crop);
         assert!(m.walkable(a));
-        assert!(!m.diggable(a, DesignationKind::Dig));
         let r = m.dig(a, DesignationKind::Chop).unwrap();
         assert_eq!(r.food, 2);
         assert_eq!(m.get(a), Some(Tile::Field), "harvest leaves the field sown");
+        // Digging grubs a field up for good; a ripe one gives its food first.
+        assert_eq!(m.dig(a, DesignationKind::Dig), Some(Resources::default()));
+        assert_eq!(m.get(a), Some(Tile::Grass));
+        m.set(a, Tile::Crop);
+        assert_eq!(m.dig(a, DesignationKind::Dig).map(|r| r.food), Some(2));
+        assert_eq!(m.get(a), Some(Tile::Grass));
     }
 
     #[test]

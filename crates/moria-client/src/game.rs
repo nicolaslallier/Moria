@@ -193,9 +193,11 @@ pub fn mode_label(k: DesignationKind) -> String {
     match k {
         DesignationKind::Dig => tr("Mode : Creuser", "Mode: Dig").into(),
         DesignationKind::Stairs => tr("Mode : Escalier", "Mode: Stairs").into(),
-        DesignationKind::Chop => {
-            tr("Mode : Couper (arbres, vaches)", "Mode: Chop (trees, cows)").into()
-        }
+        DesignationKind::Chop => tr(
+            "Mode : Couper (arbres, vaches, blé)",
+            "Mode: Chop (trees, cows, wheat)",
+        )
+        .into(),
         _ => BUILDS
             .iter()
             .find(|b| b.0 == k)
@@ -1423,7 +1425,7 @@ pub(crate) mod tests {
         let mut g = game();
         g.mode = g.mode.toggled().toggled();
         assert_eq!(g.mode, DesignationKind::Chop);
-        assert_eq!(mode_label(g.mode), "Mode : Couper (arbres, vaches)");
+        assert_eq!(mode_label(g.mode), "Mode : Couper (arbres, vaches, blé)");
         assert_eq!(
             drag_msg((3, 1), (1, 1), g.current_z(), Some(g.mode)),
             ClientMsg::Designate {
