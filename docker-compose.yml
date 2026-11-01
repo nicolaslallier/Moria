@@ -24,6 +24,8 @@ services:
   server:
     image: moria-server:local
     pull_policy: build
+    # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
+    stop_grace_period: 30s
     build:
       <<: *build
       args: { BIN: moria-server }
