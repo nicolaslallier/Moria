@@ -152,7 +152,10 @@ pub async fn run_with_listener(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     if let Some(bak) = world::reset_if_outdated(&cfg.data, 0)? {
-        tracing::warn!("ancien monde mis de côté : {}", bak.display());
+        tracing::warn!(
+            "ancien monde mis de côté : {} ; pensez à remettre l'inventaire à zéro : voir README",
+            bak.display()
+        );
     }
     let w = match world::load(&cfg.data) {
         Ok(w) => w,

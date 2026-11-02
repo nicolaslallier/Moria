@@ -121,7 +121,11 @@ impl Talks {
     pub fn new(timeout: Duration) -> Talks {
         Talks {
             timeout,
-            seq: 0,
+            // Seed horloge murale (seul usage de SystemTime ici) : une réponse tardive
+            // du roi, adressée à l'instance précédente, ne doit jamais retomber sur un nouveau seq.
+            seq: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| (d.as_millis() as u64) << 10),
             convs: HashMap::new(),
         }
     }
@@ -257,6 +261,16 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn seq_never_restarts_at_zero_after_a_restart() {
+        let (mut t1, now) = talks();
+        let first = ask(&mut t1, now, "Un").unwrap().seq;
+        std::thread::sleep(Duration::from_millis(5));
+        let (mut t2, now) = talks();
+        let second = ask(&mut t2, now, "Un").unwrap().seq;
+        assert!(second > first && second != 0, "{first} -> {second}");
     }
 
     #[test]
