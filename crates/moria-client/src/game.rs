@@ -382,10 +382,12 @@ impl Game {
         }
     }
 
-    /// Closes the build, order and status menus; true if one was open.
+    /// Closes the build, order, status and inspect menus; true if one was open.
     pub fn close_menus(&mut self) -> bool {
-        let open = self.build_menu || self.status || self.order_menu.is_some();
+        let open =
+            self.build_menu || self.status || self.order_menu.is_some() || self.inspect.is_some();
         self.build_menu = false;
+        self.inspect = None;
         self.status = false;
         self.order_menu = None;
         open
