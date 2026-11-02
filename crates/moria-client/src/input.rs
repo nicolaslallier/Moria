@@ -23,7 +23,7 @@ pub struct Drag {
 pub fn plugin(app: &mut App) {
     app.init_resource::<Drag>().add_systems(
         Update,
-        (play, mouse)
+        (play, mouse, inspect_poll)
             .in_set(InputSet)
             .run_if(in_state(Screen::Playing)),
     );
@@ -204,6 +204,18 @@ fn pause_frame(g: &mut Game, menu_dir: &mut Option<Dir>, walk: Option<Dir>, act:
     }
     *menu_dir = walk;
     g.pause_pick |= act;
+}
+
+/// Asks the server for the open panel's vitals (see `inspect_due`).
+fn inspect_poll(time: Res<Time>, mut client: ResMut<Client>) {
+    let msg = client
+        .session
+        .game
+        .as_mut()
+        .and_then(|g| g.poll_inspect(time.elapsed_secs_f64()));
+    if let Some(m) = msg {
+        client.send(m);
+    }
 }
 
 fn play(

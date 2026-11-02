@@ -8,8 +8,8 @@ use bevy::prelude::States;
 use moria_core::GROUND_Z;
 use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
-    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, InspectTarget, Reject, ServerMsg,
-    TickDelta,
+    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, InspectTarget, Inspection, Reject,
+    ServerMsg, TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
@@ -266,6 +266,12 @@ pub struct Game {
     pub status: bool,
     /// Creature shown in the status panel (middle click).
     pub inspect: Option<InspectTarget>,
+    /// Latest vitals the server sent for `inspect`.
+    pub inspection: Option<Inspection>,
+    /// Last `Inspect` request: target and time (s), to ask at most once per second.
+    pub inspect_asked: Option<(InspectTarget, f64)>,
+    /// One-line notice and the `ticks` value it was raised at.
+    pub toast: Option<(String, u64)>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
     /// Highlighted row of the pause menu, for keyboard and gamepad.
@@ -290,7 +296,7 @@ pub struct Game {
     pub confirmed: TilePos,
     /// Predicted positions not yet seen in a tick, with the local tick count at send.
     pub pending: VecDeque<(TilePos, u64)>,
-    ticks: u64,
+    pub ticks: u64,
 }
 
 /// Everything the player can build: mode and label; the cost is `kind.cost()`.
@@ -388,6 +394,7 @@ impl Game {
             self.build_menu || self.status || self.order_menu.is_some() || self.inspect.is_some();
         self.build_menu = false;
         self.inspect = None;
+        self.inspection = None;
         self.status = false;
         self.order_menu = None;
         open
@@ -432,6 +439,9 @@ impl Game {
             map_rev: 0,
             status: false,
             inspect: None,
+            inspection: None,
+            inspect_asked: None,
+            toast: None,
             pause: false,
             pause_sel: 0,
             pause_pick: false,
@@ -497,6 +507,38 @@ impl Game {
     }
 
     /// Creature on this tile of level `z`: hero first, then the first dwarf.
+    /// The `Inspect` request to send now, if the panel needs one.
+    pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
+        if !inspect_due(self.inspect, self.inspect_asked, now) {
+            return None;
+        }
+        let t = self.inspect?;
+        self.inspect_asked = Some((t, now));
+        Some(ClientMsg::Inspect(t))
+    }
+
+    /// Server reply for the open panel: keep it for that target; `None` means it is gone.
+    pub fn on_inspected(&mut self, i: Option<Inspection>) {
+        match i {
+            Some(i) if Some(i.target) == self.inspect => self.inspection = Some(i),
+            Some(_) => {}
+            None => {
+                self.close_menus_inspect();
+                self.say(tr("Disparu", "Gone"));
+            }
+        }
+    }
+
+    fn close_menus_inspect(&mut self) {
+        self.inspect = None;
+        self.inspection = None;
+    }
+
+    /// Shows a one-line notice for a few seconds.
+    pub fn say(&mut self, text: &str) {
+        self.toast = Some((text.to_string(), self.ticks));
+    }
+
     pub fn inspect_at(&self, tile: (i16, i16), z: u8) -> Option<InspectTarget> {
         let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
         if at(self.hero.pos) {
@@ -548,6 +590,9 @@ impl Game {
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
         self.hungry.clone_from(&d.hungry);
+        for _ in &d.died {
+            self.say(tr("Un nain est mort de faim", "A dwarf starved to death"));
+        }
         self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -648,6 +693,19 @@ impl Game {
     }
 }
 
+/// Whether to send `Inspect` for `open` now: on opening or changing target, then once a second.
+pub fn inspect_due(
+    open: Option<InspectTarget>,
+    asked: Option<(InspectTarget, f64)>,
+    now: f64,
+) -> bool {
+    match (open, asked) {
+        (None, _) => false,
+        (Some(t), Some((a, at))) if a == t => now - at >= 1.0,
+        _ => true,
+    }
+}
+
 /// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
 pub fn outlined(
     designations: &std::collections::BTreeMap<TilePos, DesignationKind>,
@@ -719,8 +777,12 @@ impl Session {
                 }
                 false
             }
-            // The status panel does not ask yet (Task 8).
-            NetEvent::Msg(ServerMsg::Inspected(_)) => false,
+            NetEvent::Msg(ServerMsg::Inspected(i)) => {
+                if let Some(g) = &mut self.game {
+                    g.on_inspected(i);
+                }
+                false
+            }
             NetEvent::Disconnected(reason) => {
                 // Before login, the reason shows on the login screen itself.
                 let to = match self.screen {
@@ -944,6 +1006,77 @@ pub(crate) mod tests {
             resources: Resources::default(),
             orders: vec![],
         }
+    }
+
+    fn inspection(target: InspectTarget) -> Inspection {
+        Inspection {
+            target,
+            food: 10,
+            health: 90,
+            ticks_alive: 5,
+            jobs_done: 2,
+        }
+    }
+
+    fn playing(g: Game) -> Session {
+        Session {
+            game: Some(g),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inspected_none_closes_panel_with_message() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut s = playing(g);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(None)));
+        let g = s.game.unwrap();
+        assert_eq!(g.inspect, None);
+        assert_eq!(g.inspection, None);
+        assert_eq!(g.toast.unwrap().0, "Disparu");
+    }
+
+    #[test]
+    fn stale_inspected_for_another_target_is_ignored() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        let mut s = playing(g);
+        let other = inspection(InspectTarget::Dwarf(DwarfId(1)));
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(Some(other))));
+        assert_eq!(s.game.as_ref().unwrap().inspection, None);
+        let mine = inspection(InspectTarget::Hero);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(Some(mine))));
+        assert_eq!(s.game.unwrap().inspection, Some(mine));
+    }
+
+    #[test]
+    fn inspect_requested_on_open_then_at_most_once_per_second() {
+        let hero = Some(InspectTarget::Hero);
+        let dw = Some(InspectTarget::Dwarf(DwarfId(1)));
+        assert!(!inspect_due(None, None, 0.0));
+        assert!(inspect_due(hero, None, 0.0));
+        assert!(!inspect_due(hero, Some((InspectTarget::Hero, 0.0)), 0.9));
+        assert!(inspect_due(hero, Some((InspectTarget::Hero, 0.0)), 1.0));
+        // Another target asks at once, even within the second (server limit is 100 ms).
+        assert!(inspect_due(dw, Some((InspectTarget::Hero, 0.0)), 0.5));
+        let mut g = game();
+        g.inspect = hero;
+        assert_eq!(
+            g.poll_inspect(5.0),
+            Some(ClientMsg::Inspect(InspectTarget::Hero))
+        );
+        assert_eq!(g.poll_inspect(5.5), None);
+        assert!(g.poll_inspect(6.0).is_some());
+    }
+
+    #[test]
+    fn died_in_delta_reports_message() {
+        let mut g = game();
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
     }
 
     #[test]

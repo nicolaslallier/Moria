@@ -13,8 +13,10 @@ use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
+use moria_core::light::DAY_TICKS;
 use moria_core::protocol::{ClientMsg, InspectTarget, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
+use moria_core::world::{FOOD_MAX, HEALTH_MAX};
 use std::path::PathBuf;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
@@ -52,7 +54,8 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (
-                    top_bar, hud, action_bar, build_menu, order_menu, status, inspect, pause_menu,
+                    top_bar, hud, action_bar, build_menu, order_menu, status, inspect, toast,
+                    pause_menu,
                 )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
@@ -511,6 +514,7 @@ pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
             for (name, score, m) in ability_rows(h.abilities) {
                 v.push(row(word(name), format!("{score} {m}")));
             }
+            v.extend(vitals(g, t));
             v
         }
         InspectTarget::Dwarf(id) => g
@@ -523,16 +527,68 @@ pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
                 } else {
                     tr("Rassasié", "Fed")
                 };
-                vec![
+                let mut v = vec![
                     row(tr("Nain", "Dwarf"), format!("n°{}", id.0)),
                     row(tr("Activité", "Activity"), job_label(job)),
                     row(tr("État", "State"), state.into()),
-                ]
+                ];
+                v.extend(vitals(g, t));
+                v
             })
             .unwrap_or_default(),
         InspectTarget::Cow(_) => vec![],
     }
 }
+
+/// Food, health, age and jobs from the server's latest reply for `t`.
+fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let Some(i) = g.inspection.filter(|i| i.target == t) else {
+        return vec![];
+    };
+    let mut v = vec![
+        (
+            tr("Faim", "Food").to_string(),
+            format!("{} %", u32::from(i.food) * 100 / u32::from(FOOD_MAX)),
+        ),
+        (
+            tr("Santé", "Health").to_string(),
+            format!("{} / {HEALTH_MAX}", i.health),
+        ),
+        (
+            tr("Âge", "Age").to_string(),
+            format!(
+                "{:.1} {}",
+                i.ticks_alive as f64 / DAY_TICKS as f64,
+                tr("j", "d")
+            ),
+        ),
+    ];
+    if matches!(t, InspectTarget::Dwarf(_)) {
+        v.push((tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()));
+    }
+    v
+}
+
+/// Transient one-line notice (a death, a vanished creature), top center.
+fn toast(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game
+        && let Some((text, at)) = &g.toast
+        && g.ticks.wrapping_sub(*at) < TOAST_TICKS
+    {
+        egui::Area::new("toast".into())
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                [0.0, below_bar(ctx.ctx_mut()?) + 8.0],
+            )
+            .show(ctx.ctx_mut()?, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(text.as_str()));
+            });
+    }
+    Ok(())
+}
+
+/// How long a notice stays, in server ticks (10 s at 100 ms/tick).
+const TOAST_TICKS: u64 = 100;
 
 /// No title bar (Space digs); sits under the status page when both are open.
 fn inspect_window(ctx: &egui::Context, g: &Game) {
@@ -931,6 +987,57 @@ mod tests {
         g.hungry = vec![DwarfId(3)];
         assert_eq!(state(&g), "Affamé");
         assert!(inspect_lines(&g, InspectTarget::Dwarf(DwarfId(9))).is_empty());
+    }
+
+    #[test]
+    fn inspect_lines_show_gauges_and_stats() {
+        use moria_core::DwarfId;
+        use moria_core::protocol::Inspection;
+        use moria_core::world::{FOOD_MAX, HEALTH_MAX};
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let t = InspectTarget::Dwarf(DwarfId(3));
+        let known = inspect_lines(&g, t).len();
+        g.inspection = Some(Inspection {
+            target: t,
+            food: FOOD_MAX / 2,
+            health: HEALTH_MAX,
+            ticks_alive: moria_core::light::DAY_TICKS * 3 / 2,
+            jobs_done: 12,
+        });
+        let l = inspect_lines(&g, t);
+        assert_eq!(l.len(), known + 4);
+        assert!(l.contains(&("Faim".into(), "50 %".into())));
+        assert!(l.contains(&("Santé".into(), "100 / 100".into())));
+        assert!(l.contains(&("Âge".into(), "1.5 j".into())));
+        assert!(l.contains(&("Tâches".into(), "12".into())));
+        // Hero: no jobs row.
+        g.inspection = Some(Inspection {
+            target: InspectTarget::Hero,
+            jobs_done: 0,
+            ..g.inspection.unwrap()
+        });
+        let l = inspect_lines(&g, InspectTarget::Hero);
+        assert!(l.iter().any(|(k, _)| k == "Faim"));
+        assert!(!l.iter().any(|(k, _)| k == "Tâches"));
+        // A reply for another target adds nothing.
+        assert_eq!(inspect_lines(&g, t).len(), known);
+    }
+
+    #[test]
+    fn status_page_with_zero_dwarves_does_not_panic() {
+        let mut g = crate::game::tests::game();
+        g.status = true;
+        g.dwarves.clear();
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |ui| {
+            status_window(ui.ctx(), &mut g, egui::TextureId::default());
+            g.inspect = Some(InspectTarget::Dwarf(moria_core::DwarfId(1)));
+            inspect_window(ui.ctx(), &g);
+        })
+        .textures_delta
+        .clear();
     }
 
     /// A painted text: its string, screen rect and number of rows.
