@@ -67,7 +67,39 @@ mod tests {
     }
 
     #[test]
-    fn year_length_is_28_days() {
-        assert_eq!(YEAR_TICKS, 28 * DAY_TICKS);
+    fn every_season_arm_and_last_ticks() {
+        assert_eq!(season(2 * SEASON_TICKS - 1), Season::Summer);
+        assert_eq!(season(2 * SEASON_TICKS), Season::Autumn);
+        assert_eq!(season(3 * SEASON_TICKS - 1), Season::Autumn);
+        assert_eq!(season(YEAR_TICKS - 1), Season::Winter);
+        assert_eq!(day_of_season(DAY_TICKS - 1), 0);
+        assert_eq!(day_of_season(DAY_TICKS), 1);
+        assert_eq!(day_of_season(SEASON_TICKS - 1), 6);
+        assert_eq!(year(YEAR_TICKS - 1), 0);
+    }
+
+    #[test]
+    fn huge_tick_does_not_panic() {
+        for t in [u64::MAX, u64::MAX - 1, u64::MAX / 2] {
+            let _ = season(t);
+            assert!(day_of_season(t) <= 6, "{t}");
+            assert_eq!(year(t), t / YEAR_TICKS);
+        }
+    }
+
+    #[test]
+    fn year_is_28_days_of_four_seasons() {
+        // Walk a year day by day: 7 days per season, in order, then year 1 starts.
+        let mut seen = vec![];
+        for d in 0..28 {
+            let t = d * DAY_TICKS;
+            assert_eq!(u64::from(day_of_season(t)), d % 7, "day {d}");
+            assert_eq!(year(t), 0);
+            seen.push(season(t));
+        }
+        seen.dedup();
+        use Season::*;
+        assert_eq!(seen, vec![Spring, Summer, Autumn, Winter]);
+        assert_eq!((season(28 * DAY_TICKS), year(28 * DAY_TICKS)), (Spring, 1));
     }
 }
