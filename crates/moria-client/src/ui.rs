@@ -4,8 +4,8 @@ use crate::Client;
 use crate::art::Art;
 use crate::game::{
     ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, ability_rows,
-    available_text, build_text, clock_label, level_label, mode_label, recipe_label, resource_bar,
-    stock_text, workshop_label,
+    available_text, build_text, clock_label, job_label, level_label, mode_label, recipe_label,
+    resource_bar, stock_text, workshop_label,
 };
 use crate::lang::{en, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
@@ -13,7 +13,7 @@ use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
-use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
+use moria_core::protocol::{ClientMsg, InspectTarget, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
 use std::path::PathBuf;
 
@@ -52,7 +52,7 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (
-                    top_bar, hud, action_bar, build_menu, order_menu, status, pause_menu,
+                    top_bar, hud, action_bar, build_menu, order_menu, status, inspect, pause_menu,
                 )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
@@ -487,6 +487,84 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
         });
 }
 
+/// Middle-click panel: what is known about the inspected creature.
+fn inspect(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game {
+        inspect_window(ctx.ctx_mut()?, g);
+    }
+    Ok(())
+}
+
+/// (label, value) rows of the inspect panel; empty for an unknown creature.
+pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let row = |k: &str, v: String| (k.to_string(), v);
+    match t {
+        InspectTarget::Hero => {
+            let h = &g.hero;
+            let mut v = vec![
+                row(tr("Nom", "Name"), h.name.clone()),
+                row(
+                    tr("Race", "Race"),
+                    format!("{} {}", word(h.race.label_fr()), word(h.class.label_fr())),
+                ),
+            ];
+            for (name, score, m) in ability_rows(h.abilities) {
+                v.push(row(word(name), format!("{score} {m}")));
+            }
+            v
+        }
+        InspectTarget::Dwarf(id) => g
+            .dwarves
+            .iter()
+            .find(|d| d.0 == id)
+            .map(|&(id, _, job)| {
+                let state = if g.hungry.contains(&id) {
+                    tr("Affamé", "Hungry")
+                } else {
+                    tr("Rassasié", "Fed")
+                };
+                vec![
+                    row(tr("Nain", "Dwarf"), format!("n°{}", id.0)),
+                    row(tr("Activité", "Activity"), job_label(job)),
+                    row(tr("État", "State"), state.into()),
+                ]
+            })
+            .unwrap_or_default(),
+        InspectTarget::Cow(_) => vec![],
+    }
+}
+
+/// No title bar (Space digs); sits under the status page when both are open.
+fn inspect_window(ctx: &egui::Context, g: &Game) {
+    let Some(t) = g.inspect else { return };
+    let lines = inspect_lines(g, t);
+    if lines.is_empty() {
+        return;
+    }
+    // ponytail: fixed offset; a measured status-window height if it ever overlaps.
+    let dy = below_bar(ctx) + if g.status { STATUS_HEIGHT } else { 0.0 };
+    egui::Window::new("Inspection")
+        .title_bar(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, dy])
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("inspect").show(ui, |ui| {
+                for (k, v) in lines {
+                    ui.label(k);
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+            ui.small(tr(
+                "Clic du milieu ou Échap : fermer",
+                "Middle click or Esc: close",
+            ));
+        });
+}
+
+/// Room left for the status page above the inspect panel.
+const STATUS_HEIGHT: f32 = 480.0;
+
 /// Where `bar_window` leaves the bar's bottom edge, in egui's temp memory.
 const BAR_BOTTOM: &str = "barre_bas";
 
@@ -828,6 +906,31 @@ mod tests {
             assert_eq!(ctx.memory(|m| m.focused()), None);
         }
         assert!(g.status);
+    }
+
+    #[test]
+    fn inspect_lines_for_hero_has_abilities_and_no_hunger_state() {
+        let g = crate::game::tests::game();
+        let l = inspect_lines(&g, InspectTarget::Hero);
+        assert!(l.iter().any(|(k, _)| k == "Force"));
+        assert!(!l.iter().any(|(k, _)| k == "État"));
+    }
+
+    #[test]
+    fn inspect_lines_for_dwarf_shows_activity_and_hungry_state() {
+        use moria_core::DwarfId;
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let state = |g: &Game| {
+            let l = inspect_lines(g, InspectTarget::Dwarf(DwarfId(3)));
+            assert!(l.contains(&("Activité".into(), "Inactif".into())));
+            l.into_iter().find(|(k, _)| k == "État").unwrap().1
+        };
+        assert_eq!(state(&g), "Rassasié");
+        g.hungry = vec![DwarfId(3)];
+        assert_eq!(state(&g), "Affamé");
+        assert!(inspect_lines(&g, InspectTarget::Dwarf(DwarfId(9))).is_empty());
     }
 
     /// A painted text: its string, screen rect and number of rows.
