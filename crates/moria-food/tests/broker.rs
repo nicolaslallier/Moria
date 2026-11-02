@@ -196,13 +196,52 @@ async fn restart_keeps_hidden_state() {
     svc.stop().await;
     assert!(FoodStore::load_or_default(&file).unwrap().mountains[&M].is_ripe(at));
 
-    // Redemarrage sans nouvel instantane, en hiver : rien ne pousse, seul l'etat sauve parle.
+    // Redemarrage en hiver (rien ne pousse) : sans instantane, battement a 0 et aucun evenement,
+    // `food.bin` peut etre perime.
     bus.purge("food-world").await.unwrap();
+    while tokio::time::timeout(Duration::from_millis(300), events.next())
+        .await
+        .is_ok()
+    {}
+    let before = FoodStore::load_or_default(&file).unwrap().mountains[&M].clone();
     let winter = 3 * SEASON_TICKS;
+    let mut st = bus.subscribe(KEY_STATE, Queue::Exclusive).await.unwrap();
     let svc = start(file.clone());
-    drive(&bus, &mut events, None, winter, 100, |e| {
-        e.tick > winter && e.mountain == M && e.list.contains(&FoodEvent::CropRipe { at })
+    let b = tokio::time::timeout(Duration::from_secs(5), st.next())
+        .await
+        .expect("battement jamais recu")
+        .unwrap();
+    assert_eq!(postcard::from_bytes::<Status>(&b).unwrap().tick, 0);
+    for k in 1..=10 {
+        send(
+            &bus,
+            KEY_TICK,
+            &Tick {
+                tick: winter + k * 100,
+            },
+        )
+        .await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .is_err(),
+        "evenement propose avant le premier World"
+    );
+    // L'instantane arrive : la recolte est redemandee et l'etat cache a survecu.
+    let w = World { tick: winter, ..w };
+    drive(&bus, &mut events, Some(&w), winter, 100, |e| {
+        e.tick > winter && e.list.contains(&FoodEvent::CropRipe { at })
     })
     .await;
     svc.stop().await;
+    let mut kept = before;
+    kept.adopt(&w.mountains[0].1, winter);
+    let mut fresh = moria_core::food::FoodSim::new(moria_food::seed(M));
+    fresh.adopt(&w.mountains[0].1, winter);
+    assert_ne!(kept, fresh, "aucun etat cache a garder");
+    assert_eq!(
+        FoodStore::load_or_default(&file).unwrap().mountains[&M],
+        kept
+    );
 }

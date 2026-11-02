@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 
 /// Anti-entropy: a full `World` this often while the container is up.
 pub const WORLD_EVERY: Duration = Duration::from_secs(300);
+/// A `World` again this often while the heartbeat says none was adopted (tick 0).
+pub const WORLD_RETRY: Duration = Duration::from_secs(5);
 /// Events proposed for a tick older than this (5 s) are refused whole.
 // ponytail: tick-based staleness per tile, no entity ids; ids if two lives of one tile within
 // 5 s ever matter.
@@ -71,7 +73,8 @@ pub struct Link {
     world_at: Option<Instant>,
     /// Mountains in the last `World`: another set needs a new `World`.
     world_ids: Vec<MountainId>,
-    /// Tick of the last heartbeat: going back means the container restarted.
+    /// Tick of the last heartbeat: going back means the container restarted, 0 that it has
+    /// adopted no `World` yet.
     status_tick: u64,
     inbox: Vec<Events>,
     /// Server tick of the last harvest or sowing per tile, younger than `MAX_EVENT_AGE`.
@@ -171,12 +174,18 @@ impl Link {
         }
         out.retain(|_, ch| *ch != Changes::default());
 
+        // Heartbeat tick 0: the container has adopted no `World` since it started.
+        let every = if self.status_tick == 0 {
+            WORLD_RETRY
+        } else {
+            WORLD_EVERY
+        };
         if !self.up(now) {
             self.world_at = None;
         } else if !w.fortresses.keys().eq(&self.world_ids)
             || self
                 .world_at
-                .is_none_or(|t| now.saturating_duration_since(t) >= WORLD_EVERY)
+                .is_none_or(|t| now.saturating_duration_since(t) >= every)
         {
             // One message with every fortress, even those without cells: the container
             // forgets the mountains a `World` leaves out.
@@ -306,8 +315,12 @@ mod tests {
         let (inc, rx) = mpsc::channel(MAX_IN_PER_TICK);
         (Link::new(tx, rx), (out, inc))
     }
+    /// Heartbeat of a container that has adopted a `World`.
     fn beat(inc: &mpsc::Sender<Incoming>) {
-        inc.try_send(Incoming::Status(Status { tick: 0 })).unwrap();
+        beat_at(inc, 1);
+    }
+    fn beat_at(inc: &mpsc::Sender<Incoming>, tick: u64) {
+        inc.try_send(Incoming::Status(Status { tick })).unwrap();
     }
     /// One server tick of the link: poll, then step with `acts`.
     fn tick(
@@ -430,6 +443,30 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, Outgoing::Tick(t) if t.tick == w.tick))
         );
+    }
+
+    #[test]
+    fn world_is_resent_while_the_container_has_none() {
+        // Heartbeat tick 0: no `World` adopted since the container started.
+        let (mut l, (mut out, inc)) = link();
+        let mut w = setup();
+        let t0 = Instant::now();
+        let mut at = |l: &mut Link, w: &mut GameWorld, tick, s| {
+            beat_at(&inc, tick);
+            self::tick(l, w, &[], secs(t0, s));
+            worlds(&sent(&mut out)).len()
+        };
+        assert_eq!(at(&mut l, &mut w, 0, 0), 1, "first heartbeat");
+        assert_eq!(at(&mut l, &mut w, 0, 1), 0, "not every tick");
+        assert_eq!(
+            at(&mut l, &mut w, 0, WORLD_RETRY.as_secs()),
+            1,
+            "lost World: again"
+        );
+        assert_eq!(at(&mut l, &mut w, 7, 20), 0, "adopted");
+        assert_eq!(at(&mut l, &mut w, 7, 40), 0);
+        // a restart faster than STOPPED_AFTER: tick 0 again
+        assert_eq!(at(&mut l, &mut w, 0, 41), 1, "restarted");
     }
 
     #[test]

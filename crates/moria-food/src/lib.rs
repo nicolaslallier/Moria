@@ -88,18 +88,34 @@ fn read<T: DeserializeOwned>(key: &str, bytes: &[u8], max: usize) -> Option<T> {
     v
 }
 
+/// Battement : le dernier tick vu, 0 tant qu'aucun `World` n'a ete adopte depuis le demarrage.
+pub fn status(last_tick: Option<u64>) -> Status {
+    Status {
+        tick: last_tick.unwrap_or(0),
+    }
+}
+
 /// Decode (borne) et applique un message selon sa cle ; illisible ou inconnu : ignore.
-pub fn handle(store: &mut FoodStore, last_tick: &mut u64, key: &str, bytes: &[u8]) -> Vec<Events> {
+/// `last_tick` vaut `None` tant qu'aucun `World` n'a ete adopte depuis le demarrage.
+pub fn handle(
+    store: &mut FoodStore,
+    last_tick: &mut Option<u64>,
+    key: &str,
+    bytes: &[u8],
+) -> Vec<Events> {
     match key {
         KEY_TICK => {
-            if let Some(t) = read::<Tick>(key, bytes, MAX_FOOD_MSG_BYTES) {
-                *last_tick = t.tick;
+            // Avant le premier `World` : `food.bin` peut dater d'une minute, ne rien proposer.
+            if let (Some(t), Some(last)) = (read::<Tick>(key, bytes, MAX_FOOD_MSG_BYTES), last_tick)
+            {
+                *last = t.tick;
                 return handle_tick(store, &t);
             }
         }
         KEY_WORLD => {
-            if let Some(w) = read(key, bytes, MAX_FOOD_WORLD_BYTES) {
+            if let Some(w) = read::<World>(key, bytes, MAX_FOOD_WORLD_BYTES) {
                 handle_world(store, &w);
+                last_tick.get_or_insert(w.tick);
             }
         }
         KEY_ACTION => {
@@ -180,7 +196,7 @@ pub async fn run(
     // Apres une longue attente (reconnexion), pas de rafale de battements ni de sauvegardes.
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_tick = 0;
+    let mut last_tick = None;
     loop {
         let bus = tokio::select! {
             b = Bus::connect_forever(&amqp_url) => b,
@@ -197,7 +213,7 @@ pub async fn run(
                     }
                     _ = beat.tick() => {
                         if !bus.is_connected() { break; }
-                        publish(&bus, KEY_STATE, &Status { tick: last_tick }).await;
+                        publish(&bus, KEY_STATE, &status(last_tick)).await;
                     }
                     _ = autosave.tick() => {
                         if let Err(e) = store.save(&data) {
@@ -368,13 +384,13 @@ mod tests {
     fn garbage_payload_is_ignored() {
         for key in [KEY_TICK, KEY_WORLD, KEY_ACTION, KEY_REJECT, "food.inconnu"] {
             let mut s = seeded();
-            let mut last = 0;
+            let mut last = Some(0);
             assert!(
                 handle(&mut s, &mut last, key, &[0xff; 7]).is_empty(),
                 "{key}"
             );
             assert_eq!(s, seeded(), "{key}");
-            assert_eq!(last, 0, "{key}");
+            assert_eq!(last, Some(0), "{key}");
         }
     }
 
@@ -390,7 +406,7 @@ mod tests {
         let big = pad(postcard::to_allocvec(&w).unwrap(), MAX_FOOD_WORLD_BYTES);
         assert!(postcard::from_bytes::<World>(&big).is_ok());
         let mut s = FoodStore::default();
-        let mut last = 0;
+        let mut last = None;
         handle(&mut s, &mut last, KEY_WORLD, &big);
         assert_eq!(s, FoodStore::default());
 
@@ -409,13 +425,13 @@ mod tests {
             MAX_FOOD_MSG_BYTES,
         );
         assert!(handle(&mut s, &mut last, KEY_TICK, &big).is_empty());
-        assert_eq!(last, 0);
+        assert_eq!(last, None);
     }
 
     #[test]
     fn valid_payloads_are_dispatched_by_key() {
         let mut s = FoodStore::default();
-        let mut last = 0;
+        let mut last = None;
         let w = world(0, vec![(A, vec![cow(5, 5)])]);
         handle(
             &mut s,
@@ -425,7 +441,32 @@ mod tests {
         );
         let t = postcard::to_allocvec(&Tick { tick: 10 }).unwrap();
         assert_eq!(handle(&mut s, &mut last, KEY_TICK, &t).len(), 1);
-        assert_eq!(last, 10);
+        assert_eq!(last, Some(10));
+    }
+
+    #[test]
+    fn no_step_before_the_first_world_since_start() {
+        // `food.bin` charge (montagne connue) mais aucun `World` recu depuis le demarrage.
+        let mut s = seeded();
+        let mut last = None;
+        let enc = |t| postcard::to_allocvec(&Tick { tick: t }).unwrap();
+        assert!(handle(&mut s, &mut last, KEY_TICK, &enc(10)).is_empty());
+        assert_eq!(s, seeded(), "etat perime avance");
+        assert_eq!(
+            status(last),
+            Status { tick: 0 },
+            "le serveur doit renvoyer un World"
+        );
+        let w = world(20, vec![(A, vec![cow(5, 5)])]);
+        handle(
+            &mut s,
+            &mut last,
+            KEY_WORLD,
+            &postcard::to_allocvec(&w).unwrap(),
+        );
+        assert_eq!(status(last), Status { tick: 20 });
+        assert_eq!(handle(&mut s, &mut last, KEY_TICK, &enc(30)).len(), 1);
+        assert_eq!(status(last), Status { tick: 30 });
     }
 
     fn bad_path() -> PathBuf {
