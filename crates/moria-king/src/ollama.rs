@@ -127,6 +127,10 @@ pub(crate) mod tests {
         assert_eq!(v["format"]["type"], "object");
         assert_eq!(v["format"]["required"], serde_json::json!(["say", "offer"]));
         assert_eq!(
+            v["format"]["properties"]["offer"]["enum"],
+            serde_json::json!(["forge_ingots", "forge_doors", "food", "depth", null])
+        );
+        assert_eq!(
             v["messages"],
             serde_json::json!([{"role":"user","content":"bonjour"}])
         );

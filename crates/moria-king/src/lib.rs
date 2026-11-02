@@ -8,7 +8,11 @@ pub use prompt::{ChatMessage, build_messages, parse_reply};
 use futures::StreamExt;
 use moria_bus::{Bus, Queue};
 use moria_core::king::{Ask, KEY_ASK, KEY_REPLY, Reply};
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Semaphore, mpsc};
 
 /// Questions traitées en parallèle (une lente ne bloque pas les autres).
@@ -36,6 +40,55 @@ pub async fn answer(ask: &Ask, llm: &impl Llm) -> Reply {
         text,
         offer,
     }
+}
+
+/// Taille maximale d'une question sur le bus, vérifiée avant décodage.
+pub const MAX_ASK_BYTES: usize = 64 * 1024;
+/// Au-delà, le serveur (70 s) a déjà envoyé son repli : inutile d'occuper Ollama.
+const STALE: Duration = Duration::from_secs(60);
+
+fn decode_ask(payload: &[u8]) -> Option<Ask> {
+    if payload.len() > MAX_ASK_BYTES {
+        tracing::warn!("question trop grosse ignorée ({} octets)", payload.len());
+        return None;
+    }
+    postcard::from_bytes(payload)
+        .inspect_err(|e| tracing::warn!("question illisible ignorée: {e}"))
+        .ok()
+}
+
+/// `None` si la question a trop attendu : on l'abandonne sans appeler le LLM.
+async fn handle(ask: &Ask, received: Instant, llm: &impl Llm) -> Option<Reply> {
+    if received.elapsed() > STALE {
+        tracing::debug!(mountain = ask.mountain.0, seq = ask.seq, "question périmée");
+        return None;
+    }
+    Some(answer(ask, llm).await)
+}
+
+/// Attend une place libre (contre-pression sur la réception), puis traite la question
+/// dans sa propre tâche : au plus `IN_FLIGHT` tâches à la fois.
+async fn dispatch<L: Llm + Send + Sync + 'static>(
+    ask: Ask,
+    received: Instant,
+    llm: &Arc<L>,
+    slots: &Arc<Semaphore>,
+    tx: &mpsc::Sender<Reply>,
+) {
+    let Ok(permit) = slots.clone().acquire_owned().await else {
+        return;
+    };
+    let (llm, tx) = (llm.clone(), tx.clone());
+    tokio::spawn(async move {
+        let reply = handle(&ask, received, &*llm).await;
+        // La place est rendue avant l'envoi : la boucle peut attendre une place sans
+        // bloquer les tâches qui lui rendent leur réponse.
+        drop(permit);
+        drop(llm);
+        if let Some(r) = reply {
+            let _ = tx.send(r).await;
+        }
+    });
 }
 
 /// Répond aux questions jusqu'à `shutdown` ; se reconnecte (2 s) quand le bus tombe.
@@ -69,7 +122,7 @@ pub async fn run(
                 }
             }
         };
-        tracing::info!("king connecte a RabbitMQ");
+        tracing::info!("king connecté à RabbitMQ");
         loop {
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
@@ -79,7 +132,7 @@ pub async fn run(
                         continue;
                     };
                     if let Err(e) = bus.publish(KEY_REPLY, b, false).await {
-                        tracing::warn!("publication echouee ({e}), reconnexion dans 2 s");
+                        tracing::warn!("publication échouée ({e}), reconnexion dans 2 s");
                         tokio::select! {
                             _ = &mut shutdown => return Ok(()),
                             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -89,21 +142,15 @@ pub async fn run(
                 }
                 m = sub.next() => {
                     let Some(payload) = m else {
-                        tracing::warn!("abonnement termine, reconnexion");
+                        tracing::warn!("abonnement terminé, reconnexion");
                         break;
                     };
-                    let ask: Ask = match postcard::from_bytes(&payload) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::warn!("question illisible ignoree: {e}");
-                            continue;
-                        }
-                    };
-                    let (llm, slots, tx) = (llm.clone(), slots.clone(), tx.clone());
-                    tokio::spawn(async move {
-                        let Ok(_permit) = slots.acquire_owned().await else { return };
-                        let _ = tx.send(answer(&ask, &*llm).await).await;
-                    });
+                    let received = Instant::now();
+                    let Some(ask) = decode_ask(&payload) else { continue };
+                    tokio::select! {
+                        _ = &mut shutdown => return Ok(()),
+                        _ = dispatch(ask, received, &llm, &slots, &tx) => {}
+                    }
                 }
             }
         }
@@ -115,6 +162,7 @@ mod tests {
     use super::*;
     use crate::prompt::tests::ask;
     use moria_core::king::{FALLBACK_FR, QuestId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct Fake(anyhow::Result<String>);
@@ -129,8 +177,66 @@ mod tests {
         }
     }
 
+    /// Compte les appels simultanés et garde le maximum observé.
+    #[derive(Default)]
+    struct Counting {
+        now: AtomicUsize,
+        max: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl Llm for Counting {
+        async fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            Ok(r#"{"say":"ok","offer":null}"#.into())
+        }
+    }
+
+    #[test]
+    fn oversized_payload_is_ignored() {
+        let ok = postcard::to_allocvec(&ask()).unwrap();
+        assert_eq!(decode_ask(&ok), Some(ask()));
+        assert_eq!(decode_ask(&vec![0u8; MAX_ASK_BYTES + 1]), None);
+        assert_eq!(decode_ask(b"\xff\xff"), None);
+    }
+
     #[tokio::test]
-    async fn run_replies_with_same_mountain_and_seq() {
+    async fn stale_ask_is_skipped_without_calling_the_llm() {
+        let llm = Counting::default();
+        let old = Instant::now() - STALE - Duration::from_secs(1);
+        assert_eq!(handle(&ask(), old, &llm).await, None);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+        assert!(handle(&ask(), Instant::now(), &llm).await.is_some());
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_llm_calls_never_exceed_the_limit() {
+        let llm = Arc::new(Counting::default());
+        let slots = Arc::new(Semaphore::new(IN_FLIGHT));
+        let (tx, mut rx) = mpsc::channel(16);
+        for seq in 0..7 {
+            let mut a = ask();
+            a.seq = seq;
+            // Bloque tant que IN_FLIGHT questions sont en cours : contre-pression.
+            dispatch(a, Instant::now(), &llm, &slots, &tx).await;
+            assert!(Arc::strong_count(&llm) <= IN_FLIGHT + 1);
+        }
+        let mut seqs = Vec::new();
+        for _ in 0..7 {
+            seqs.push(rx.recv().await.unwrap().seq);
+        }
+        seqs.sort();
+        assert_eq!(seqs, (0..7).collect::<Vec<_>>());
+        assert_eq!(llm.max.load(Ordering::SeqCst), IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn answer_replies_with_same_mountain_and_seq() {
         let a = ask();
         let r = answer(&a, &Fake(Ok(r#"{"say":"Creuse.","offer":"depth"}"#.into()))).await;
         assert_eq!(

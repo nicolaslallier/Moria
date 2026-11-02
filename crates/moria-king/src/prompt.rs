@@ -1,6 +1,9 @@
 //! Prompt du roi et lecture de sa réponse.
 use moria_core::Resources;
-use moria_core::king::{Ask, FALLBACK_EN, FALLBACK_FR, Lang, MAX_REPLY_CHARS, QuestId, quest_def};
+use moria_core::king::{
+    Ask, FALLBACK_EN, FALLBACK_FR, HISTORY_LEN, Lang, MAX_REPLY_CHARS, MAX_TALK_CHARS, QuestId,
+    quest_def,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -110,19 +113,22 @@ pub fn build_messages(ask: &Ask) -> Vec<ChatMessage> {
         role: "system",
         content: system(ask),
     }];
-    for e in &ask.history {
+    // Bornes avant le LLM : seuls les HISTORY_LEN derniers échanges, chaque texte plafonné.
+    let recent = &ask.history[ask.history.len().saturating_sub(HISTORY_LEN)..];
+    for e in recent {
         m.push(ChatMessage {
             role: "user",
-            content: wrap(&e.player),
+            content: wrap(&cut(&e.player, MAX_TALK_CHARS)),
         });
+        let king = cut(&e.king, MAX_REPLY_CHARS);
         m.push(ChatMessage {
             role: "assistant",
-            content: serde_json::json!({ "say": e.king, "offer": null }).to_string(),
+            content: serde_json::json!({ "say": king, "offer": null }).to_string(),
         });
     }
     m.push(ChatMessage {
         role: "user",
-        content: wrap(&ask.text),
+        content: wrap(&cut(&ask.text, MAX_TALK_CHARS)),
     });
     m
 }
@@ -130,8 +136,14 @@ pub fn build_messages(ask: &Ask) -> Vec<ChatMessage> {
 #[derive(Deserialize)]
 struct Raw {
     say: String,
+    // Valeur brute : un type inattendu n'invalide pas `say`.
     #[serde(default)]
-    offer: Option<String>,
+    offer: serde_json::Value,
+}
+
+/// Les `n` premiers caractères (jamais au milieu d'un caractère).
+fn cut(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 /// Tolérant : accepte un JSON entouré de texte (bloc de code) ; sinon le repli, sans offre.
@@ -156,10 +168,10 @@ pub fn parse_reply(raw: &str, ask: &Ask) -> (String, Option<QuestId>) {
     }
     let offer = r
         .offer
-        .as_deref()
+        .as_str()
         .and_then(QuestId::from_key)
         .filter(|q| ask.active.is_none() && ask.offered.contains(q));
-    (say.chars().take(MAX_REPLY_CHARS).collect(), offer)
+    (cut(say, MAX_REPLY_CHARS), offer)
 }
 
 #[cfg(test)]
@@ -274,6 +286,51 @@ pub(crate) mod tests {
         let mut a = ask();
         a.lang = Lang::En;
         assert_eq!(parse_reply("", &a), (FALLBACK_EN.into(), None));
+    }
+
+    #[test]
+    fn non_string_offer_keeps_say() {
+        assert_eq!(
+            parse_reply(r#"{"say":"ok","offer":3}"#, &ask()),
+            ("ok".into(), None)
+        );
+    }
+
+    #[test]
+    fn long_text_and_history_entries_are_truncated() {
+        use moria_core::king::MAX_TALK_CHARS;
+        let mut a = ask();
+        a.text = "é".repeat(MAX_TALK_CHARS + 10);
+        a.history = vec![Exchange {
+            player: "é".repeat(MAX_TALK_CHARS + 10),
+            king: "é".repeat(MAX_REPLY_CHARS + 10),
+        }];
+        let m = build_messages(&a);
+        let wrapped = wrap(&"é".repeat(MAX_TALK_CHARS));
+        assert_eq!(m[1].content, wrapped);
+        assert_eq!(m.last().unwrap().content, wrapped);
+        let king: serde_json::Value = serde_json::from_str(&m[2].content).unwrap();
+        assert_eq!(
+            king["say"].as_str().unwrap().chars().count(),
+            MAX_REPLY_CHARS
+        );
+    }
+
+    #[test]
+    fn only_the_last_history_len_exchanges_are_sent() {
+        use moria_core::king::HISTORY_LEN;
+        let mut a = ask();
+        a.history = (0..20)
+            .map(|i| Exchange {
+                player: format!("q{i}"),
+                king: format!("r{i}"),
+            })
+            .collect();
+        let m = build_messages(&a);
+        let users: Vec<_> = m.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(users.len(), HISTORY_LEN + 1);
+        assert_eq!(users[0].content, wrap(&format!("q{}", 20 - HISTORY_LEN)));
+        assert_eq!(users[HISTORY_LEN - 1].content, wrap("q19"));
     }
 
     #[test]
