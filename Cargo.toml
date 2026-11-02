@@ -14,5 +14,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 futures = "0.3"
+serde_json = "1"
+# Client HTTP minimal pour l'Ollama du LAN : sans TLS.
+ureq = { version = "3", default-features = false, features = ["json"] }
 bevy = "0.20.1"
 bevy_egui = "0.43.1"
