@@ -41,18 +41,24 @@ pub fn handle_world(store: &mut FoodStore, w: &World) {
     }
 }
 
-/// Un `Events` par montagne connue qui propose quelque chose.
+/// Evenements par message : un `FoodEvent` s'encode en 15 octets au plus, l'en-tete en 16,
+/// donc sous `MAX_FOOD_MSG_BYTES` (le serveur jette un message trop gros en entier).
+const EVENTS_PER_MSG: usize = 1000;
+
+/// Des `Events` (decoupes) par montagne connue qui propose quelque chose.
 pub fn handle_tick(store: &mut FoodStore, t: &Tick) -> Vec<Events> {
     store
         .mountains
         .iter_mut()
-        .filter_map(|(&mountain, sim)| {
-            let list = sim.step(t.tick);
-            (!list.is_empty()).then_some(Events {
-                tick: t.tick,
-                mountain,
-                list,
-            })
+        .flat_map(|(&mountain, sim)| {
+            sim.step(t.tick)
+                .chunks(EVENTS_PER_MSG)
+                .map(|c| Events {
+                    tick: t.tick,
+                    mountain,
+                    list: c.to_vec(),
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -442,6 +448,39 @@ mod tests {
         let t = postcard::to_allocvec(&Tick { tick: 10 }).unwrap();
         assert_eq!(handle(&mut s, &mut last, KEY_TICK, &t).len(), 1);
         assert_eq!(last, Some(10));
+    }
+
+    #[test]
+    fn events_are_split_under_the_message_limit() {
+        // Pire cas : des milliers de recoltes mures loin de l'origine, redemandees a chaque
+        // verification, plus des vaches qui se deplacent (World forge).
+        let far = |i: i16| TilePos::new(i16::MIN + i, i16::MAX - i, u8::MAX);
+        let mut cells: Vec<Cell> = (0..6000)
+            .map(|i| Cell {
+                pos: far(i),
+                kind: CellKind::Crop,
+            })
+            .collect();
+        cells.extend((0..3000).map(|i| Cell {
+            pos: TilePos::new(i16::MAX - 1 - 2 * i, i16::MIN + 1 + 2 * i, u8::MAX),
+            kind: CellKind::Cow,
+        }));
+        let m = MountainId(u16::MAX);
+        let mut s = FoodStore::default();
+        handle_world(&mut s, &world(0, vec![(m, cells)]));
+        let tick = 100 * u64::from(u32::MAX); // multiple de COW_EVERY et GROW_EVERY
+        let expected = s.mountains[&m].clone().step(tick);
+        assert!(expected.len() > 6000);
+        let msgs = handle_tick(&mut s, &Tick { tick });
+        assert!(msgs.len() > 1);
+        for e in &msgs {
+            let b = postcard::to_allocvec(e).unwrap();
+            assert!(b.len() <= MAX_FOOD_MSG_BYTES, "{} octets", b.len());
+            assert_eq!(decode::<Events>(&b, MAX_FOOD_MSG_BYTES).as_ref(), Some(e));
+            assert_eq!((e.tick, e.mountain), (tick, m));
+        }
+        let all: Vec<_> = msgs.into_iter().flat_map(|e| e.list).collect();
+        assert_eq!(all, expected, "evenement perdu");
     }
 
     #[test]
