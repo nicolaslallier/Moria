@@ -54,7 +54,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::food::{COW_CAP, CellKind};
+    use crate::food::{CellKind, HERD_CAP, Species};
     use crate::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W, TilePos};
 
     fn p(x: i16, y: i16) -> TilePos {
@@ -69,7 +69,10 @@ mod tests {
     fn roundtrip_every_message() {
         let m = MAX_FOOD_MSG_BYTES;
         let ev = vec![
-            FoodEvent::CowBorn { at: p(1, 2) },
+            FoodEvent::AnimalBorn {
+                species: Species::Sheep,
+                at: p(1, 2),
+            },
             FoodEvent::CropRipe { at: p(3, 4) },
         ];
         let t = Tick { tick: 7 };
@@ -125,7 +128,7 @@ mod tests {
         let cells = |n: usize| {
             (0..n)
                 .map(|i| {
-                    let kind = if i < COW_CAP {
+                    let kind = if i < HERD_CAP {
                         CellKind::Cow
                     } else {
                         CellKind::Field
@@ -145,7 +148,7 @@ mod tests {
         let w = World {
             tick: u64::MAX,
             mountains: (0..10)
-                .map(|i| (MountainId(i), cells(COW_CAP + 4096)))
+                .map(|i| (MountainId(i), cells(HERD_CAP + 4096)))
                 .collect(),
         };
         let b = enc(&w);
