@@ -2,7 +2,7 @@
 
 Jeu multijoueur à la Dwarf Fortress : chaque joueur dirige une forteresse dans sa montagne, avec un héros et des nains autonomes (service d'IA séparé).
 
-Architecture : `server` (TCP 7777, simulation 10 Hz), `dwarf-ai` (IA des nains), `inventory` (inventaire des joueurs, voir « Inventaire »), `worldgen` (génération du monde, une seule fois). Les services communiquent par le RabbitMQ de la pile Infra (`rabbitmq:5672` sur `infra-net`, vhost `moria`, utilisateur `moria`) ; en local, l'override lance un RabbitMQ jetable.
+Architecture : `server` (TCP 7777, simulation 10 Hz), `dwarf-ai` (IA des nains), `inventory` (inventaire des joueurs, voir « Inventaire »), `food` (vaches, cultures, saisons, voir « Nourriture »), `worldgen` (génération du monde, une seule fois). Les services communiquent par le RabbitMQ de la pile Infra (`rabbitmq:5672` sur `infra-net`, vhost `moria`, utilisateur `moria`) ; en local, l'override lance un RabbitMQ jetable.
 
 ## Premier démarrage
 
@@ -40,6 +40,8 @@ Le monde est régénéré (carte 176×96×12 avec forêt, rivière, lac et colli
   5. Chaque joueur recrée son compte.
 
 **Remise à zéro de l'inventaire.** Supprimer `inventory.bin` pendant que l'inventaire tourne ne sert à rien : il réécrit son état en mémoire au lot suivant ou au SIGTERM. Marche à suivre : (1) arrêter le conteneur (`docker stop`, par ex. `docker stop moria-inventory-1`, ou « Stop » dans Portainer) ; (2) `docker run --rm -v moria-inventory:/data alpine rm -f /data/inventory.bin` ; (3) vérifier la file `inventory` dans RabbitMQ et la purger si elle contient des lots : une ancienne graine encore en file l'emporterait sur la nouvelle ; (4) redéployer. `make reset-world` et `docker compose down -v` suppriment déjà le volume `moria-inventory`.
+
+**Remise à zéro de la nourriture.** Même principe pour `food.bin` (volume `moria-food`) : arrêter le conteneur `food`, `docker run --rm -v moria-food:/data alpine rm -f /data/food.bin`, purger la file `food` dans RabbitMQ si elle contient des lots, redéployer. Une réinitialisation du monde doit aussi supprimer `food.bin` : sinon vaches et cultures de l'ancien monde réapparaissent. `docker compose down -v` supprime déjà le volume `moria-food`.
 
 **Attention :** le volume du compose s'appelle `moria-data` globalement, quel que soit le nom du projet. `make reset-world`, `docker compose down -v` ou la suppression du volume `moria-data` détruit donc ce monde sur la machine, même depuis un autre projet Compose.
 
@@ -80,6 +82,14 @@ Sur le routeur, rediriger le port **7777/TCP** vers `192.168.2.10:7777`. Aucun a
 ## Inventaire
 
 Le service `inventory` possède l'inventaire des joueurs et le sauvegarde dans `/data/inventory.bin` (`MORIA_INVENTORY_FILE`), sur le volume `moria-inventory`, avec une sauvegarde finale à l'arrêt. `server` en garde un cache alimenté par le bus. S'il tombe, le jeu continue sur ce cache ; les règles de nourriture et de faim sont inchangées.
+
+## Nourriture
+
+Le service `food` possède les vaches, les cultures et les saisons, et les sauvegarde dans `/data/food.bin` (`MORIA_FOOD_FILE`), sur le volume `moria-food`, avec une sauvegarde finale à l'arrêt. Les saisons sont une fonction du tick : 4 saisons de 7 jours chacune, rien n'est stocké.
+
+S'il tombe, vaches et cultures sont gelées et la faim et les repas sont en pause ; creuser et récolter continuent de fonctionner.
+
+**Ordre de déploiement.** Le serveur tourne désormais toujours en mode bus : nourriture et repas restent gelés tant que `moria-food` ne tourne pas et n'envoie pas son battement de cœur. Déployer `moria-food` avec (ou avant) le serveur. La stack doit démarrer avec `MORIA_AMQP_PASSWORD` défini (voir plus haut).
 
 ## Plusieurs services d'IA
 

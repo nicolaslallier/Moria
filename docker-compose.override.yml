@@ -23,6 +23,11 @@ services:
     build: { <<: *build, args: { BIN: moria-inventory } }
     environment: *amqp
     networks: [default]
+  food:
+    image: moria-food:local
+    build: { <<: *build, args: { BIN: moria-food } }
+    environment: *amqp
+    networks: [default]
 
   # Pas d'Infra en local : broker jetable, compte guest sur le vhost par défaut.
   rabbitmq:

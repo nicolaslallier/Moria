@@ -63,6 +63,18 @@ services:
     networks: [infra-net]
     restart: unless-stopped
 
+  # Propriétaire des vaches et des cultures (/data/food.bin). Le commit du bot CI réécrit le tag
+  # ci-dessous à chaque build sur main.
+  food:
+    image: ghcr.io/nicolaslallier/moria-food:sha-55fedb4a1603633d782875013252e051868a9a69
+    # Sauvegarde finale sur SIGTERM.
+    stop_grace_period: 30s
+    volumes: ["moria-food:/data"]
+    environment:
+      AMQP_URL: *amqp
+    networks: [infra-net]
+    restart: unless-stopped
+
 networks:
   infra-net:
     external: true
@@ -72,3 +84,5 @@ volumes:
     name: moria-data
   moria-inventory:
     name: moria-inventory
+  moria-food:
+    name: moria-food
