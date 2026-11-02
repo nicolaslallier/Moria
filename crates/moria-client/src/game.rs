@@ -509,7 +509,8 @@ impl Game {
     /// The `Inspect` request to send now, if the panel needs one.
     pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
         if self.inspect.is_none() {
-            // Closed: reopening the same target asks at once.
+            // Closed: reopening the same target asks at once. Relies on this running every
+            // frame (the `inspect_poll` system), so a close is always seen here.
             self.inspect_asked = None;
         }
         if !inspect_due(self.inspect, self.inspect_asked, now) {
@@ -596,7 +597,10 @@ impl Game {
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
         self.hungry.clone_from(&d.hungry);
-        for _ in &d.died {
+        for id in &d.died {
+            if self.inspect == Some(InspectTarget::Dwarf(*id)) {
+                self.close_menus_inspect();
+            }
             self.say(tr("Un nain est mort de faim", "A dwarf starved to death"));
         }
         self.tick = d.tick;
@@ -1101,6 +1105,22 @@ pub(crate) mod tests {
         d.died = vec![DwarfId(1)];
         g.apply_tick(&d);
         assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+    }
+
+    #[test]
+    fn died_inspected_dwarf_closes_panel() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!((g.inspect, g.inspection), (None, None));
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+        // Another dwarf's death leaves the panel open.
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(2)));
+        g.apply_tick(&d);
+        assert!(g.inspect.is_some());
     }
 
     #[test]

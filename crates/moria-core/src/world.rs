@@ -445,6 +445,8 @@ pub fn load(path: &Path) -> io::Result<World> {
 
 /// The v5 save layout (`Dwarf` and `Hero` without vitals), loaded with full vitals.
 /// postcard is not self-describing: an old layout needs its own structs.
+/// It reuses the live `Region`/`Mountain`/`Account`/`DigJob`/`DwarfTask` types: a future
+/// change to their serialized shape must freeze copies of them here.
 mod v5 {
     use super::{Account, DigJob, DwarfTask, FOOD_MAX, HEALTH_MAX, Region};
     use crate::srd::{Abilities, Class, Race};
@@ -514,6 +516,8 @@ mod v5 {
                     .map(|d| super::Dwarf {
                         task: d.task,
                         hungry: d.hungry,
+                        // A hungry dwarf shows an empty gauge; `ticks_alive` restarts at 0.
+                        food: if d.hungry { 0 } else { FOOD_MAX },
                         ..super::Dwarf::new(d.id, d.pos)
                     })
                     .collect();
@@ -980,12 +984,20 @@ mod tests {
                 dig: None,
                 move_cooldown: 1,
             }),
-            dwarves: vec![old::Dwarf {
-                id: DwarfId(7),
-                pos,
-                task: None,
-                hungry: true,
-            }],
+            dwarves: vec![
+                old::Dwarf {
+                    id: DwarfId(7),
+                    pos,
+                    task: None,
+                    hungry: true,
+                },
+                old::Dwarf {
+                    id: DwarfId(8),
+                    pos,
+                    task: None,
+                    hungry: false,
+                },
+            ],
             resources: Resources::default(),
         };
         let old = old::World {
@@ -1010,8 +1022,10 @@ mod tests {
         let f = &w.fortresses[&MountainId(0)];
         let d = &f.dwarves[0];
         assert_eq!((d.id, d.pos, d.hungry), (DwarfId(7), pos, true));
-        assert_eq!((d.food, d.health), (FOOD_MAX, HEALTH_MAX));
+        // A hungry dwarf loads with an empty gauge, a fed one with a full gauge.
+        assert_eq!((d.food, d.health), (0, HEALTH_MAX));
         assert_eq!((d.ticks_alive, d.jobs_done), (0, 0));
+        assert_eq!(f.dwarves[1].food, FOOD_MAX);
         let h = f.hero.as_ref().unwrap();
         assert_eq!((h.name.as_str(), h.move_cooldown), ("Gimli", 1));
         assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));

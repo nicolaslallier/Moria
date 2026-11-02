@@ -547,23 +547,24 @@ fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
     };
     let mut v = vec![
         (
-            tr("Faim", "Food").to_string(),
+            tr("Satiété", "Food").to_string(),
             format!("{} %", u32::from(i.food) * 100 / u32::from(FOOD_MAX)),
         ),
         (
             tr("Santé", "Health").to_string(),
             format!("{} / {HEALTH_MAX}", i.health),
         ),
-        (
+    ];
+    // The server sends no age or job count for the hero.
+    if matches!(t, InspectTarget::Dwarf(_)) {
+        v.push((
             tr("Âge", "Age").to_string(),
             format!(
                 "{:.1} {}",
                 i.ticks_alive as f64 / DAY_TICKS as f64,
                 tr("j", "d")
             ),
-        ),
-    ];
-    if matches!(t, InspectTarget::Dwarf(_)) {
+        ));
         v.push((tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()));
     }
     v
@@ -1008,7 +1009,7 @@ mod tests {
         });
         let l = inspect_lines(&g, t);
         assert_eq!(l.len(), known + 4);
-        assert!(l.contains(&("Faim".into(), "50 %".into())));
+        assert!(l.contains(&("Satiété".into(), "50 %".into())));
         assert!(l.contains(&("Santé".into(), "100 / 100".into())));
         assert!(l.contains(&("Âge".into(), "1.5 j".into())));
         assert!(l.contains(&("Tâches".into(), "12".into())));
@@ -1019,8 +1020,9 @@ mod tests {
             ..g.inspection.unwrap()
         });
         let l = inspect_lines(&g, InspectTarget::Hero);
-        assert!(l.iter().any(|(k, _)| k == "Faim"));
+        assert!(l.iter().any(|(k, _)| k == "Satiété"));
         assert!(!l.iter().any(|(k, _)| k == "Tâches"));
+        assert!(!l.iter().any(|(k, _)| k == "Âge"));
         // A reply for another target adds nothing.
         assert_eq!(inspect_lines(&g, t).len(), known);
     }
