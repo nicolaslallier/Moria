@@ -8,7 +8,8 @@ use bevy::prelude::States;
 use moria_core::GROUND_Z;
 use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
-    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
+    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, InspectTarget, Reject, ServerMsg,
+    TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
@@ -263,6 +264,8 @@ pub struct Game {
     pub map_rev: u32,
     /// Status page (key C) open.
     pub status: bool,
+    /// Creature shown in the status panel (middle click).
+    pub inspect: Option<moria_core::protocol::InspectTarget>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
     /// Highlighted row of the pause menu, for keyboard and gamepad.
@@ -426,6 +429,7 @@ impl Game {
             memory: None,
             map_rev: 0,
             status: false,
+            inspect: None,
             pause: false,
             pause_sel: 0,
             pause_pick: false,
@@ -488,6 +492,18 @@ impl Game {
                 }
             }
         }
+    }
+
+    /// Creature on this tile of level `z`: hero first, then the first dwarf.
+    pub fn inspect_at(&self, tile: (i16, i16), z: u8) -> Option<InspectTarget> {
+        let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
+        if at(self.hero.pos) {
+            return Some(InspectTarget::Hero);
+        }
+        self.dwarves
+            .iter()
+            .find(|(_, p, _)| at(*p))
+            .map(|(id, _, _)| InspectTarget::Dwarf(*id))
     }
 
     pub fn current_z(&self) -> u8 {
@@ -770,6 +786,31 @@ pub(crate) mod tests {
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)
+    }
+
+    #[test]
+    fn inspect_at_prefers_hero_over_dwarf() {
+        let mut g = game();
+        g.dwarves = vec![(DwarfId(1), p(2, 1, 0), None)];
+        assert_eq!(g.inspect_at((2, 1), 0), Some(InspectTarget::Hero));
+    }
+
+    #[test]
+    fn inspect_at_finds_dwarf_on_current_level() {
+        let mut g = game();
+        g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
+        assert_eq!(
+            g.inspect_at((3, 1), 0),
+            Some(InspectTarget::Dwarf(DwarfId(1)))
+        );
+    }
+
+    #[test]
+    fn inspect_at_ignores_other_levels_and_empty_tiles() {
+        let mut g = game();
+        g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
+        assert_eq!(g.inspect_at((3, 1), 1), None);
+        assert_eq!(g.inspect_at((4, 1), 0), None);
     }
 
     /// 6×6×3 rock; floor at (1..=3, 1, 0); stairs at (1,1,0)-(1,1,1).

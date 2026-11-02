@@ -1,5 +1,5 @@
 use crate::srd::{Abilities, Class, Race};
-use crate::{DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
+use crate::{CowId, DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read};
 
@@ -81,6 +81,14 @@ pub struct DwarfJob {
 }
 
 /// A dwarf as clients see it; `None` is idle.
+/// What the status panel looks at.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectTarget {
+    Hero,
+    Dwarf(DwarfId),
+    Cow(CowId),
+}
+
 pub type DwarfState = (DwarfId, TilePos, Option<DwarfJob>);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
