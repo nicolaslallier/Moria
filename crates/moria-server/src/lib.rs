@@ -12,7 +12,7 @@ use inventory::InvSync;
 use metrics::{M, inc};
 use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::inventory::{Batch, State as InvState};
-use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
+use moria_core::protocol::{FortressView, HeroView, InspectTarget, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, FOOD_MAX, HEALTH_MAX, Hero, World};
 use moria_core::{MountainId, PlayerId, TilePos};
@@ -86,6 +86,11 @@ pub enum Request {
         name: String,
         race: Race,
         class: Class,
+    },
+    /// A query: answered to `player` alone, without touching the world.
+    Inspect {
+        player: PlayerId,
+        target: InspectTarget,
     },
 }
 
@@ -499,6 +504,16 @@ impl State {
                 });
                 self.send_snapshot(player, m);
             }
+            Request::Inspect { player, target } => {
+                // No hero yet: the session is still at character creation, ignore.
+                let has_hero = self
+                    .mountain_of(player)
+                    .is_some_and(|m| self.w.fortresses[&m].hero.is_some());
+                if has_hero {
+                    let r = sim::inspect(&self.w, player, target);
+                    self.send(player, ServerMsg::Inspected(r));
+                }
+            }
         }
     }
 
@@ -736,5 +751,58 @@ mod tests {
                 .any(|b| !b.seed && b.mountain == MountainId(0) && b.add != Default::default()),
             "no add batch for the dig: {got:?}"
         );
+    }
+
+    /// Players 0 and 1 connected; returns their session queues.
+    fn connect_both(s: &mut State) -> [mpsc::Receiver<ServerMsg>; 2] {
+        [0, 1].map(|i| {
+            let (tx, rx) = mpsc::channel(8);
+            s.sessions.insert(PlayerId(i), tx);
+            rx
+        })
+    }
+
+    #[test]
+    fn inspect_reply_goes_only_to_asker() {
+        use moria_core::protocol::InspectTarget;
+        let (mut s, _) = state();
+        let [mut a, mut b] = connect_both(&mut s);
+        let id = s.w.fortresses[&MountainId(0)].dwarves[0].id;
+        s.request(Request::Inspect {
+            player: PlayerId(0),
+            target: InspectTarget::Dwarf(id),
+        });
+        let Ok(ServerMsg::Inspected(Some(i))) = a.try_recv() else {
+            panic!("asker gets Inspected")
+        };
+        assert_eq!(i.target, InspectTarget::Dwarf(id));
+        assert!(b.try_recv().is_err(), "nothing for the other player");
+        s.request(Request::Inspect {
+            player: PlayerId(1),
+            target: InspectTarget::Dwarf(id),
+        });
+        assert_eq!(b.try_recv().unwrap(), ServerMsg::Inspected(None));
+        assert!(a.try_recv().is_err());
+    }
+
+    #[test]
+    fn inspect_without_hero_is_ignored() {
+        use moria_core::protocol::InspectTarget;
+        let (mut s, _) = state();
+        let [mut a, _b] = connect_both(&mut s);
+        s.w.fortresses.get_mut(&MountainId(0)).unwrap().hero = None;
+        let id = s.w.fortresses[&MountainId(0)].dwarves[0].id;
+        for target in [InspectTarget::Hero, InspectTarget::Dwarf(id)] {
+            s.request(Request::Inspect {
+                player: PlayerId(0),
+                target,
+            });
+        }
+        // Unknown player (no fortress): ignored too.
+        s.request(Request::Inspect {
+            player: PlayerId(77),
+            target: InspectTarget::Hero,
+        });
+        assert!(a.try_recv().is_err());
     }
 }

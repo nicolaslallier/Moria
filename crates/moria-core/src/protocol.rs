@@ -8,7 +8,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -46,6 +46,8 @@ pub enum ClientMsg {
         dir: Dir,
         add: u8,
     },
+    /// Asks for one creature's vitals; answered by `ServerMsg::Inspected`.
+    Inspect(InspectTarget),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -80,7 +82,6 @@ pub struct DwarfJob {
     pub working: bool,
 }
 
-/// A dwarf as clients see it; `None` is idle.
 /// What the status panel looks at.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InspectTarget {
@@ -89,6 +90,7 @@ pub enum InspectTarget {
     Cow(CowId),
 }
 
+/// A dwarf as clients see it; `None` is idle.
 pub type DwarfState = (DwarfId, TilePos, Option<DwarfJob>);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -120,14 +122,29 @@ pub struct TickDelta {
     pub died: Vec<DwarfId>,
 }
 
+/// One creature's vitals, for the status panel.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inspection {
+    pub target: InspectTarget,
+    pub food: u16,
+    pub health: u16,
+    pub ticks_alive: u64,
+    pub jobs_done: u32,
+}
+
 // One Tick moved per tick per client: boxing it buys nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
-    Welcome { player: PlayerId, needs_hero: bool },
+    Welcome {
+        player: PlayerId,
+        needs_hero: bool,
+    },
     Reject(Reject),
     Snapshot(Box<FortressView>),
     Tick(TickDelta),
+    /// Answer to `ClientMsg::Inspect`; `None` = not found (unknown, dead or not yours).
+    Inspected(Option<Inspection>),
 }
 
 /// u32 big-endian length prefix, then the postcard body.
@@ -208,6 +225,21 @@ mod tests {
         let r = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch { server: 1 }))
             .unwrap();
         assert_eq!(r, [1, 0, 1]);
+    }
+    #[test]
+    fn inspect_roundtrip() {
+        let q = ClientMsg::Inspect(InspectTarget::Dwarf(DwarfId(7)));
+        assert_eq!(decode::<ClientMsg>(&encode(&q)[4..]).unwrap(), q);
+        let a = ServerMsg::Inspected(Some(Inspection {
+            target: InspectTarget::Hero,
+            food: 3,
+            health: 4,
+            ticks_alive: 1 << 40,
+            jobs_done: 9,
+        }));
+        assert_eq!(decode::<ServerMsg>(&encode(&a)[4..]).unwrap(), a);
+        let none = ServerMsg::Inspected(None);
+        assert_eq!(decode::<ServerMsg>(&encode(&none)[4..]).unwrap(), none);
     }
     #[test]
     fn oversized_frame_rejected() {

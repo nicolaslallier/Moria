@@ -3,12 +3,12 @@
 
 use moria_core::ai::Assignments;
 use moria_core::path::{find_path, work_spot_goal};
-use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
+use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, InspectTarget, Inspection, TickDelta};
 use moria_core::srd::hero_dig_ticks;
 use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, HEALTH_MAX, Hero, World};
 use moria_core::{
-    DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, Resources, Tile,
-    TilePos,
+    DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, PlayerId, Resources,
+    Tile, TilePos,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -73,9 +73,34 @@ impl Command {
             ClientMsg::CancelDesignation { a, b } => Command::Cancel { a, b },
             ClientMsg::Use(d) => Command::Use(d),
             ClientMsg::Order { dir, add } => Command::Order { dir, add },
-            ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
+            // Handshake, or a query answered outside the tick.
+            ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } | ClientMsg::Inspect(_) => {
+                return None;
+            }
         })
     }
+}
+
+/// `t`'s vitals, looked up only in `owner`'s fortress; `None` if not found there.
+pub fn inspect(w: &World, owner: PlayerId, t: InspectTarget) -> Option<Inspection> {
+    let f = w.fortresses.values().find(|f| f.owner == owner)?;
+    let (food, health, ticks_alive, jobs_done) = match t {
+        InspectTarget::Hero => f.hero.as_ref().map(|h| (h.food, h.health, 0, 0))?,
+        InspectTarget::Dwarf(id) => f
+            .dwarves
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| (d.food, d.health, d.ticks_alive, d.jobs_done))?,
+        // ponytail: cows carry no vitals yet (stage 3).
+        InspectTarget::Cow(_) => return None,
+    };
+    Some(Inspection {
+        target: t,
+        food,
+        health,
+        ticks_alive,
+        jobs_done,
+    })
 }
 
 /// Changes caused by commands, folded into that tick's delta. Designations per tile:
@@ -2558,5 +2583,60 @@ mod tests {
         assert!(!ids(&w).contains(&id));
         assert_eq!(w.next_dwarf, next, "never goes back");
         assert!(id.0 < w.next_dwarf);
+    }
+
+    #[test]
+    fn inspect_returns_dwarf_vitals() {
+        use moria_core::protocol::{InspectTarget as T, Inspection};
+        let mut w = setup();
+        let d = &mut w.fortresses.get_mut(&M).unwrap().dwarves[1];
+        (d.food, d.health, d.ticks_alive, d.jobs_done) = (40, 55, 1234, 7);
+        let id = d.id;
+        assert_eq!(
+            inspect(&w, PlayerId(1), T::Dwarf(id)),
+            Some(Inspection {
+                target: T::Dwarf(id),
+                food: 40,
+                health: 55,
+                ticks_alive: 1234,
+                jobs_done: 7,
+            })
+        );
+        let h = inspect(&w, PlayerId(1), T::Hero).unwrap();
+        assert_eq!(
+            (h.food, h.health, h.ticks_alive, h.jobs_done),
+            (FOOD_MAX, HEALTH_MAX, 0, 0)
+        );
+        assert_eq!(inspect(&w, PlayerId(1), T::Cow(moria_core::CowId(0))), None);
+    }
+
+    #[test]
+    fn inspect_unknown_or_dead_dwarf_is_none() {
+        use moria_core::protocol::InspectTarget as T;
+        let mut w = setup();
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(DwarfId(9999))), None);
+        let id = starve(&mut w, 0);
+        step(&mut w);
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(id)), None);
+        assert_eq!(inspect(&w, PlayerId(42), T::Hero), None, "no fortress");
+        w.fortresses.get_mut(&M).unwrap().hero = None;
+        assert_eq!(inspect(&w, PlayerId(1), T::Hero), None, "no hero");
+    }
+
+    #[test]
+    fn inspect_cannot_read_another_players_dwarf() {
+        use moria_core::protocol::InspectTarget as T;
+        let mut w = setup();
+        let other = claim_mountain(&mut w, PlayerId(2)).unwrap();
+        let theirs = w.fortresses[&other].dwarves[0].id;
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(theirs)), None);
+        assert!(inspect(&w, PlayerId(2), T::Dwarf(theirs)).is_some());
+        assert_eq!(inspect(&w, PlayerId(2), T::Dwarf(ids(&w)[0])), None);
+    }
+
+    #[test]
+    fn inspect_is_not_a_command() {
+        use moria_core::protocol::InspectTarget as T;
+        assert_eq!(Command::from_client(ClientMsg::Inspect(T::Hero)), None);
     }
 }

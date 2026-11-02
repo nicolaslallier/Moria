@@ -265,7 +265,7 @@ pub struct Game {
     /// Status page (key C) open.
     pub status: bool,
     /// Creature shown in the status panel (middle click).
-    pub inspect: Option<moria_core::protocol::InspectTarget>,
+    pub inspect: Option<InspectTarget>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
     /// Highlighted row of the pause menu, for keyboard and gamepad.
@@ -719,6 +719,8 @@ impl Session {
                 }
                 false
             }
+            // The status panel does not ask yet (Task 8).
+            NetEvent::Msg(ServerMsg::Inspected(_)) => false,
             NetEvent::Disconnected(reason) => {
                 // Before login, the reason shows on the login screen itself.
                 let to = match self.screen {
