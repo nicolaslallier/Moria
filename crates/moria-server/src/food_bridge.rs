@@ -69,8 +69,8 @@ pub struct Link {
     pub up_at: Option<Instant>,
     /// When the last `World` went out; `None` = send one as soon as the container is up.
     world_at: Option<Instant>,
-    /// Fortresses in the last `World`: a new one needs a new `World`.
-    world_len: usize,
+    /// Mountains in the last `World`: another set needs a new `World`.
+    world_ids: Vec<MountainId>,
     /// Tick of the last heartbeat: going back means the container restarted.
     status_tick: u64,
     inbox: Vec<Events>,
@@ -90,7 +90,7 @@ impl Link {
             rx,
             up_at: None,
             world_at: None,
-            world_len: 0,
+            world_ids: vec![],
             status_tick: 0,
             inbox: vec![],
             touched: HashMap::new(),
@@ -150,7 +150,9 @@ impl Link {
                 tracing::warn!("evenements nourriture ignores: montagne inconnue {id:?}");
                 continue;
             };
-            let rejected = if ev.tick + MAX_EVENT_AGE < tick {
+            // The tick is untrusted: one from the future (an older save restarted) or too
+            // old is refused whole.
+            let rejected = if ev.tick > tick || ev.tick.saturating_add(MAX_EVENT_AGE) < tick {
                 ev.list
             } else {
                 // A ripe proposed before the tile's last harvest or sowing is stale.
@@ -171,7 +173,7 @@ impl Link {
 
         if !self.up(now) {
             self.world_at = None;
-        } else if self.world_len != w.fortresses.len()
+        } else if !w.fortresses.keys().eq(&self.world_ids)
             || self
                 .world_at
                 .is_none_or(|t| now.saturating_duration_since(t) >= WORLD_EVERY)
@@ -185,7 +187,7 @@ impl Link {
                 .collect();
             if self.send(Outgoing::World(World { tick, mountains })) {
                 self.world_at = Some(now);
-                self.world_len = w.fortresses.len();
+                self.world_ids = w.fortresses.keys().copied().collect();
             }
         }
         for (&id, list) in acts {
@@ -526,6 +528,51 @@ mod tests {
             tick(&mut l, &mut w, &[], t0);
         }
         assert!(l.touched.is_empty());
+    }
+
+    #[test]
+    fn untrusted_event_ticks_are_refused() {
+        let (mut l, (mut out, inc)) = link();
+        let mut w = setup();
+        w.tick = 1_000;
+        let c = p(-6, 1, 0);
+        cow_pen(&mut w, c, &[Dir::N]);
+        let good = FoodEvent::CowMoved {
+            from: c,
+            to: c.step(Dir::N),
+        };
+        for bad_tick in [u64::MAX, 5_000] {
+            inc.try_send(Incoming::Events(Events {
+                tick: bad_tick,
+                mountain: M,
+                list: vec![good],
+            }))
+            .unwrap();
+            tick(&mut l, &mut w, &[], Instant::now()); // must not panic
+            let v = sent(&mut out);
+            let r = rejects(&v);
+            assert_eq!(r.len(), 1, "tick {bad_tick}");
+            assert_eq!((r[0].tick, &r[0].list), (bad_tick, &vec![good]));
+            assert_eq!(w.mountains[&M].get(c), Some(Tile::Cow), "future: refused");
+        }
+    }
+
+    #[test]
+    fn world_is_resent_when_the_fortresses_change() {
+        let (mut l, (mut out, inc)) = link();
+        let mut w = setup();
+        let t0 = Instant::now();
+        beat(&inc);
+        tick(&mut l, &mut w, &[], t0);
+        assert_eq!(worlds(&sent(&mut out)).len(), 1);
+        // one fortress gone, another claimed: same count, other mountains
+        let f = w.fortresses.remove(&M).unwrap();
+        w.fortresses.insert(MountainId(5), f);
+        beat(&inc);
+        tick(&mut l, &mut w, &[], secs(t0, 1));
+        let v = sent(&mut out);
+        assert_eq!(worlds(&v).len(), 1);
+        assert_eq!(worlds(&v)[0].mountains[0].0, MountainId(5));
     }
 
     #[test]
