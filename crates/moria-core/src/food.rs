@@ -1,12 +1,14 @@
 //! Food simulation model: cows and fields with hidden state, kept in step with the server's grid.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::TilePos;
 use crate::calendar::{Season, season};
 use crate::light::DAY_TICKS;
+use crate::{MountainId, TilePos};
 
 /// Ticks between two grazing steps of the herd.
 pub const COW_EVERY: u64 = 10;
@@ -260,6 +262,60 @@ impl FoodSim {
     /// Tick of the last `adopt`, 0 before the first.
     pub fn adopted_at(&self) -> u64 {
         self.adopted_at
+    }
+}
+
+/// On-disk format version of `food.bin`.
+const FOOD_VERSION: u32 = 1;
+
+/// Hidden food state of every mountain, persisted as `food.bin`.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct FoodStore {
+    pub mountains: BTreeMap<MountainId, FoodSim>,
+}
+
+impl FoodStore {
+    /// Atomic write: temp file, `sync_all`, rename, parent-directory fsync.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let mut bytes = FOOD_VERSION.to_le_bytes().to_vec();
+        bytes.extend(postcard::to_allocvec(self).map_err(io::Error::other)?);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        // Sans fsync du dossier, un crash de l'hote peut perdre le rename. Best effort.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Missing file gives the empty store; anything unreadable is an error, never a silent reset.
+    pub fn load_or_default(path: &Path) -> io::Result<FoodStore> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FoodStore::default()),
+            Err(e) => return Err(e),
+        };
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let Some((v, body)) = bytes.split_first_chunk::<4>() else {
+            return Err(bad("nourriture tronquée".into()));
+        };
+        match u32::from_le_bytes(*v) {
+            FOOD_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+            n => Err(bad(format!("nourriture v{n} non supportée"))),
+        }
     }
 }
 
@@ -673,5 +729,61 @@ mod tests {
         s.reject(&FoodEvent::CropRipe { at: p(3, 3) });
         assert!(!s.is_ripe(p(3, 3)));
         assert_eq!(s.fields[&p(3, 3)].progress, 0);
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("moria-food-{}-{name}", std::process::id()))
+    }
+
+    fn seeded_store() -> FoodStore {
+        let mut sim = FoodSim::new(7);
+        sim.adopt(
+            &[cell(p(1, 1), CellKind::Cow), cell(p(2, 2), CellKind::Crop)],
+            5,
+        );
+        let mut st = FoodStore::default();
+        st.mountains.insert(MountainId(1), sim);
+        st
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let path = tmp("roundtrip");
+        let s = seeded_store();
+        s.save(&path).unwrap();
+        assert_eq!(FoodStore::load_or_default(&path).unwrap(), s);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_missing_file_is_default() {
+        let path = tmp("missing");
+        assert_eq!(
+            FoodStore::load_or_default(&path).unwrap(),
+            FoodStore::default()
+        );
+    }
+
+    #[test]
+    fn load_rejects_garbage_and_truncated() {
+        let path = tmp("garbage");
+        std::fs::write(&path, [1, 2, 3]).unwrap();
+        assert!(FoodStore::load_or_default(&path).is_err());
+        seeded_store().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(FoodStore::load_or_default(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_newer_version() {
+        let path = tmp("newer");
+        seeded_store().save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(&(FOOD_VERSION + 1).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(FoodStore::load_or_default(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 }
