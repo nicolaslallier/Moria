@@ -13,6 +13,19 @@ pub fn set_en(on: bool) {
     EN.store(on, Ordering::Relaxed);
 }
 
+/// Langue envoyée au roi avec chaque question.
+pub fn lang() -> moria_core::king::Lang {
+    talk_lang(en())
+}
+
+fn talk_lang(en: bool) -> moria_core::king::Lang {
+    if en {
+        moria_core::king::Lang::En
+    } else {
+        moria_core::king::Lang::Fr
+    }
+}
+
 /// The text in the current language.
 pub fn tr(fr: &'static str, en_text: &'static str) -> &'static str {
     if en() { en_text } else { fr }
@@ -140,5 +153,23 @@ mod tests {
         for l in labels {
             assert!(english(l).is_some(), "no English for {l:?}");
         }
+    }
+
+    /// Les textes du roi passent par `tr` (paires par construction) ; le catalogue des
+    /// quêtes, lui, est une table : chaque quête a un titre et une description par langue.
+    #[test]
+    fn lang_has_both_languages_for_every_new_string() {
+        use crate::game::quest_text;
+        use moria_core::king::{Lang, QuestId};
+        for id in QuestId::ALL {
+            let (fr, en) = (quest_text(id, Lang::Fr), quest_text(id, Lang::En));
+            for t in [fr.0, fr.1, en.0, en.1] {
+                assert!(!t.is_empty(), "{id:?}");
+            }
+            assert!(fr.0 != en.0 && fr.1 != en.1, "{id:?}");
+        }
+        // Langue du client par défaut : français, envoyée telle quelle dans `Talk`.
+        assert_eq!(talk_lang(false), Lang::Fr);
+        assert_eq!(talk_lang(true), Lang::En);
     }
 }

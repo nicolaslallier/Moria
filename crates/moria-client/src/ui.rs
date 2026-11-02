@@ -3,19 +3,21 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, ability_rows,
-    available_text, build_text, clock_label, level_label, mode_label, recipe_label, resource_bar,
-    stock_text, workshop_label,
+    ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, Who, ability_rows,
+    available_text, build_text, clock_label, level_label, mode_label, quest_progress, quest_text,
+    recipe_label, resource_bar, stock_text, workshop_label,
 };
-use crate::lang::{en, set_en, tr, word};
+use crate::lang::{en, lang, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
+use moria_core::king::{MAX_TALK_CHARS, quest_def};
 use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
 use std::path::PathBuf;
+use std::time::Instant;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
 
@@ -52,7 +54,14 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (
-                    top_bar, hud, action_bar, build_menu, order_menu, status, pause_menu,
+                    top_bar,
+                    hud,
+                    action_bar,
+                    build_menu,
+                    order_menu,
+                    king_dialog,
+                    status,
+                    pause_menu,
                 )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
@@ -396,6 +405,115 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     g.pick_order(i)
 }
 
+fn king_dialog(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if let Some(m) = king_window(ctx.ctx_mut()?, g, Instant::now()) {
+        client.send(m);
+    }
+    Ok(())
+}
+
+/// Id du champ de saisie : seul contrôle du dialogue qui garde le focus.
+const KING_INPUT: &str = "roi_saisie";
+
+/// Dialogue avec le roi : journal, saisie, Accepter, remise de la nourriture.
+fn king_window(ctx: &egui::Context, g: &mut Game, now: Instant) -> Option<ClientMsg> {
+    g.dialog.as_ref()?;
+    let waiting = g.dialog_waiting(now);
+    let accept = g.can_accept();
+    let turn_in = g.can_turn_in();
+    let quest = quest_lines(g);
+    let d = g.dialog.as_mut()?;
+    let (mut out, mut send) = (None, false);
+    centered(tr("Le roi nain", "The dwarf king")).show(ctx, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for (who, text) in &d.log {
+                    let name = match who {
+                        Who::Player => tr("Vous : ", "You: "),
+                        Who::King => tr("Le roi : ", "The king: "),
+                    };
+                    ui.label(format!("{name}{text}"));
+                }
+            });
+        if waiting {
+            ui.weak(tr("Le roi réfléchit…", "The king is thinking…"));
+        }
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut d.input)
+                .id(egui::Id::new(KING_INPUT))
+                .char_limit(MAX_TALK_CHARS)
+                .hint_text(tr("Votre question au roi", "Your question to the king"))
+                .desired_width(f32::INFINITY),
+        );
+        // Entrée rend le focus au jeu : on l'envoie, puis le champ le reprend aussitôt.
+        send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        r.request_focus();
+        ui.small(format!("{} / {MAX_TALK_CHARS}", d.input.chars().count()));
+        // Les boutons rendent le focus : Tab puis Espace ou Entrée ne doit rien accepter.
+        if let Some(id) = accept {
+            let title = quest_text(id, lang()).0;
+            let r = ui.button(format!("{}{title}", tr("Accepter : ", "Accept: ")));
+            r.surrender_focus();
+            if r.clicked() {
+                out = Some(ClientMsg::AcceptQuest(id));
+            }
+        }
+        if let Some(lines) = &quest {
+            ui.separator();
+            quest_panel(ui, lines);
+        }
+        if turn_in {
+            let r = ui.button(tr("Remettre la nourriture", "Hand in food"));
+            r.surrender_focus();
+            if r.clicked() {
+                out = Some(ClientMsg::TurnIn);
+            }
+        }
+        ui.small(tr(
+            "Entrée : parler · Échap : fermer",
+            "Enter: speak · Esc: close",
+        ));
+    });
+    if send {
+        out = out.or_else(|| g.send_talk(now, lang()));
+    }
+    out
+}
+
+/// Quête active : titre, description, avancement, récompense.
+fn quest_lines(g: &Game) -> Option<[String; 4]> {
+    let q = g.quest?;
+    let (title, desc) = quest_text(q.id, lang());
+    let reward = resource_bar(quest_def(q.id).reward)
+        .iter()
+        .filter(|r| r.0 > 0)
+        .map(|r| format!("{} {}", r.0, word(r.1)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Some([
+        format!("{}{title}", tr("Quête : ", "Quest: ")),
+        desc.into(),
+        format!(
+            "{}{}",
+            tr("Avancement : ", "Progress: "),
+            quest_progress(g, q)
+        ),
+        format!("{}{reward}", tr("Récompense : ", "Reward: ")),
+    ])
+}
+
+fn quest_panel(ui: &mut egui::Ui, [title, desc, progress, reward]: &[String; 4]) {
+    ui.strong(title);
+    ui.label(desc);
+    ui.label(progress);
+    ui.label(reward);
+}
+
 /// Bottom bar: one button per action, the current one highlighted.
 fn action_bar(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let Some(g) = &mut client.session.game else {
@@ -582,11 +700,16 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 word(g.hero.class.label_fr())
             ));
             ui.label(mode_label(g.mode));
+            if let Some(lines) = quest_lines(g) {
+                ui.separator();
+                quest_panel(ui, &lines);
+                ui.separator();
+            }
             ui.small(tr(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler · Échap : menu",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · E à côté du roi : lui parler · glisser clic gauche : désigner · clic droit : annuler · Échap : menu",
                 "WASD (ZQSD on AZERTY)/arrows: walk · Space: dig or chop (in build mode: build) · < > or Q/E (A/E on AZERTY): stairs or level \
-                 · X: next mode · 1, 2, 3, 4 or bottom bar: dig, stairs, build, chop · C: status · F: use (door, workshop) · left-drag: designate · right-click: cancel · Esc: menu",
+                 · X: next mode · 1, 2, 3, 4 or bottom bar: dig, stairs, build, chop · C: status · F: use (door, workshop) · E next to the king: talk · left-drag: designate · right-click: cancel · Esc: menu",
             ));
             ui.small(tr(
                 "Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
@@ -722,6 +845,8 @@ fn pause_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::Dialog;
+    use moria_core::king::{Quest, QuestId, quest_def};
     use moria_core::{DesignationKind, Resources};
 
     #[test]
@@ -1020,5 +1145,173 @@ mod tests {
         assert!(!parse_prefs("a\nb\nfr\n").1);
         assert!(!parse_prefs("a\nb\nmellon\n").1); // older file: 3rd line was the invite
         assert!(!parse_prefs("").1);
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Une frame de `king_window` : textes peints (avec leur rect) et message éventuel.
+    fn king_frame(
+        ctx: &egui::Context,
+        g: &mut Game,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, egui::Rect)>, Option<ClientMsg>) {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut msg = None;
+        let mut out = ctx.run_ui(input, |ui| msg = king_window(ui.ctx(), g, Instant::now()));
+        out.textures_delta.clear();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => {
+                    Some((t.galley.text().to_owned(), s.shape.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .collect();
+        (texts, msg)
+    }
+
+    /// Les textes du dialogue après deux frames (une fenêtre neuve est cachée à la première).
+    fn king_texts(g: &mut Game) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        king_frame(&ctx, g, vec![]);
+        king_frame(&ctx, g, vec![]).0
+    }
+
+    fn shows(texts: &[(String, egui::Rect)], prefix: &str) -> bool {
+        texts.iter().any(|t| t.0.starts_with(prefix))
+    }
+
+    /// Clique sur le texte commençant par `prefix` ; renvoie le message envoyé.
+    fn click(g: &mut Game, prefix: &str) -> Option<ClientMsg> {
+        let ctx = egui::Context::default();
+        king_frame(&ctx, g, vec![]);
+        let (texts, _) = king_frame(&ctx, g, vec![]);
+        let at = texts
+            .iter()
+            .find(|t| t.0.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {texts:?}"))
+            .1
+            .center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        king_frame(&ctx, g, vec![egui::Event::PointerMoved(at), button(true)]);
+        king_frame(&ctx, g, vec![button(false)]).1
+    }
+
+    fn with_dialog(offer: Option<QuestId>) -> Game {
+        let mut g = crate::game::tests::game();
+        g.dialog = Some(Dialog {
+            offer,
+            ..Default::default()
+        });
+        g
+    }
+
+    #[test]
+    fn accept_button_appears_only_with_an_offer() {
+        assert!(!shows(&king_texts(&mut with_dialog(None)), "Accepter"));
+        let mut g = with_dialog(Some(QuestId::Food));
+        assert!(shows(&king_texts(&mut g), "Accepter"));
+        // Déjà une quête en cours, ou celle-ci déjà faite : pas de bouton.
+        g.quest = Some(Quest {
+            id: QuestId::Depth,
+            baseline: 0,
+        });
+        assert!(!shows(&king_texts(&mut g), "Accepter"));
+        g.quest = None;
+        g.done = vec![QuestId::Food];
+        assert!(!shows(&king_texts(&mut g), "Accepter"));
+    }
+
+    #[test]
+    fn accept_sends_accept_quest_with_the_offered_id() {
+        let mut g = with_dialog(Some(QuestId::ForgeDoors));
+        assert_eq!(
+            click(&mut g, "Accepter"),
+            Some(ClientMsg::AcceptQuest(QuestId::ForgeDoors))
+        );
+    }
+
+    #[test]
+    fn turn_in_button_only_for_active_food_quest_in_reach() {
+        let label = "Remettre la nourriture";
+        let mut g = with_dialog(None);
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        g.resources.food = quest_def(QuestId::Food).target;
+        assert!(!shows(&king_texts(&mut g), label));
+        g.quest = Some(Quest {
+            id: QuestId::Food,
+            baseline: 0,
+        });
+        assert!(shows(&king_texts(&mut g), label));
+        assert_eq!(click(&mut g, label), Some(ClientMsg::TurnIn));
+        g.king = moria_core::TilePos::new(0, 0, 0);
+        assert!(!shows(&king_texts(&mut g), label));
+    }
+
+    #[test]
+    fn enter_sends_the_question_and_shows_the_king_thinking() {
+        let mut g = with_dialog(None);
+        let ctx = egui::Context::default();
+        king_frame(&ctx, &mut g, vec![]);
+        // Entrée sur un champ vide : rien ne part.
+        assert_eq!(
+            king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]).1,
+            None
+        );
+        king_frame(&ctx, &mut g, vec![egui::Event::Text("Salut".into())]);
+        let (_, msg) = king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Talk {
+                text: "Salut".into(),
+                lang: crate::lang::lang(),
+            })
+        );
+        let (texts, _) = king_frame(&ctx, &mut g, vec![]);
+        assert!(shows(&texts, "Le roi réfléchit"), "{texts:?}");
+    }
+
+    /// Tab puis Espace ou Entrée ne doivent jamais presser Accepter ni la remise.
+    #[test]
+    fn king_dialog_never_takes_focus_by_accident() {
+        let mut g = with_dialog(Some(QuestId::Food));
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        g.resources.food = 100;
+        g.quest = None;
+        let ctx = egui::Context::default();
+        let input = egui::Id::new(KING_INPUT);
+        for k in [
+            egui::Key::Tab,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Enter,
+            egui::Key::Tab,
+            egui::Key::Tab,
+            egui::Key::Space,
+        ] {
+            let (_, msg) = king_frame(&ctx, &mut g, vec![key(k)]);
+            assert_eq!(msg, None, "{k:?}");
+            let f = ctx.memory(|m| m.focused());
+            assert!(f.is_none() || f == Some(input), "{k:?}: {f:?}");
+        }
+        assert!(g.dialog.is_some());
     }
 }

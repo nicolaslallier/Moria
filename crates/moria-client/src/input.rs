@@ -1,7 +1,7 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
+use crate::game::{Dialog, Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
@@ -52,10 +52,18 @@ struct Intent {
     use_: bool,
     /// Gamepad Start: the pause menu (the keyboard uses Escape, `close_menu`).
     pause: bool,
+    /// `E` à côté du roi : ouvre le dialogue au lieu de descendre.
+    talk: bool,
 }
 
-fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
+fn keyboard_intent(
+    keys: &ButtonInput<KeyCode>,
+    logical: &ButtonInput<Key>,
+    near_king: bool,
+) -> Intent {
     let ch = |s: &str| logical.just_pressed(Key::Character(s.into()));
+    // `E` contextuel : parler au roi à côté de lui, sinon descendre ; `>` descend toujours.
+    let e = keys.just_pressed(KeyCode::KeyE);
     Intent {
         // Held keys keep walking; the cooldown paces them.
         walk: MOVES
@@ -63,7 +71,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             .find(|(a, b, _)| keys.pressed(*a) || keys.pressed(*b))
             .map(|&(_, _, d)| d),
         up: ch("<") || keys.just_pressed(KeyCode::KeyQ),
-        down: ch(">") || keys.just_pressed(KeyCode::KeyE),
+        down: ch(">") || (e && !near_king),
         dig: keys.just_pressed(KeyCode::Space),
         toggle: keys.just_pressed(KeyCode::KeyX),
         mode: if keys.just_pressed(KeyCode::Digit1) {
@@ -80,6 +88,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         status: keys.just_pressed(KeyCode::KeyC),
         use_: keys.just_pressed(KeyCode::KeyF),
         pause: false,
+        talk: e && near_king,
     }
 }
 
@@ -220,7 +229,7 @@ fn play(
     let Some(g) = &mut client.session.game else {
         return;
     };
-    let k = keyboard_intent(&keys, &logical);
+    let k = keyboard_intent(&keys, &logical, g.near_king());
     // gilrs keeps reporting pads in the background; only a focused window plays.
     let (stick, menu_dir) = &mut *prev;
     let p = if window.focused {
@@ -234,6 +243,10 @@ fn play(
     } else if p.close_menu {
         g.close_menus();
         g.pause = false;
+    }
+    // Dialogue ouvert : le clavier sert à la saisie (egui), rien n'atteint le héros ni les menus.
+    if g.dialog.is_some() {
+        return;
     }
     // Pause menu open: moves and the action button drive it, nothing reaches the hero.
     if g.pause {
@@ -266,6 +279,10 @@ fn play(
         for m in out {
             client.send(m);
         }
+        return;
+    }
+    if k.talk {
+        g.dialog = Some(Dialog::default());
         return;
     }
     let mut out = vec![];
@@ -372,7 +389,7 @@ mod tests {
     fn key_4_picks_chop() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::Digit4);
-        let i = keyboard_intent(&keys, &ButtonInput::default());
+        let i = keyboard_intent(&keys, &ButtonInput::default(), false);
         assert_eq!(i.mode, Some(DesignationKind::Chop));
     }
 
@@ -380,7 +397,7 @@ mod tests {
     fn key_f_is_use() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyF);
-        assert!(keyboard_intent(&keys, &ButtonInput::default()).use_);
+        assert!(keyboard_intent(&keys, &ButtonInput::default(), false).use_);
     }
 
     #[test]
@@ -416,7 +433,7 @@ mod tests {
     fn key_c_toggles_status() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyC);
-        assert!(keyboard_intent(&keys, &ButtonInput::default()).status);
+        assert!(keyboard_intent(&keys, &ButtonInput::default(), false).status);
     }
 
     #[test]
@@ -451,5 +468,71 @@ mod tests {
         assert_eq!(pad_dir(r, l, None), Some(Dir::E));
         assert_eq!(pad_dir(Vec2::ZERO, r, None), Some(Dir::E));
         assert_eq!(pad_dir(Vec2::ZERO, Vec2::ZERO, Some(Dir::N)), None);
+    }
+
+    #[test]
+    fn e_talks_when_king_is_adjacent_else_goes_down() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyE);
+        let near = keyboard_intent(&keys, &ButtonInput::default(), true);
+        assert!(near.talk && !near.down);
+        let far = keyboard_intent(&keys, &ButtonInput::default(), false);
+        assert!(far.down && !far.talk);
+    }
+
+    #[test]
+    fn greater_than_always_goes_down() {
+        let mut logical = ButtonInput::<Key>::default();
+        logical.press(Key::Character(">".into()));
+        for near in [true, false] {
+            let i = keyboard_intent(&ButtonInput::default(), &logical, near);
+            assert!(i.down && !i.talk, "near = {near}");
+        }
+    }
+
+    /// Une frame de `play` avec `pressed` enfoncées ; renvoie la partie.
+    fn play_frame(g: crate::game::Game, pressed: &[KeyCode]) -> crate::game::Game {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut w = World::new();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        for &k in pressed {
+            keys.press(k);
+        }
+        w.insert_resource(keys);
+        w.insert_resource(ButtonInput::<Key>::default());
+        w.insert_resource(Time::<()>::default());
+        w.insert_resource(Client {
+            session: crate::game::Session {
+                game: Some(g),
+                ..Default::default()
+            },
+            net: None,
+        });
+        w.spawn((Window::default(), PrimaryWindow));
+        w.run_system_once(play).unwrap();
+        w.resource_mut::<Client>().session.game.take().unwrap()
+    }
+
+    #[test]
+    fn typing_in_dialog_does_not_move_the_hero() {
+        let keys = [KeyCode::KeyD, KeyCode::KeyC, KeyCode::Digit3, KeyCode::KeyE];
+        // Témoin : sans dialogue, D fait bien marcher le héros.
+        let g = play_frame(crate::game::tests::game(), &[KeyCode::KeyD]);
+        assert_ne!(g.hero.pos, crate::game::tests::game().hero.pos);
+        let mut g = crate::game::tests::game();
+        let start = g.hero.pos;
+        g.dialog = Some(crate::game::Dialog::default());
+        let g = play_frame(g, &keys);
+        assert_eq!(g.hero.pos, start);
+        assert!(!g.status && !g.build_menu && g.browse_z.is_none());
+        assert!(g.dialog.is_some());
+    }
+
+    #[test]
+    fn e_next_to_the_king_opens_the_dialog() {
+        let mut g = crate::game::tests::game();
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        let g = play_frame(g, &[KeyCode::KeyE]);
+        assert!(g.dialog.is_some() && g.browse_z.is_none());
     }
 }
