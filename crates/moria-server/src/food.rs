@@ -40,7 +40,8 @@ pub fn validate(m: &Mountain, f: &Fortress, ev: &FoodEvent) -> bool {
 }
 
 /// Applies the valid events to the grid in order and records their tiles; returns the
-/// rejected ones.
+/// rejected ones. Tests only: both modes go through `apply_bus_events`.
+#[cfg(test)]
 pub fn apply_events(
     m: &mut Mountain,
     f: &Fortress,
@@ -174,7 +175,8 @@ pub fn step(
             if tick.saturating_sub(sim.adopted_at()) >= RESYNC_EVERY {
                 sim.adopt(&snapshot(m), tick);
             }
-            for ev in apply_events(m, f, &sim.step(tick), &mut ch.tiles) {
+            // Same checks as the bus (cap, birth next to a cow); no stale ripe in process.
+            for ev in apply_bus_events(m, f, &sim.step(tick), |_| false, &mut ch.tiles) {
                 sim.reject(&ev);
             }
         }
@@ -597,6 +599,31 @@ mod tests {
             assert_eq!(cows(&w), herd, "a moving cow is neither lost nor cloned");
         }
         assert!(seen.contains(&(c, Tile::Grass)) && seen.contains(&(c.step(Dir::N), Tile::Cow)));
+    }
+
+    #[test]
+    fn in_process_births_obey_the_herd_cap() {
+        let mut w = setup();
+        w.tick = SEASON_TICKS; // summer: births
+        let m = w.mountains.get_mut(&M).unwrap();
+        for q in on_ground(m, Tile::Cow) {
+            m.set(q, Tile::Grass);
+        }
+        let c = p(-6, 1, 0);
+        cow_pen(&mut w, c, &[Dir::N, Dir::E]);
+        let mut sims = InProcess::default();
+        run(&mut w, &mut sims); // the sim adopts the grid: one cow
+        // cows the sim does not know of yet (until its next resync): the herd is full
+        let m = w.mountains.get_mut(&M).unwrap();
+        for i in 0..COW_CAP as i16 {
+            m.set(p(-6 - i, 8, 0), Tile::Cow);
+        }
+        let herd = cows(&w);
+        assert_eq!(herd, COW_CAP + 1);
+        for _ in 0..2_000 {
+            run(&mut w, &mut sims);
+            assert!(cows(&w) <= herd, "a birth over the cap");
+        }
     }
 
     #[test]
