@@ -506,12 +506,21 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             }
             if d.hungry {
                 if tick.is_multiple_of(HUNGER_DAMAGE_EVERY) {
-                    d.health = d.health.saturating_sub(1); // death is handled elsewhere
+                    d.health = d.health.saturating_sub(1);
                 }
             } else if tick.is_multiple_of(REGEN_EVERY) {
                 d.health = (d.health + 1).min(HEALTH_MAX);
             }
         }
+        // Death: the dwarf and its task go. Claims are read from tasks, so its designation is
+        // free again; the AI drops unknown ids (`apply_assignments`); ids are never reused.
+        let died: Vec<_> = f
+            .dwarves
+            .iter()
+            .filter(|d| d.health == 0)
+            .map(|d| d.id)
+            .collect();
+        f.dwarves.retain(|d| d.health > 0);
 
         let hero_spare = hero_spare(f);
         if let Some(h) = f.hero.as_mut() {
@@ -679,6 +688,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     .filter(|d| d.hungry)
                     .map(|d| d.id)
                     .collect(),
+                died,
             };
             ch.merge_into(&mut d);
             out.insert(id, d);
@@ -2388,11 +2398,7 @@ mod tests {
             step(&mut w);
         }
         assert_eq!(dwarf0(&mut w).health, HEALTH_MAX - 1);
-        dwarf0(&mut w).health = 0;
-        for _ in 0..HUNGER_DAMAGE_EVERY {
-            step(&mut w);
-        }
-        assert_eq!(dwarf0(&mut w).health, 0, "saturates at zero");
+        // Reaching zero is death: see the `dies` tests.
     }
 
     #[test]
@@ -2441,5 +2447,116 @@ mod tests {
         }
         let h = w.fortresses[&M].hero.as_ref().unwrap();
         assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));
+    }
+
+    /// Dwarf `i` is one hunger hit from death, and the next step deals it. Returns its id.
+    fn starve(w: &mut World, i: usize) -> DwarfId {
+        res(w).food = 0;
+        w.tick = HUNGER_DAMAGE_EVERY;
+        let d = &mut w.fortresses.get_mut(&M).unwrap().dwarves[i];
+        d.hungry = true;
+        d.health = 1;
+        d.id
+    }
+    fn ids(w: &World) -> Vec<DwarfId> {
+        w.fortresses[&M].dwarves.iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn dwarf_dies_at_zero_health() {
+        let mut w = setup();
+        let id = starve(&mut w, 0);
+        step(&mut w);
+        assert_eq!(w.fortresses[&M].dwarves.len(), 2);
+        assert!(!ids(&w).contains(&id));
+    }
+
+    #[test]
+    fn dies_reported_in_tick_delta() {
+        let mut w = setup();
+        let id = starve(&mut w, 0);
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(d.died, vec![id]);
+        assert!(d.dwarves.iter().all(|s| s.0 != id));
+        assert!(!d.hungry.contains(&id));
+        assert!(step(&mut w)[&M].died.is_empty(), "reported once");
+    }
+
+    #[test]
+    fn dies_dead_dwarf_releases_its_designation() {
+        let mut w = setup();
+        let c = p(-3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        w.mountains
+            .get_mut(&M)
+            .unwrap()
+            .set(c.step(Dir::E), Tile::Grass);
+        designate(&mut w, c, DesignationKind::Chop);
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = c.step(Dir::E);
+        starve(&mut w, 0);
+        assign(&mut w, 0, c);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some(), "harvesting");
+        step(&mut w); // dies mid-task
+        assert!(!claimed(&w, M).contains(&c));
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = c.step(Dir::E);
+        assign(&mut w, 0, c);
+        assert_eq!(
+            w.fortresses[&M].dwarves[0].task.as_ref().map(|t| t.target),
+            Some(c),
+            "another dwarf takes the harvest"
+        );
+    }
+
+    #[test]
+    fn famine_ends_when_last_hungry_dwarf_dies() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        starve(&mut w, 0);
+        let seen = |w: &World| {
+            view_mountain(&w.mountains[&M], &w.fortresses[&M])
+                .designations
+                .contains_key(&rock)
+        };
+        assert!(!seen(&w), "famine hides the dig");
+        step(&mut w);
+        assert!(seen(&w), "the famine died with the last hungry dwarf");
+    }
+
+    #[test]
+    fn last_dwarf_dies_without_panic() {
+        let mut w = setup();
+        let dead: Vec<_> = (0..3).map(|i| starve(&mut w, i)).collect();
+        let d = step(&mut w).remove(&M).unwrap();
+        assert!(w.fortresses[&M].dwarves.is_empty());
+        assert_eq!(d.died, dead);
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(dead[0], rock)],
+            },
+        );
+        view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert!(claimed(&w, M).is_empty());
+        assert_eq!(occupied(&w, M), vec![hero(&w).pos]);
+        for _ in 0..HUNGER_DAMAGE_EVERY * 2 {
+            step(&mut w);
+        }
+        assert!(hero(&w).health > 0, "the hero never dies");
+    }
+
+    #[test]
+    fn dies_dead_dwarf_id_not_reused() {
+        let mut w = setup();
+        let next = w.next_dwarf;
+        let id = starve(&mut w, 2);
+        step(&mut w);
+        assert!(!ids(&w).contains(&id));
+        assert_eq!(w.next_dwarf, next, "never goes back");
+        assert!(id.0 < w.next_dwarf);
     }
 }

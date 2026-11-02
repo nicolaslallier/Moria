@@ -932,6 +932,7 @@ pub(crate) mod tests {
     fn tick(hero_pos: TilePos) -> TickDelta {
         TickDelta {
             hungry: vec![],
+            died: vec![],
             tick: 1,
             hero_pos,
             dwarves: vec![],

@@ -116,8 +116,12 @@ pub struct TickDelta {
     pub orders: Vec<(TilePos, u8)>,
     /// Dwarves that missed a meal and do not work (the full list, every tick).
     pub hungry: Vec<DwarfId>,
+    /// Dwarves that died this tick (starved); their ids are never reused.
+    pub died: Vec<DwarfId>,
 }
 
+// One Tick moved per tick per client: boxing it buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
     Welcome { player: PlayerId, needs_hero: bool },
