@@ -33,7 +33,7 @@ jobs:
   image:
     strategy:
       matrix:
-        bin: [moria-server, moria-dwarf-ai, moria-worldgen, moria-inventory]
+        bin: [moria-server, moria-dwarf-ai, moria-worldgen, moria-inventory, moria-king]
     runs-on: ubuntu-latest
     permissions:
       contents: read
