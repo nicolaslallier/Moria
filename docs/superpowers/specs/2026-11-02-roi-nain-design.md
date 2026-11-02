@@ -191,12 +191,11 @@ consigne explicite « si tu ne sais pas, dis-le ».
 - **Délais** : 60 s est un plafond, pas un objectif ; le but reste quelques secondes. À ramener
   autour de 20 s si les mesures le permettent.
 
-## Question ouverte pour Nicolas
+## Décision : quêtes uniques **[Décidé par Nicolas, 2026-11-02]**
 
-Les quêtes sont-elles **uniques** (chacune une seule fois par montagne) ou **répétables** ? Unique
-oblige à sauvegarder la liste des quêtes terminées et limite le contenu à quatre quêtes ; répétable
-fait du roi une source infinie de ressources, à équilibrer par les montants. Valeur par défaut si
-tu ne tranches pas : **uniques**.
+Chaque quête ne se fait qu'**une fois par montagne**. `Fortress` sauvegarde donc la liste des
+quêtes terminées (avec `SAVE_VERSION` 6), et `Ask` n'offre que celles qui ne le sont pas. Le
+design est **approuvé** par Nicolas.
 
 ## Tests attendus (RED d'abord)
 
