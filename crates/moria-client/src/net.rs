@@ -259,7 +259,7 @@ mod smoke {
         let cfg = moria_server::Config {
             data,
             bind: addr,
-            nats_url: None,
+            amqp_url: None,
             invite: Some("secret".into()),
             max_per_ip: 4,
         };

@@ -1,14 +1,17 @@
-//! Central server. One task owns the `World` and ticks at 10 Hz; sessions and the NATS
+//! Central server. One task owns the `World` and ticks at 10 Hz; sessions and the bus
 //! bridge talk to it only through bounded channels. The world task never awaits a session
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
 pub mod bridge;
+mod inventory;
 pub mod metrics;
 pub mod net;
 pub mod sim;
 
+use inventory::InvSync;
 use metrics::{M, inc};
 use moria_core::ai::{AiView, Assignments, DwarfView};
+use moria_core::inventory::{Batch, State as InvState};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, Hero, World};
@@ -43,12 +46,15 @@ const MAX_CMDS_PER_PLAYER: usize = 32;
 const MAX_QUEUED_PER_PLAYER: usize = 256;
 const MAX_REQS_PER_TICK: usize = 64;
 const MAX_ASSIGN_PER_TICK: usize = 16;
+const MAX_STATES_PER_TICK: usize = 16;
+/// Batches queued for the bridge; a full channel drops (logged and counted), never blocks.
+const BATCH_CHANNEL: usize = 65_536;
 
 pub struct Config {
     pub data: PathBuf,
     pub bind: SocketAddr,
-    /// `None` disables the NATS bridge.
-    pub nats_url: Option<String>,
+    /// `None` disables the AI bridge.
+    pub amqp_url: Option<String>,
     /// Invite code required to create a new account; `None` means open registration.
     pub invite: Option<String>,
     /// Concurrent connections allowed per source IP.
@@ -148,15 +154,30 @@ pub async fn run_with_listener(
         ),
         Err(e) => anyhow::bail!("lecture du monde {} impossible : {e}", cfg.data.display()),
     };
+    let world_mtime_ms = std::fs::metadata(&cfg.data)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
     let (req_tx, req_rx) = mpsc::channel(256);
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (assign_tx, assign_rx) = mpsc::channel(64);
-    let mut view_tx = None;
-    let bridge = cfg.nats_url.clone().map(|url| {
+    let (states_tx, states_rx) = mpsc::channel(16);
+    let (mut view_tx, mut batch_tx) = (None, None);
+    let bridge = cfg.amqp_url.clone().map(|url| {
         let (tx, rx) = mpsc::channel(16);
         view_tx = Some(tx);
+        let (btx, brx) = mpsc::channel(BATCH_CHANNEL);
+        batch_tx = Some(btx);
         let known = w.mountains.keys().copied().collect();
-        tokio::spawn(bridge::run(url, known, rx, assign_tx.clone()))
+        tokio::spawn(bridge::run(
+            url,
+            known,
+            rx,
+            assign_tx.clone(),
+            brx,
+            states_tx,
+        ))
     });
     drop(assign_tx);
 
@@ -212,7 +233,21 @@ pub async fn run_with_listener(
         }
     });
 
+    // The inventory tells runs apart by epoch: wall-clock ms, lifted above world.bin's mtime.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let epoch = start_epoch(now_ms, world_mtime_ms);
+    tracing::info!("époque de l'inventaire : {epoch}");
+    let inv = if cfg.amqp_url.is_some() {
+        InvSync::new("server", epoch)
+    } else {
+        InvSync::disabled()
+    };
     let state = State {
+        inv,
+        batch_tx,
+        states_rx,
         w,
         data: cfg.data,
         sessions: HashMap::new(),
@@ -226,13 +261,30 @@ pub async fn run_with_listener(
     };
     let r = state.run(shutdown).await;
     accept.abort();
-    if let Some(b) = bridge {
+    // The state is gone, so the bridge's channels are closed: let it flush what is left.
+    if let Some(mut b) = bridge
+        && tokio::time::timeout(Duration::from_secs(5), &mut b)
+            .await
+            .is_err()
+    {
+        tracing::warn!("le pont n'a pas fini d'envoyer les lots d'inventaire en 5 s, arrêt forcé");
         b.abort();
     }
     r
 }
 
+/// Wall-clock ms, but never below the world file's mtime + 1: world.bin is rewritten during
+/// and at the end of every run, so its mtime is past the previous run's epoch even when the
+/// clock was set back (a lower epoch makes the inventory discard every batch).
+fn start_epoch(now_ms: u64, world_mtime_ms: Option<u64>) -> u64 {
+    world_mtime_ms.map_or(now_ms, |m| now_ms.max(m.saturating_add(1)))
+}
+
 struct State {
+    inv: InvSync,
+    /// `None` without a bridge: batches are dropped.
+    batch_tx: Option<mpsc::Sender<Batch>>,
+    states_rx: mpsc::Receiver<InvState>,
     w: World,
     data: PathBuf,
     sessions: HashMap<PlayerId, mpsc::Sender<ServerMsg>>,
@@ -279,10 +331,21 @@ impl State {
         M.sessions.store(self.sessions.len() as i64, Relaxed);
         M.accounts.store(self.w.accounts.len() as i64, Relaxed);
         M.fortresses.store(self.w.fortresses.len() as i64, Relaxed);
+        let up = M.bus_up.load(Relaxed) == 1 && self.inv.inventory_up(std::time::Instant::now());
+        M.nats_connected.store(up as i64, Relaxed);
     }
 
     fn step(&mut self) {
         self.sessions.retain(|_, tx| !tx.is_closed());
+        for _ in 0..MAX_STATES_PER_TICK {
+            let Ok(st) = self.states_rx.try_recv() else {
+                break;
+            };
+            self.inv.on_state(st);
+        }
+        // Every change to `Fortress.resources` happens in sim::step (requests and commands
+        // never touch them), so begin_tick .. end_tick brackets them all.
+        self.inv.begin_tick(&mut self.w);
         // Bounded drains: senders on other threads cannot keep the tick looping.
         for _ in 0..MAX_REQS_PER_TICK {
             let Ok(r) = self.req_rx.try_recv() else { break };
@@ -296,6 +359,14 @@ impl State {
         }
         let mut changes = self.commands();
         let deltas = sim::step(&mut self.w);
+        for b in self.inv.end_tick(&self.w) {
+            if let Some(tx) = &self.batch_tx
+                && tx.try_send(b).is_err()
+            {
+                inc(&M.inventory_dropped);
+                tracing::error!("lot d'inventaire perdu: file du pont pleine");
+            }
+        }
         for (m, mut d) in deltas {
             if let Some(ch) = changes.remove(&m) {
                 ch.merge_into(&mut d);
@@ -538,7 +609,16 @@ mod tests {
     use moria_core::DesignationKind;
 
     fn state() -> (State, mpsc::Sender<(PlayerId, Command)>) {
-        let mut w = world::generate(1);
+        let (s, tx, _) = state_with_batches();
+        (s, tx)
+    }
+
+    fn state_with_batches() -> (
+        State,
+        mpsc::Sender<(PlayerId, Command)>,
+        mpsc::Receiver<Batch>,
+    ) {
+        let mut w = world::generate(7);
         for i in 0..2 {
             let m = world::claim_mountain(&mut w, PlayerId(i)).unwrap();
             let pos = entrance(&w, m).unwrap();
@@ -557,7 +637,12 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::channel(1);
         let (cmd_tx, cmd_rx) = mpsc::channel(4096);
         let (_assign_tx, assign_rx) = mpsc::channel(1);
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL);
+        let (_states_tx, states_rx) = mpsc::channel(1);
         let s = State {
+            inv: InvSync::new("server", 1),
+            batch_tx: Some(batch_tx),
+            states_rx,
             w,
             data: PathBuf::new(),
             sessions: HashMap::new(),
@@ -569,7 +654,7 @@ mod tests {
             saving: None,
             pending: HashMap::new(),
         };
-        (s, cmd_tx)
+        (s, cmd_tx, batch_rx)
     }
 
     /// A tile of the mountain's rock, `x` tiles east of its foot.
@@ -601,5 +686,51 @@ mod tests {
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
         assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
+    }
+
+    #[test]
+    fn epoch_never_below_world_mtime() {
+        assert_eq!(start_epoch(1_000, Some(5_000)), 5_001);
+        assert_eq!(start_epoch(5_000, Some(5_000)), 5_001);
+    }
+
+    #[test]
+    fn epoch_uses_clock_when_ahead() {
+        assert_eq!(start_epoch(9_000, Some(5_000)), 9_000);
+    }
+
+    #[test]
+    fn epoch_falls_back_without_mtime() {
+        assert_eq!(start_epoch(1_000, None), 1_000);
+    }
+
+    #[test]
+    fn step_sends_a_batch_for_a_dig_yield() {
+        let (mut s, cmd, mut batches) = state_with_batches();
+        // Stand at the entrance's east edge, facing rock.
+        let m = s.w.fortresses.get_mut(&MountainId(0)).unwrap();
+        m.hero.as_mut().unwrap().pos =
+            TilePos::new(world::ENTRANCE_X.end - 1, 46, moria_core::GROUND_Z);
+        cmd.try_send((PlayerId(0), Command::Dig(moria_core::Dir::E)))
+            .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            s.step();
+            while let Ok(b) = batches.try_recv() {
+                got.push(b);
+            }
+            if got.iter().any(|b| !b.seed && b.add != Default::default()) {
+                break;
+            }
+        }
+        assert!(
+            got.iter().filter(|b| b.seed).count() == 2,
+            "one seed per mountain: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|b| !b.seed && b.mountain == MountainId(0) && b.add != Default::default()),
+            "no add batch for the dig: {got:?}"
+        );
     }
 }

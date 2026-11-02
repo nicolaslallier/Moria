@@ -676,7 +676,7 @@ mod tests {
         }
     }
 
-    /// NATS refuses messages over its max_payload (1 MiB by default); keep half of it spare.
+    /// The bus (RabbitMQ) has a message size limit; keep half of 1 MiB spare.
     #[test]
     fn worst_case_ai_view_fits_in_half_a_nats_message() {
         use crate::ai::{AiView, DwarfView, MAX_DWARVES_PER_VIEW};

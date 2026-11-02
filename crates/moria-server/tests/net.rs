@@ -40,7 +40,7 @@ impl Server {
         let cfg = Config {
             data: data.clone(),
             bind: addr,
-            nats_url: None,
+            amqp_url: None,
             invite: invite.map(Into::into),
             max_per_ip,
         };
@@ -317,7 +317,7 @@ async fn missing_world_file_is_an_error() {
     let cfg = Config {
         data: std::env::temp_dir().join("moria-net-does-not-exist/world.bin"),
         bind: listener.local_addr().unwrap(),
-        nats_url: None,
+        amqp_url: None,
         invite: None,
         max_per_ip: 4,
     };
@@ -566,5 +566,38 @@ async fn create_hero_flood_keeps_server_usable() {
     })
     .await;
     assert!(moved.is_ok(), "flooding session stopped working");
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn game_keeps_running_without_inventory() {
+    // amqp_url is None: the inventory is disabled and Fortress.resources stays authoritative.
+    let s = Server::start("noinv").await;
+    let (mut c, pos) = Client::new_player(&s, "durin").await;
+    // Walk to the entrance's east edge, then dig the rock there.
+    let edge = TilePos::new(moria_core::world::ENTRANCE_X.end - 1, pos.y, pos.z);
+    let got = timeout(Duration::from_secs(20), async {
+        let first = c.next_tick().await.tick;
+        loop {
+            let d = c.next_tick().await;
+            if d.resources.stone > 0 {
+                // Still there on later ticks: nothing overwrites the resources.
+                for _ in 0..5 {
+                    assert!(c.next_tick().await.resources.stone > 0, "yield lost");
+                }
+                break d.tick > first;
+            }
+            c.send(&ClientMsg::Move(Dir::E)).await;
+            if d.hero_pos == edge {
+                c.send(&ClientMsg::Dig(Dir::E)).await;
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        got,
+        Ok(true),
+        "dig yield never reached the hero's resources"
+    );
     s.stop().await;
 }

@@ -1,0 +1,31 @@
+use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // Pas de couleurs hors terminal : Docker → Alloy → Loki garde un texte lisible.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
+    let url = std::env::var("AMQP_URL")
+        .unwrap_or_else(|_| "amqp://moria:moria@rabbitmq:5672/moria".into());
+    let data = PathBuf::from(
+        std::env::var("MORIA_INVENTORY_FILE").unwrap_or_else(|_| "/data/inventory.bin".into()),
+    );
+    moria_inventory::run(url, data, shutdown_signal()).await
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}

@@ -1,4 +1,8 @@
-# Stack Moria. Variable de stack Portainer OBLIGATOIRE : MORIA_INVITE (code d'invitation).
+# Stack Moria. Variables de stack Portainer OBLIGATOIRES : MORIA_INVITE (code d'invitation)
+# et MORIA_AMQP_PASSWORD (mot de passe de l'utilisateur RabbitMQ « moria »). Ce mot de passe est
+# inséré dans l'URL AMQP : il doit être URL-safe (lettres et chiffres seulement).
+# Ordre de déploiement : d'abord le changement Infra (vhost + utilisateur « moria » sur RabbitMQ),
+# ensuite cette stack.
 #
 # Déploiement : Portainer (stack 6) suit main en auto-update GitOps. Les images sont
 # construites par .github/workflows/server.yml, poussées sur GHCR, puis épinglées
@@ -7,10 +11,6 @@
 # En local, docker-compose.override.yml (chargé automatiquement) reconstruit depuis les sources.
 
 services:
-  nats:
-    image: nats:2-alpine
-    restart: unless-stopped
-
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
     image: ghcr.io/nicolaslallier/moria-worldgen:sha-55fedb4a1603633d782875013252e051868a9a69
@@ -32,24 +32,36 @@ services:
       infra-net: { aliases: [moria-server] }
     volumes: ["moria-data:/data"]
     environment:
-      NATS_URL: nats://nats:4222
+      AMQP_URL: &amqp amqp://moria:${MORIA_AMQP_PASSWORD:?définir MORIA_AMQP_PASSWORD dans les variables de la stack Portainer}@rabbitmq:5672/moria
       MORIA_INVITE: ${MORIA_INVITE:?définir MORIA_INVITE dans les variables de la stack Portainer}
       # Derrière nginx, toutes les connexions viennent de l'IP du proxy : la limite par IP
       # réelle est faite par nginx (limit_conn), on neutralise celle du serveur.
       MORIA_MAX_PER_IP: ${MORIA_MAX_PER_IP:-1000}
     restart: unless-stopped
     depends_on:
-      nats: { condition: service_started }
       worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
     image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-55fedb4a1603633d782875013252e051868a9a69
     environment:
-      NATS_URL: nats://nats:4222
+      AMQP_URL: *amqp
+    networks: [infra-net]
     restart: unless-stopped
-    depends_on: [nats]
     deploy:
       replicas: 1
+
+  # Propriétaire de l'inventaire des joueurs (/data/inventory.bin). Le tag ci-dessous est un
+  # épinglage provisoire : le commit du bot CI le remplace au premier build sur main (d'ici là,
+  # le pull peut échouer et être réessayé).
+  inventory:
+    image: ghcr.io/nicolaslallier/moria-inventory:sha-55fedb4a1603633d782875013252e051868a9a69
+    # Sauvegarde finale sur SIGTERM.
+    stop_grace_period: 30s
+    volumes: ["moria-inventory:/data"]
+    environment:
+      AMQP_URL: *amqp
+    networks: [infra-net]
+    restart: unless-stopped
 
 networks:
   infra-net:
@@ -58,3 +70,5 @@ networks:
 volumes:
   moria-data:
     name: moria-data
+  moria-inventory:
+    name: moria-inventory

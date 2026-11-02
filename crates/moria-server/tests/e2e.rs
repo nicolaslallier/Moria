@@ -1,27 +1,30 @@
-//! End-to-end tests: server + dwarf-ai in-process over a real NATS.
-//! Run: NATS_TEST_URL=nats://127.0.0.1:4222 cargo test -p moria-server --test e2e -- --ignored
-use moria_core::TilePos;
+//! End-to-end tests: server + dwarf-ai + inventory in-process over a real RabbitMQ.
+//! Run: AMQP_TEST_URL=amqp://guest:guest@127.0.0.1:5672 cargo test -p moria-server --test e2e -- --ignored
+use futures::StreamExt;
+use moria_bus::{Bus, Queue};
+use moria_core::inventory::{Batch, KEY_APPLY, KEY_STATE, State};
 use moria_core::protocol::{
     ClientMsg, FortressView, PROTOCOL_VERSION, ServerMsg, encode, read_frame_async,
 };
 use moria_core::srd::{Class, Race};
 use moria_core::tile::{DesignationKind, Tile};
 use moria_core::world::{generate, save};
+use moria_core::{Dir, Resources, TilePos};
 use moria_server::{Config, run_with_listener};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-// All tests share one NATS and its subjects: run them one at a time.
+// All tests share one broker and its queues: run them one at a time.
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
-fn nats_url() -> String {
-    std::env::var("NATS_TEST_URL").expect("NATS_TEST_URL")
+fn amqp_url() -> String {
+    std::env::var("AMQP_TEST_URL").expect("AMQP_TEST_URL")
 }
 
 struct Task {
@@ -42,7 +45,7 @@ impl Task {
 
 fn start_ai() -> Task {
     let (stop, rx) = oneshot::channel();
-    let done = tokio::spawn(moria_dwarf_ai::run(nats_url(), async {
+    let done = tokio::spawn(moria_dwarf_ai::run(amqp_url(), async {
         let _ = rx.await;
     }));
     Task { stop, done }
@@ -55,7 +58,7 @@ async fn start_server(data: &Path) -> (Task, SocketAddr) {
     let cfg = Config {
         data: data.to_path_buf(),
         bind: addr,
-        nats_url: Some(nats_url()),
+        amqp_url: Some(amqp_url()),
         invite: None,
         max_per_ip: 1000,
     };
@@ -89,6 +92,8 @@ struct Client {
     s: TcpStream,
     view: FortressView,
     tick: u64,
+    /// Direction of the last dug tile, entered before the next dig.
+    step: Option<Dir>,
 }
 
 impl Client {
@@ -120,6 +125,7 @@ impl Client {
                 s,
                 view: *v,
                 tick: 0,
+                step: None,
             },
             m => panic!("expected snapshot, got {m:?}"),
         }
@@ -313,5 +319,325 @@ async fn restart_server_restores_fortress() {
     assert!(c.view.resources.stone >= 3);
     assert_eq!(c.view.dwarves.len(), 3);
     srv.stop().await;
+    rm(&data);
+}
+
+// ---- Inventory service: flow, outage, restarts -------------------------------------------
+
+fn start_inventory(file: &Path) -> Task {
+    let (stop, rx) = oneshot::channel();
+    let done = tokio::spawn(moria_inventory::run(
+        amqp_url(),
+        file.to_path_buf(),
+        async {
+            let _ = rx.await;
+        },
+    ));
+    Task { stop, done }
+}
+
+fn inventory_file(data: &Path) -> PathBuf {
+    data.parent().unwrap().join("inventory.bin")
+}
+
+/// Latest `inventory.state` seen on the bus (the file and the queue start empty).
+struct Env {
+    _bus: Bus,
+    states: watch::Receiver<State>,
+}
+
+async fn env() -> Env {
+    let bus = Bus::connect(&amqp_url()).await.unwrap();
+    bus.declare(KEY_APPLY, Queue::Durable("inventory"))
+        .await
+        .unwrap();
+    bus.purge("inventory").await.unwrap(); // leftovers of other tests
+    let mut st = bus.subscribe(KEY_STATE, Queue::Exclusive).await.unwrap();
+    let (tx, states) = watch::channel(State::default());
+    tokio::spawn(async move {
+        while let Some(b) = st.next().await {
+            if let Ok(s) = postcard::from_bytes::<State>(&b) {
+                let _ = tx.send(s);
+            }
+        }
+    });
+    Env { _bus: bus, states }
+}
+
+/// Resources of the (only) fortress.
+fn total(s: &State) -> Resources {
+    s.totals.values().next().copied().unwrap_or_default()
+}
+
+impl Client {
+    /// Pumps until a freshly published inventory state satisfies `ok` (bounded, ticks keep being read).
+    async fn until_state(&mut self, env: &Env, ok: impl Fn(&State) -> bool) -> State {
+        // Only states published from now on count: an older one may come from a dead service.
+        let mut rx = env.states.clone();
+        rx.borrow_and_update();
+        for _ in 0..600 {
+            if rx
+                .has_changed()
+                .unwrap_or_else(|_| panic!("state forwarder ended; last seen {:?}", *rx.borrow()))
+            {
+                let s = rx.borrow_and_update().clone();
+                if ok(&s) {
+                    return s;
+                }
+            }
+            self.pump().await;
+        }
+        panic!("inventory state never matched; last {:?}", rx.borrow());
+    }
+
+    /// Hero digs `n` rock tiles, one after the other; returns the stone they yield.
+    async fn dig(&mut self, n: u32) -> u32 {
+        for _ in 0..n {
+            if let Some(d) = self.step.take() {
+                self.s
+                    .write_all(&encode(&ClientMsg::Move(d)))
+                    .await
+                    .unwrap();
+                self.ticks(4).await;
+            }
+            let pos = self.view.hero.pos;
+            let dir = Dir::HORIZONTAL
+                .into_iter()
+                .find(|&d| self.view.mountain.get(pos.step(d)) == Some(Tile::Rock))
+                .expect("rock next to the hero");
+            let t = pos.step(dir);
+            self.s
+                .write_all(&encode(&ClientMsg::Dig(dir)))
+                .await
+                .unwrap();
+            self.until(300, |c| c.view.mountain.get(t) != Some(Tile::Rock))
+                .await;
+            self.step = Some(dir); // entered at the next dig, so callers act right after the yield
+        }
+        n * Tile::Rock.yield_().stone
+    }
+
+    /// Hero builds one wall on a neighbouring floor tile (1 stone).
+    async fn build_wall(&mut self) {
+        let pos = self.view.hero.pos;
+        let dir = Dir::HORIZONTAL
+            .into_iter()
+            .find(|&d| self.view.mountain.get(pos.step(d)) == Some(Tile::Floor))
+            .expect("floor next to the hero");
+        let t = pos.step(dir);
+        self.s
+            .write_all(&encode(&ClientMsg::Build(dir, DesignationKind::Wall)))
+            .await
+            .unwrap();
+        self.until(100, |c| c.view.mountain.get(t) == Some(Tile::Wall))
+            .await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn resources_flow_through_the_inventory() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-flow");
+    let env = env().await;
+    let inv = start_inventory(&inventory_file(&data));
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let start = c.view.resources.stone;
+    let expected = start + c.dig(2).await;
+    assert!(expected > start, "digging yields stone");
+
+    let s = c.until_state(&env, |s| total(s).stone == expected).await;
+    assert_eq!(total(&s).stone, c.view.resources.stone);
+    srv.stop().await;
+    inv.stop().await;
+    let disk = State::load_or_default(&inventory_file(&data)).unwrap();
+    assert_eq!(total(&disk).stone, expected);
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn inventory_outage_keeps_the_game_running() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-outage");
+    let file = inventory_file(&data);
+    let env = env().await;
+    let inv = start_inventory(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let mut expected = c.view.resources.stone;
+    expected += c.dig(1).await;
+    c.until_state(&env, |s| total(s).stone == expected).await;
+
+    inv.stop().await;
+    let t0 = c.tick;
+    expected += c.dig(3).await;
+    c.build_wall().await;
+    expected -= 1;
+    c.ticks(20).await;
+    assert!(c.tick >= t0 + 20, "ticks keep advancing");
+    assert_eq!(
+        c.view.resources.stone, expected,
+        "client keeps seeing its resources"
+    );
+
+    let inv = start_inventory(&file);
+    let s = c.until_state(&env, |s| total(s).stone == expected).await;
+    c.ticks(10).await;
+    assert_eq!(total(&s).stone, c.view.resources.stone);
+    assert_eq!(c.view.resources.stone, expected, "no stone counted twice");
+    srv.stop().await;
+    inv.stop().await;
+    assert_eq!(
+        total(&State::load_or_default(&file).unwrap()).stone,
+        expected
+    );
+    rm(&data);
+}
+
+// Here we wait for the inventory to catch up before stopping; batches still unsent at stop
+// are covered by `server_stop_right_after_a_dig_loses_nothing`.
+#[tokio::test]
+#[ignore]
+async fn server_restart_does_not_drop_batches() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-srv-restart");
+    let file = inventory_file(&data);
+    let env = env().await;
+    let inv = start_inventory(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let mut expected = c.view.resources.stone;
+    expected += c.dig(2).await;
+    c.until_state(&env, |s| total(s).stone == expected).await;
+    drop(c);
+    srv.stop().await; // saves world.bin
+
+    // The restarted server seeds again with the saved stock: ignored, the mountain is seeded.
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    c.until_state(&env, |s| total(s).stone == expected).await;
+    c.until(100, |c| c.view.resources.stone == expected).await;
+    expected += c.dig(2).await;
+    // Reaching `expected` proves the new epoch was accepted, not dropped as stale.
+    c.until_state(&env, |s| total(s).stone == expected).await;
+    srv.stop().await;
+    inv.stop().await;
+    assert_eq!(
+        total(&State::load_or_default(&file).unwrap()).stone,
+        expected
+    );
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn inventory_killed_without_final_save_loses_nothing() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-killed");
+    let file = inventory_file(&data);
+    let env = env().await;
+    let inv = start_inventory(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let mut expected = c.view.resources.stone;
+    expected += c.dig(1).await;
+    c.until_state(&env, |s| total(s).stone == expected).await;
+    // Burst without waiting for the inventory, then kill it right after the last yield, so
+    // batches are in flight. Probabilistic: the ack-before-save ordering is also guarded
+    // structurally by the `step` unit tests in moria-inventory.
+    expected += c.dig(12).await;
+    inv.done.abort(); // no clean shutdown, no final save
+    let _ = inv.done.await;
+    c.ticks(10).await;
+
+    let inv = start_inventory(&file);
+    let s = c.until_state(&env, |s| total(s).stone == expected).await;
+    c.ticks(10).await;
+    assert_eq!(total(&s).stone, c.view.resources.stone);
+    srv.stop().await;
+    inv.stop().await;
+    assert_eq!(
+        total(&State::load_or_default(&file).unwrap()).stone,
+        expected
+    );
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn server_stop_right_after_a_dig_loses_nothing() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-stop-now");
+    let file = inventory_file(&data);
+    let env = env().await;
+    let inv = start_inventory(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let mut expected = c.view.resources.stone;
+    expected += c.dig(12).await;
+    // Stop IMMEDIATELY: the last batches may still be in the bridge's channel or unsent.
+    drop(c);
+    srv.stop().await;
+    let mut rx = env.states.clone();
+    let got = timeout(Duration::from_secs(30), async {
+        loop {
+            if total(&rx.borrow_and_update()).stone == expected {
+                break;
+            }
+            rx.changed().await.expect("state forwarder ended");
+        }
+    })
+    .await;
+    assert!(
+        got.is_ok(),
+        "inventory never reached {expected}; last {:?}",
+        rx.borrow()
+    );
+    inv.stop().await;
+    assert_eq!(
+        total(&State::load_or_default(&file).unwrap()).stone,
+        expected
+    );
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn durable_confirm_latency_report() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("inv-latency");
+    let env = env().await;
+    let inv = start_inventory(&inventory_file(&data));
+    let bus = Bus::connect(&amqp_url()).await.unwrap();
+    let mut ms = Vec::new();
+    for seq in 1..=200u64 {
+        let b = Batch {
+            sender: "latency".into(),
+            epoch: 1,
+            seq,
+            mountain: moria_core::MountainId(0),
+            add: Resources::default(),
+            take: Resources::default(),
+            seed: false,
+        };
+        let bytes = postcard::to_allocvec(&b).unwrap();
+        let t = std::time::Instant::now();
+        bus.publish(KEY_APPLY, bytes, true).await.unwrap();
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg = ms.iter().sum::<f64>() / ms.len() as f64;
+    eprintln!(
+        "durable confirm latency over 200: min {:.2} avg {avg:.2} p95 {:.2} max {:.2} ms",
+        ms[0], ms[189], ms[199]
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while env.states.borrow().acks.get("latency") != Some(&(1, 200)) {
+        assert!(tokio::time::Instant::now() < deadline, "not all applied");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    inv.stop().await;
     rm(&data);
 }

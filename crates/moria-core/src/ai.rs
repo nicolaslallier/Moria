@@ -1,8 +1,8 @@
 use crate::{DwarfId, Mountain, MountainId, TilePos};
 use serde::{Deserialize, Serialize};
 
-pub const SUBJECT_VIEW: &str = "moria.ai.view";
-pub const SUBJECT_ASSIGN: &str = "moria.ai.assign";
+pub const KEY_VIEW: &str = "ai.view";
+pub const KEY_ASSIGN: &str = "ai.assign";
 /// Most dwarves in one view, hence most assignments in one reply.
 pub const MAX_DWARVES_PER_VIEW: usize = 64;
 

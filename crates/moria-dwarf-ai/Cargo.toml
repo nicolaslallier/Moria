@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 moria-core = { path = "../moria-core" }
-async-nats.workspace = true
+moria-bus = { path = "../moria-bus" }
 tokio.workspace = true
 postcard.workspace = true
 serde = { workspace = true }
