@@ -790,9 +790,27 @@ async fn butchered_cow_does_not_come_back() {
     c.until(300, |c| c.view.mountain.get(WEST) != Some(Tile::Cow))
         .await;
     assert_eq!(c.view.resources.food, food0 + Tile::Cow.yield_().food);
-    c.ticks(100).await; // ten cow steps, and the stale proposals they bring
     assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
     assert_eq!(c.cows().len(), herd - 1);
+
+    // Open the pen: the hero steps onto the old tile and chops the trees north and west, so
+    // a ghost of the cow there would have free grass on two sides out of four.
+    c.s.write_all(&encode(&ClientMsg::Move(Dir::W)))
+        .await
+        .unwrap();
+    c.until(50, |c| c.view.hero.pos == WEST).await;
+    for d in [Dir::N, Dir::W] {
+        let t = WEST.step(d);
+        c.s.write_all(&encode(&ClientMsg::Dig(d))).await.unwrap();
+        c.until(300, |c| c.view.mountain.get(t) == Some(Tile::Grass))
+            .await;
+    }
+    // Twenty container steps: a ghost proposing from WEST would get through at once.
+    for _ in 0..200 {
+        c.pump().await;
+        assert_eq!(c.cows().len(), herd - 1, "a cow came back at {}", c.tick);
+    }
+    assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
     drop(c);
     let c = Client::login(addr, "alice").await; // a fresh snapshot says the same
     assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
@@ -822,7 +840,10 @@ async fn food_outage_freezes_food_and_pauses_hunger() {
 
     food.stop().await;
     assert!(c.tick + 170 < meal, "too slow to stop before the meal");
-    c.ticks(60).await; // past STOPPED_AFTER: the food is paused
+    // Past STOPPED_AFTER: the food is paused. `stop` returns once the container has exited,
+    // so its last heartbeat is older than these 60 ticks, and ticks never run ahead of the
+    // wall clock (100 ms interval, missed ticks skipped): at least 6 s > 5 s.
+    c.ticks(60).await;
     c.cows_still(100).await;
     let food0 = c.view.resources.food;
     assert!(food0 > 0);
@@ -857,7 +878,12 @@ async fn food_outage_freezes_food_and_pauses_hunger() {
     c.until_cows_move().await;
     assert!(c.tick < meal, "the container came back too late");
     c.until(200, |c| c.tick > meal + 1).await;
-    assert_eq!(c.view.hungry.len(), 3, "every dwarf missed the meal");
+    assert_eq!(
+        c.view.hungry.len(),
+        c.view.dwarves.len(),
+        "every dwarf missed the meal"
+    );
+    assert!(!c.view.hungry.is_empty());
     srv.stop().await;
     food.stop().await;
     rm(&data);
@@ -941,16 +967,11 @@ async fn server_restart_keeps_the_herd() {
     rm(&data);
 }
 
-/// Seed of the container's `FoodSim` for `m` (private to `moria-food`: from the id only).
-fn container_seed(m: MountainId) -> u64 {
-    (u64::from(m.0) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-
 /// A grass tile near the entrance whose field ripens at the first summer growth check and
 /// not at the spring check before it.
 fn field_ripe_at_summer(m: &Mountain) -> TilePos {
     let ripe_at = |q: TilePos, tick: u64| {
-        let mut s = FoodSim::new(container_seed(M0));
+        let mut s = FoodSim::new(moria_food::seed(M0));
         let field = Cell {
             pos: q,
             kind: CellKind::Field,
@@ -995,7 +1016,8 @@ async fn crop_ripens_and_stays_designated() {
         .await;
 
     food.stop().await;
-    c.ticks(60).await; // past STOPPED_AFTER: the food is paused
+    c.ticks(60).await; // past STOPPED_AFTER: the food is paused (see the outage test)
+    c.cows_still(30).await; // the herd is frozen: no container is driving it
     // A cancelled harvest is asked for again, container or not (famine deadlock).
     c.s.write_all(&encode(&ClientMsg::CancelDesignation { a: q, b: q }))
         .await

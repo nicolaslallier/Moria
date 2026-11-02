@@ -22,7 +22,7 @@ pub const STATE_EVERY: Duration = Duration::from_secs(1);
 pub const SAVE_EVERY: Duration = Duration::from_secs(60);
 
 /// `World` ne porte pas la graine du monde : graine stable tiree du seul id de la montagne.
-fn seed(m: MountainId) -> u64 {
+pub fn seed(m: MountainId) -> u64 {
     (m.0 as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
