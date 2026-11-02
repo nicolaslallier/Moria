@@ -701,6 +701,8 @@ impl Session {
                 }
                 false
             }
+            // Le dialogue et les quêtes seront traités par les tâches 6 et 7.
+            NetEvent::Msg(ServerMsg::KingSay { .. } | ServerMsg::Quest(_)) => false,
             NetEvent::Disconnected(reason) => {
                 // Before login, the reason shows on the login screen itself.
                 let to = match self.screen {
@@ -883,6 +885,9 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 100,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         })
     }
 
@@ -1047,6 +1052,9 @@ pub(crate) mod tests {
                 dwarves: vec![],
                 resources: Resources::default(),
                 tick: 0,
+                king: TilePos::new(0, 0, 0),
+                quest: None,
+                done: vec![],
             })))
         };
         // Tile vec not matching the dimensions (only possible via deserialization).
@@ -1103,6 +1111,9 @@ pub(crate) mod tests {
                 dwarves: vec![],
                 resources: Resources::default(),
                 tick: 0,
+                king: TilePos::new(0, 0, 0),
+                quest: None,
+                done: vec![],
             })))
         };
         let mut s = Session::default();
@@ -1371,6 +1382,9 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert_eq!(s.screen, Screen::Playing);
@@ -1558,6 +1572,9 @@ pub(crate) mod tests {
                 .collect(),
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let mut s = Session::default();
         assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));
@@ -1574,6 +1591,9 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let mut s = Session::default();
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view.clone()))));

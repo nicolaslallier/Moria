@@ -71,6 +71,8 @@ impl Command {
             ClientMsg::Use(d) => Command::Use(d),
             ClientMsg::Order { dir, add } => Command::Order { dir, add },
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
+            // Le dialogue et les quêtes seront traités par les tâches 4, 6 et 7.
+            ClientMsg::Talk { .. } | ClientMsg::AcceptQuest(_) | ClientMsg::TurnIn => return None,
         })
     }
 }

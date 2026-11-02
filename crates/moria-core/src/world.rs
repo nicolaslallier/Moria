@@ -507,6 +507,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&view).len();
         assert!(n < MAX_FRAME, "{n} >= {MAX_FRAME}");
@@ -851,6 +854,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&v).len();
         assert!(n < MAX_FRAME / 2, "{n}");

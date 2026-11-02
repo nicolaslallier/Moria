@@ -558,6 +558,9 @@ impl State {
                 .map(|d| d.id)
                 .collect(),
             tick: self.w.tick,
+            king: f.king,
+            quest: f.quest,
+            done: f.done.clone(),
         };
         self.send(player, ServerMsg::Snapshot(Box::new(v)));
     }

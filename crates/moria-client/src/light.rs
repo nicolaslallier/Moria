@@ -249,6 +249,9 @@ mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         }))));
     }
 

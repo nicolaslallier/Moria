@@ -1,3 +1,4 @@
+use crate::king::{Lang, Quest, QuestId};
 use crate::srd::{Abilities, Class, Race};
 use crate::{DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -8,7 +9,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -46,6 +47,13 @@ pub enum ClientMsg {
         dir: Dir,
         add: u8,
     },
+    /// Parole au roi (à portée), dans la langue du joueur.
+    Talk {
+        text: String,
+        lang: Lang,
+    },
+    AcceptQuest(QuestId),
+    TurnIn,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -93,6 +101,9 @@ pub struct FortressView {
     pub hungry: Vec<DwarfId>,
     /// World tick, so the client knows the game hour on connect.
     pub tick: u64,
+    pub king: TilePos,
+    pub quest: Option<Quest>,
+    pub done: Vec<QuestId>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -112,10 +123,20 @@ pub struct TickDelta {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
-    Welcome { player: PlayerId, needs_hero: bool },
+    Welcome {
+        player: PlayerId,
+        needs_hero: bool,
+    },
     Reject(Reject),
     Snapshot(Box<FortressView>),
     Tick(TickDelta),
+    /// Réponse du roi ; `offer` = quête proposée.
+    KingSay {
+        text: String,
+        offer: Option<QuestId>,
+    },
+    /// État de la quête active (acceptation, validation, snapshot).
+    Quest(Option<Quest>),
 }
 
 /// u32 big-endian length prefix, then the postcard body.
@@ -196,6 +217,60 @@ mod tests {
         let r = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch { server: 1 }))
             .unwrap();
         assert_eq!(r, [1, 0, 1]);
+        // Les nouvelles variantes sont les dernières ; `Hello` et `Reject` ne bougent pas.
+        let talk = ClientMsg::Talk {
+            text: String::new(),
+            lang: Lang::Fr,
+        };
+        let b = postcard::to_allocvec(&talk).unwrap();
+        assert_eq!(b[0], 9, "Talk suit Order (8)");
+        let n = |m: &ClientMsg| postcard::to_allocvec(m).unwrap()[0];
+        assert_eq!(n(&ClientMsg::AcceptQuest(QuestId::ALL[0])), n(&talk) + 1);
+        assert_eq!(n(&ClientMsg::TurnIn), n(&talk) + 2);
+        let s = |m: &ServerMsg| postcard::to_allocvec(m).unwrap()[0];
+        let say = ServerMsg::KingSay {
+            text: String::new(),
+            offer: None,
+        };
+        assert_eq!(s(&say), 4);
+        assert_eq!(s(&ServerMsg::Quest(None)), 5);
+    }
+    #[test]
+    fn talk_and_quest_messages_round_trip() {
+        let q = Quest {
+            id: QuestId::ALL[0],
+            baseline: 3,
+        };
+        for m in [
+            ClientMsg::Talk {
+                text: "salut".into(),
+                lang: Lang::En,
+            },
+            ClientMsg::AcceptQuest(q.id),
+            ClientMsg::TurnIn,
+        ] {
+            let b = encode(&m);
+            assert_eq!(read_frame::<ClientMsg>(&mut Cursor::new(b)).unwrap(), m);
+        }
+        for m in [
+            ServerMsg::KingSay {
+                text: "bonjour".into(),
+                offer: Some(q.id),
+            },
+            ServerMsg::Quest(Some(q)),
+            ServerMsg::Quest(None),
+        ] {
+            let b = encode(&m);
+            assert_eq!(read_frame::<ServerMsg>(&mut Cursor::new(b)).unwrap(), m);
+        }
+    }
+    #[test]
+    fn version_mismatch_reports_server_version_11() {
+        let b = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch {
+            server: PROTOCOL_VERSION,
+        }))
+        .unwrap();
+        assert_eq!(b, [1, 0, 11]);
     }
     #[test]
     fn oversized_frame_rejected() {
