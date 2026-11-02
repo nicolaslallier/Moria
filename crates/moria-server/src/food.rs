@@ -3,7 +3,7 @@
 //! server also runs the `FoodSim`s itself (`InProcess`).
 
 use crate::sim::{Changes, on_ground};
-use moria_core::food::{Cell, CellKind, FoodAction, FoodEvent, FoodSim, GROW_EVERY};
+use moria_core::food::{COW_CAP, Cell, CellKind, FoodAction, FoodEvent, FoodSim, GROW_EVERY};
 use moria_core::protocol::TickDelta;
 use moria_core::world::{Fortress, World};
 use moria_core::{DesignationKind, Dir, GROUND_Z, Mountain, MountainId, Tile, TilePos};
@@ -47,9 +47,21 @@ pub fn apply_events(
     evs: &[FoodEvent],
     tiles: &mut Vec<(TilePos, Tile)>,
 ) -> Vec<FoodEvent> {
+    apply_checked(m, f, evs, tiles, |_, _| true)
+}
+
+/// `apply_events` with an extra check, asked only for events `validate` accepts (an event
+/// that passes both is applied).
+fn apply_checked(
+    m: &mut Mountain,
+    f: &Fortress,
+    evs: &[FoodEvent],
+    tiles: &mut Vec<(TilePos, Tile)>,
+    mut extra: impl FnMut(&Mountain, &FoodEvent) -> bool,
+) -> Vec<FoodEvent> {
     let mut rejected = vec![];
     for ev in evs {
-        if !validate(m, f, ev) {
+        if !validate(m, f, ev) || !extra(m, ev) {
             rejected.push(*ev);
             continue;
         }
@@ -65,6 +77,33 @@ pub fn apply_events(
         }
     }
     rejected
+}
+
+/// Bus events are untrusted (a buggy container, a stale message): on top of `validate`, a
+/// birth needs a cow next to it and room under `COW_CAP`, and a ripe crop is refused where
+/// `stale_ripe` says the tile was harvested or sown after the proposal.
+pub fn apply_bus_events(
+    m: &mut Mountain,
+    f: &Fortress,
+    evs: &[FoodEvent],
+    stale_ripe: impl Fn(TilePos) -> bool,
+    tiles: &mut Vec<(TilePos, Tile)>,
+) -> Vec<FoodEvent> {
+    // Counted only when a birth is proposed: a full scan of the ground level.
+    let mut herd = None;
+    apply_checked(m, f, evs, tiles, |m, ev| match *ev {
+        FoodEvent::CowBorn { at } => {
+            let n = herd.get_or_insert_with(|| on_ground(m, Tile::Cow).len());
+            let ok = *n < COW_CAP
+                && Dir::HORIZONTAL
+                    .iter()
+                    .any(|&d| m.get(at.step(d)) == Some(Tile::Cow));
+            *n += ok as usize;
+            ok
+        }
+        FoodEvent::CropRipe { at } => !stale_ripe(at),
+        FoodEvent::CowMoved { .. } => true,
+    })
 }
 
 /// Every cow, field and crop of the ground level.
@@ -268,6 +307,71 @@ mod tests {
         assert_eq!(rejected, vec![born(b), born(t), born(d)]);
         assert_eq!(m.get(a), Some(Tile::Cow));
         assert_eq!(tiles, vec![(a, Tile::Cow)]);
+    }
+
+    #[test]
+    fn bus_birth_needs_a_cow_next_to_it_and_room_under_the_cap() {
+        let (mut m, f) = meadow();
+        let born = |at| FoodEvent::CowBorn { at };
+        let mut tiles = vec![];
+        let lonely = born(g(10, 10));
+        assert_eq!(
+            apply_bus_events(&mut m, &f, &[lonely], |_| false, &mut tiles),
+            vec![lonely],
+            "no cow next to it"
+        );
+        m.set(g(20, 20), Tile::Cow);
+        let above = born(TilePos::new(20, 20, GROUND_Z + 1));
+        let calf = born(g(21, 20));
+        assert_eq!(
+            apply_bus_events(&mut m, &f, &[above, calf], |_| false, &mut tiles),
+            vec![above]
+        );
+        assert_eq!(m.get(g(21, 20)), Some(Tile::Cow));
+        // fill the herd up to the cap (a row of cows), then one more birth is refused
+        for x in 0..COW_CAP as i16 - 3 {
+            m.set(g(x, 30), Tile::Cow);
+        }
+        let last = born(g(0, 31));
+        let over = born(g(1, 31));
+        assert_eq!(
+            apply_bus_events(&mut m, &f, &[last, over], |_| false, &mut tiles),
+            vec![over],
+            "the herd is full"
+        );
+        assert_eq!(m.get(g(1, 31)), Some(Tile::Grass));
+        assert_eq!(on_ground(&m, Tile::Cow).len(), COW_CAP);
+    }
+
+    #[test]
+    fn bus_stale_ripe_is_refused() {
+        let (mut m, f) = meadow();
+        let (old, fresh) = (g(1, 1), g(2, 2));
+        m.set(old, Tile::Field);
+        m.set(fresh, Tile::Field);
+        let ripe = |at| FoodEvent::CropRipe { at };
+        let mut tiles = vec![];
+        let rejected = apply_bus_events(
+            &mut m,
+            &f,
+            &[ripe(old), ripe(fresh)],
+            |q| q == old,
+            &mut tiles,
+        );
+        assert_eq!(rejected, vec![ripe(old)]);
+        assert_eq!(
+            (m.get(old), m.get(fresh)),
+            (Some(Tile::Field), Some(Tile::Crop))
+        );
+        // moves still go through `validate`
+        let c = g(20, 20);
+        m.set(c, Tile::Cow);
+        let ev = moved(c, c.step(Dir::E));
+        assert!(apply_bus_events(&mut m, &f, &[ev], |_| false, &mut tiles).is_empty());
+        assert_eq!(
+            apply_bus_events(&mut m, &f, &[ev], |_| false, &mut tiles),
+            vec![ev]
+        );
     }
 
     #[test]

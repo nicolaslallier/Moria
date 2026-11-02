@@ -436,6 +436,8 @@ pub fn step_with_food(
 ) {
     let tick = w.tick;
     w.tick += 1;
+    // The food container is down: its meals are skipped, not owed.
+    let meal = !w.food_paused && tick != 0 && tick.is_multiple_of(EAT_EVERY); // new world: fed
     let no_block = HashSet::new();
     let (mut out, mut food) = (BTreeMap::new(), BTreeMap::new());
     for (&id, f) in w.fortresses.iter_mut() {
@@ -447,7 +449,6 @@ pub fn step_with_food(
 
         // Meals: each dwarf needs one every EAT_EVERY ticks. A hungry dwarf drops its work
         // and eats as soon as there is food.
-        let meal = tick != 0 && tick.is_multiple_of(EAT_EVERY); // a new world starts fed
         for d in f.dwarves.iter_mut() {
             d.hungry |= meal;
             if d.hungry && f.resources.food > 0 {
@@ -1566,6 +1567,30 @@ pub(crate) mod tests {
             w.fortresses[&M].resources.food, 2,
             "no second meal before the next"
         );
+    }
+
+    #[test]
+    fn meal_skipped_while_food_paused() {
+        let mut w = setup();
+        w.tick = EAT_EVERY;
+        w.food_paused = true;
+        res(&mut w).food = 5;
+        let d = step(&mut w).remove(&M).unwrap();
+        assert!(d.hungry.is_empty(), "nobody gets hungry");
+        assert_eq!(res(&mut w).food, 5, "no meal taken");
+        // the same tick, food running: the meal falls
+        w.tick = EAT_EVERY;
+        w.food_paused = false;
+        step(&mut w);
+        assert_eq!(res(&mut w).food, 2);
+        // a hungry dwarf stays hungry while paused
+        w.food_paused = true;
+        res(&mut w).food = 0;
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].hungry = true;
+        w.tick = 2 * EAT_EVERY;
+        step(&mut w);
+        assert!(w.fortresses[&M].dwarves[0].hungry);
+        assert!(!w.fortresses[&M].dwarves[1].hungry);
     }
 
     #[test]

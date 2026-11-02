@@ -93,6 +93,9 @@ pub struct World {
     pub accounts: BTreeMap<String, Account>,
     pub next_dwarf: u32,
     pub tick: u64,
+    /// The food container is down: food freezes and meals are skipped. Not saved.
+    #[serde(skip)]
+    pub food_paused: bool,
 }
 
 /// One fortress map. Outdoors (x < 128): grass with trees on `GROUND_Z`, 2 levels of soil,
@@ -274,6 +277,7 @@ fn generate_base(seed: u64) -> World {
         accounts: BTreeMap::new(),
         next_dwarf: 0,
         tick: 0,
+        food_paused: false,
     };
     for i in 0..(GRID * GRID) {
         let id = MountainId(i as u16);

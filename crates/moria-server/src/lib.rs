@@ -4,6 +4,7 @@
 
 pub mod bridge;
 mod food;
+pub mod food_bridge;
 mod inventory;
 pub mod metrics;
 pub mod net;
@@ -181,6 +182,13 @@ pub async fn run_with_listener(
         ))
     });
     drop(assign_tx);
+    // The food container gets its own connection: a slow inventory flush never holds it up.
+    let food_link = cfg.amqp_url.clone().map(|url| {
+        let (tx, out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::MAX_IN_PER_TICK);
+        tokio::spawn(food_bridge::run(url, out, inc));
+        food_bridge::Link::new(tx, rx)
+    });
 
     // An empty (or blank) code means open registration, whatever the caller passed.
     let invite = cfg.invite.clone().filter(|s| !s.trim().is_empty());
@@ -259,7 +267,9 @@ pub async fn run_with_listener(
         last_view: None,
         saving: None,
         pending: HashMap::new(),
-        food_sim: Some(food::InProcess::default()),
+        // With a bus the container runs the food; without, the server does.
+        food_sim: food_link.is_none().then(food::InProcess::default),
+        food_link,
     };
     let r = state.run(shutdown).await;
     accept.abort();
@@ -300,6 +310,8 @@ struct State {
     pending: HashMap<PlayerId, VecDeque<Command>>,
     /// The food simulation run here; `None` when it comes from the bus.
     food_sim: Option<food::InProcess>,
+    /// The food container; `None` without a bus.
+    food_link: Option<food_bridge::Link>,
 }
 
 impl State {
@@ -335,12 +347,23 @@ impl State {
         M.sessions.store(self.sessions.len() as i64, Relaxed);
         M.accounts.store(self.w.accounts.len() as i64, Relaxed);
         M.fortresses.store(self.w.fortresses.len() as i64, Relaxed);
-        let up = M.bus_up.load(Relaxed) == 1 && self.inv.inventory_up(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let up = M.bus_up.load(Relaxed) == 1 && self.inv.inventory_up(now);
         M.nats_connected.store(up as i64, Relaxed);
+        let food_up = self.food_link.as_ref().is_some_and(|l| l.up(now));
+        M.food_up.store(food_up as i64, Relaxed);
     }
 
     fn step(&mut self) {
+        self.step_at(std::time::Instant::now());
+    }
+
+    fn step_at(&mut self, now: std::time::Instant) {
         self.sessions.retain(|_, tx| !tx.is_closed());
+        if let Some(l) = &mut self.food_link {
+            l.poll(now);
+        }
+        self.w.food_paused = food_bridge::paused(self.food_link.as_ref(), now);
         for _ in 0..MAX_STATES_PER_TICK {
             let Ok(st) = self.states_rx.try_recv() else {
                 break;
@@ -364,6 +387,11 @@ impl State {
         let mut changes = self.commands();
         let (deltas, acts) = sim::step_with_food(&mut self.w);
         let mut fed = food::step(&mut self.w, self.food_sim.as_mut(), &acts);
+        if let Some(l) = &mut self.food_link {
+            for (m, ch) in l.step(&mut self.w, &acts, now) {
+                fed.entry(m).or_default().then(ch);
+            }
+        }
         for b in self.inv.end_tick(&self.w) {
             if let Some(tx) = &self.batch_tx
                 && tx.try_send(b).is_err()
@@ -664,6 +692,7 @@ mod tests {
             saving: None,
             pending: HashMap::new(),
             food_sim: Some(food::InProcess::default()),
+            food_link: None,
         };
         (s, cmd_tx, batch_rx)
     }
@@ -729,6 +758,31 @@ mod tests {
             assert_ne!(m.get(q), Some(Tile::Cow), "a cow under someone");
         }
         assert!(f.hero.is_some());
+    }
+
+    #[test]
+    fn food_paused_follows_staleness_when_a_bus_is_configured() {
+        use moria_core::food_msg::Status;
+        let (mut s, _cmd) = state();
+        let t0 = std::time::Instant::now();
+        s.step_at(t0);
+        assert!(!s.w.food_paused, "no bus: never paused");
+        let (tx, mut out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::MAX_IN_PER_TICK);
+        s.food_link = Some(food_bridge::Link::new(tx, rx));
+        s.food_sim = None;
+        s.step_at(t0);
+        assert!(s.w.food_paused, "container never heard of");
+        inc.try_send(food_bridge::Incoming::Status(Status { tick: 0 }))
+            .unwrap();
+        s.step_at(t0 + Duration::from_secs(1));
+        assert!(!s.w.food_paused, "heartbeat seen this tick");
+        s.step_at(t0 + Duration::from_secs(6));
+        assert!(s.w.food_paused, "silent for 5 s");
+        let ticks = std::iter::from_fn(|| out.try_recv().ok())
+            .filter(|o| matches!(o, food_bridge::Outgoing::Tick(_)))
+            .count();
+        assert_eq!(ticks, 3, "one food.tick per server tick");
     }
 
     #[test]
