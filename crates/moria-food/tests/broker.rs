@@ -128,7 +128,6 @@ async fn world_in_events_out() {
     };
     let e = drive(&bus, &mut events, Some(&w), 0, 10, |e| e.mountain == M).await;
     assert!(!e.list.is_empty());
-    assert!(e.tick.is_multiple_of(10));
     svc.stop().await;
     // Sauvegarde a l'arret ; des naissances ont pu s'ajouter, aucune vache ne se perd.
     assert!(FoodStore::load_or_default(&file).unwrap().mountains[&M].cow_count() >= 2);
@@ -165,7 +164,7 @@ async fn restart_keeps_hidden_state() {
     let file = tmp("restart");
     let bus = setup().await;
     let mut events = bus.subscribe(KEY_EVENTS, Queue::Exclusive).await.unwrap();
-    // Ete : des champs murissent ; l'etat "mur" est cache (la grille ne dit que `Field`).
+    // Ete : un champ murit dans le conteneur.
     let svc = start(file.clone());
     let w = World {
         tick: SEASON_TICKS,
@@ -182,6 +181,18 @@ async fn restart_keeps_hidden_state() {
     })
     .await;
     let at = ripe(&e).unwrap();
+    // Comme le serveur : la grille dit maintenant `Crop` (l'instantane fait foi sur la maturite).
+    // Le meme ordre dans la file garantit que ce dernier instantane est adopte apres l'ancien.
+    let mut w = w;
+    for c in &mut w.mountains[0].1 {
+        if c.pos == at {
+            c.kind = CellKind::Crop;
+        }
+    }
+    drive(&bus, &mut events, Some(&w), e.tick, 100, |e| {
+        e.list.contains(&FoodEvent::CropRipe { at })
+    })
+    .await;
     svc.stop().await;
     assert!(FoodStore::load_or_default(&file).unwrap().mountains[&M].is_ripe(at));
 

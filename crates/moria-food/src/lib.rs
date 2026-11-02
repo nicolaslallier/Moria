@@ -26,8 +26,12 @@ fn seed(m: MountainId) -> u64 {
     (m.0 as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// Adopte les montagnes listees ; celles absentes du message gardent leur etat.
+/// Instantane complet : adopte les montagnes listees, oublie les autres (le conteneur n'a aucun
+/// moyen de supprimer quoi que ce soit de la carte).
 pub fn handle_world(store: &mut FoodStore, w: &World) {
+    store
+        .mountains
+        .retain(|m, _| w.mountains.iter().any(|(l, _)| l == m));
     for (m, cells) in &w.mountains {
         store
             .mountains
@@ -173,6 +177,9 @@ pub async fn run(
     tokio::pin!(shutdown);
     let mut beat = tokio::time::interval(STATE_EVERY);
     let mut autosave = tokio::time::interval(SAVE_EVERY);
+    // Apres une longue attente (reconnexion), pas de rafale de battements ni de sauvegardes.
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_tick = 0;
     loop {
         let bus = tokio::select! {
@@ -274,6 +281,28 @@ mod tests {
         assert!(evs.iter().all(|e| e.tick == 10 && !e.list.is_empty()));
         // Pas de pas de vache hors des multiples de COW_EVERY : rien a publier.
         assert!(handle_tick(&mut s, &Tick { tick: 11 }).is_empty());
+    }
+
+    #[test]
+    fn world_is_a_complete_snapshot() {
+        let summer = moria_core::calendar::SEASON_TICKS;
+        let fields = vec![field(1, 1), field(4, 1)];
+        let mut s = FoodStore::default();
+        handle_world(
+            &mut s,
+            &world(summer, vec![(A, fields.clone()), (B, vec![cow(9, 9)])]),
+        );
+        // etat cache : une verification de croissance fait avancer les champs
+        handle_tick(&mut s, &Tick { tick: summer + 100 });
+        let mut kept = s.mountains[&A].clone();
+        kept.adopt(&fields, summer + 200);
+        let mut fresh = FoodSim::new(seed(A));
+        fresh.adopt(&fields, summer + 200);
+        assert_ne!(kept, fresh, "aucun etat cache a garder");
+
+        handle_world(&mut s, &world(summer + 200, vec![(A, fields)]));
+        assert!(!s.mountains.contains_key(&B), "montagne absente gardee");
+        assert_eq!(s.mountains[&A], kept);
     }
 
     #[test]

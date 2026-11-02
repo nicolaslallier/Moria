@@ -118,7 +118,7 @@ impl FoodSim {
                         .get(&c.pos)
                         .copied()
                         .unwrap_or(FieldState { progress: 0, ripe });
-                    st.ripe |= ripe; // the server's grid says ripe: believe it
+                    st.ripe = ripe; // the server's grid wins (a lost harvest is cleared here)
                     self.fields.insert(c.pos, st);
                 }
             }
@@ -367,6 +367,17 @@ mod tests {
         );
         assert_eq!(s.cows[&p(1, 1)].fertile_at, 999);
         assert_eq!(s.fields[&p(2, 2)].progress, 7);
+    }
+
+    #[test]
+    fn adopt_takes_ripeness_from_the_server() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(2, 2), CellKind::Crop)], 10);
+        // a lost FieldHarvested: the grid says Field, the server wins
+        s.adopt(&[cell(p(2, 2), CellKind::Field)], 20);
+        assert!(!s.is_ripe(p(2, 2)));
+        s.adopt(&[cell(p(2, 2), CellKind::Crop)], 30);
+        assert!(s.is_ripe(p(2, 2)));
     }
 
     #[test]
