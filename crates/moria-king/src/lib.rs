@@ -10,14 +10,8 @@ use moria_bus::{Bus, Queue};
 use moria_core::king::{Ask, KEY_ASK, KEY_REPLY, Reply};
 use std::{
     future::Future,
-    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, mpsc};
-
-/// Questions traitées en parallèle (une lente ne bloque pas les autres).
-// ponytail: plafond fixe, à rendre réglable si Ollama tient plus de charge.
-const IN_FLIGHT: usize = 2;
 
 pub trait Llm {
     fn chat(&self, msgs: &[ChatMessage]) -> impl Future<Output = anyhow::Result<String>> + Send;
@@ -66,42 +60,16 @@ async fn handle(ask: &Ask, received: Instant, llm: &impl Llm) -> Option<Reply> {
     Some(answer(ask, llm).await)
 }
 
-/// Attend une place libre (contre-pression sur la réception), puis traite la question
-/// dans sa propre tâche : au plus `IN_FLIGHT` tâches à la fois.
-async fn dispatch<L: Llm + Send + Sync + 'static>(
-    ask: Ask,
-    received: Instant,
-    llm: &Arc<L>,
-    slots: &Arc<Semaphore>,
-    tx: &mpsc::Sender<Reply>,
-) {
-    let Ok(permit) = slots.clone().acquire_owned().await else {
-        return;
-    };
-    let (llm, tx) = (llm.clone(), tx.clone());
-    tokio::spawn(async move {
-        let reply = handle(&ask, received, &*llm).await;
-        // La place est rendue avant l'envoi : la boucle peut attendre une place sans
-        // bloquer les tâches qui lui rendent leur réponse.
-        drop(permit);
-        drop(llm);
-        if let Some(r) = reply {
-            let _ = tx.send(r).await;
-        }
-    });
-}
-
 /// Répond aux questions jusqu'à `shutdown` ; se reconnecte (2 s) quand le bus tombe.
-/// Une réponse perdue est sans gravité : le serveur envoie son repli au bout de 70 s.
+/// Une question à la fois par instance (prefetch 1, acquittée une fois traitée) : le reste
+/// attend dans le broker, où le serveur le fait expirer à 70 s. Pour plus de débit, lancer
+/// plusieurs instances sur la file partagée. Une réponse perdue est sans gravité : le
+/// serveur envoie son repli.
 pub async fn run(
     amqp_url: String,
     llm: impl Llm + Send + Sync + 'static,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let llm = Arc::new(llm);
-    let slots = Arc::new(Semaphore::new(IN_FLIGHT));
-    // Les tâches rendent leur réponse ici ; seule la boucle publie (et gère la reconnexion).
-    let (tx, mut rx) = mpsc::channel::<Reply>(16);
     tokio::pin!(shutdown);
     loop {
         let bus = tokio::select! {
@@ -112,7 +80,7 @@ pub async fn run(
             name: "king",
             latest_only: false,
         };
-        let mut sub = match bus.subscribe(KEY_ASK, queue).await {
+        let mut sub = match bus.subscribe_acked(KEY_ASK, queue).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("abonnement impossible ({e}), nouvel essai dans 2 s");
@@ -124,34 +92,49 @@ pub async fn run(
         };
         tracing::info!("king connecté à RabbitMQ");
         loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                Some(reply) = rx.recv() => {
-                    let Ok(b) = postcard::to_allocvec(&reply) else {
-                        tracing::error!("encodage de la réponse impossible");
-                        continue;
-                    };
-                    if let Err(e) = bus.publish(KEY_REPLY, b, false).await {
-                        tracing::warn!("publication échouée ({e}), reconnexion dans 2 s");
-                        tokio::select! {
-                            _ = &mut shutdown => return Ok(()),
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                        }
-                        break;
-                    }
+            let d = tokio::select! {
+                _ = &mut shutdown => {
+                    bus.close().await;
+                    return Ok(());
                 }
-                m = sub.next() => {
-                    let Some(payload) = m else {
+                m = sub.next() => match m {
+                    Some(d) => d,
+                    None => {
                         tracing::warn!("abonnement terminé, reconnexion");
                         break;
-                    };
-                    let received = Instant::now();
-                    let Some(ask) = decode_ask(&payload) else { continue };
+                    }
+                },
+            };
+            let received = Instant::now();
+            // Illisible ou périmée : pas de réponse, mais acquittée (jamais redistribuée).
+            let reply = match decode_ask(&d.body) {
+                Some(ask) => tokio::select! {
+                    // Arrêt en pleine réflexion : non acquittée, une autre instance la reprend.
+                    _ = &mut shutdown => {
+                        bus.close().await;
+                        return Ok(());
+                    }
+                    r = handle(&ask, received, &llm) => r,
+                },
+                None => None,
+            };
+            if let Some(reply) = reply {
+                let res = match postcard::to_allocvec(&reply) {
+                    Ok(b) => bus.publish(KEY_REPLY, b, false).await,
+                    Err(e) => Err(e.into()),
+                };
+                if let Err(e) = res {
+                    tracing::warn!("publication échouée ({e}), reconnexion dans 2 s");
                     tokio::select! {
                         _ = &mut shutdown => return Ok(()),
-                        _ = dispatch(ask, received, &llm, &slots, &tx) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     }
+                    break;
                 }
+            }
+            if let Err(e) = d.ack().await {
+                tracing::warn!("ack impossible ({e:#}), reconnexion");
+                break;
             }
         }
     }
@@ -177,21 +160,15 @@ mod tests {
         }
     }
 
-    /// Compte les appels simultanés et garde le maximum observé.
+    /// Compte les appels.
     #[derive(Default)]
     struct Counting {
-        now: AtomicUsize,
-        max: AtomicUsize,
         calls: AtomicUsize,
     }
 
     impl Llm for Counting {
         async fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max.fetch_max(n, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            self.now.fetch_sub(1, Ordering::SeqCst);
             Ok(r#"{"say":"ok","offer":null}"#.into())
         }
     }
@@ -212,27 +189,6 @@ mod tests {
         assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
         assert!(handle(&ask(), Instant::now(), &llm).await.is_some());
         assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn concurrent_llm_calls_never_exceed_the_limit() {
-        let llm = Arc::new(Counting::default());
-        let slots = Arc::new(Semaphore::new(IN_FLIGHT));
-        let (tx, mut rx) = mpsc::channel(16);
-        for seq in 0..7 {
-            let mut a = ask();
-            a.seq = seq;
-            // Bloque tant que IN_FLIGHT questions sont en cours : contre-pression.
-            dispatch(a, Instant::now(), &llm, &slots, &tx).await;
-            assert!(Arc::strong_count(&llm) <= IN_FLIGHT + 1);
-        }
-        let mut seqs = Vec::new();
-        for _ in 0..7 {
-            seqs.push(rx.recv().await.unwrap().seq);
-        }
-        seqs.sort();
-        assert_eq!(seqs, (0..7).collect::<Vec<_>>());
-        assert_eq!(llm.max.load(Ordering::SeqCst), IN_FLIGHT);
     }
 
     #[tokio::test]
