@@ -506,9 +506,12 @@ impl Game {
         }
     }
 
-    /// Creature on this tile of level `z`: hero first, then the first dwarf.
     /// The `Inspect` request to send now, if the panel needs one.
     pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
+        if self.inspect.is_none() {
+            // Closed: reopening the same target asks at once.
+            self.inspect_asked = None;
+        }
         if !inspect_due(self.inspect, self.inspect_asked, now) {
             return None;
         }
@@ -522,6 +525,8 @@ impl Game {
         match i {
             Some(i) if Some(i.target) == self.inspect => self.inspection = Some(i),
             Some(_) => {}
+            // No panel open (closed while the request was in flight): nothing to report.
+            None if self.inspect.is_none() => {}
             None => {
                 self.close_menus_inspect();
                 self.say(tr("Disparu", "Gone"));
@@ -539,6 +544,7 @@ impl Game {
         self.toast = Some((text.to_string(), self.ticks));
     }
 
+    /// Creature on this tile of level `z`: hero first, then the first dwarf.
     pub fn inspect_at(&self, tile: (i16, i16), z: u8) -> Option<InspectTarget> {
         let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
         if at(self.hero.pos) {
@@ -1068,6 +1074,24 @@ pub(crate) mod tests {
         );
         assert_eq!(g.poll_inspect(5.5), None);
         assert!(g.poll_inspect(6.0).is_some());
+    }
+
+    #[test]
+    fn inspected_none_with_no_open_panel_shows_no_toast() {
+        let mut g = game();
+        g.on_inspected(None);
+        assert_eq!(g.toast, None);
+    }
+
+    #[test]
+    fn reopening_same_target_asks_at_once() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.0).is_some());
+        g.inspect = None;
+        assert_eq!(g.poll_inspect(5.2), None);
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.3).is_some());
     }
 
     #[test]
