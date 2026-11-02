@@ -4434,6 +4434,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "moria-food"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "moria-bus",
+ "moria-core",
+ "postcard",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "moria-inventory"
 version = "0.1.0"
 dependencies = [
