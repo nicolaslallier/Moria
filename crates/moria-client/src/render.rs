@@ -524,4 +524,62 @@ mod tests {
         g.mountain.orders.remove(&a);
         assert_eq!(visible_orders(&g, 0), BTreeMap::from([(b, 2)]));
     }
+
+    /// Every count entity: (entity, workshop, text).
+    fn counts(w: &mut World) -> Vec<(Entity, TilePos, String)> {
+        w.query::<(Entity, &OrderCount, &Text2d)>()
+            .iter(w)
+            .map(|(e, c, t)| (e, c.0, t.0.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn order_counts_reuse_their_entity() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut g = crate::game::tests::game();
+        // The hero's tile: lit by the hero.
+        let a = TilePos::new(2, 1, 0);
+        g.mountain.orders.insert(a, 5);
+        let area = Area {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 5,
+        };
+        let light = light_map(&g.mountain, 0, area, &g.light_sources(0), g.tick);
+        let mut w = World::new();
+        w.insert_resource(Client {
+            session: crate::game::Session {
+                game: Some(g),
+                ..Default::default()
+            },
+            net: None,
+        });
+        w.insert_resource(Lighting(light));
+        let frame = |w: &mut World| w.run_system_once(sync_order_counts).unwrap();
+        fn orders(w: &mut World) -> &mut BTreeMap<TilePos, u8> {
+            let g = w.resource_mut::<Client>().into_inner();
+            &mut g.session.game.as_mut().unwrap().mountain.orders
+        }
+
+        // Spawned on the first frame, written on the next.
+        frame(&mut w);
+        frame(&mut w);
+        let first = counts(&mut w);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].1, first[0].2.as_str()), (a, "5"));
+        // An unchanged order keeps its entity.
+        frame(&mut w);
+        assert_eq!(counts(&mut w), first);
+        // A new count rewrites the same entity.
+        orders(&mut w).insert(a, 4);
+        frame(&mut w);
+        let now = counts(&mut w);
+        assert_eq!(now.len(), 1);
+        assert_eq!((now[0].0, now[0].2.as_str()), (first[0].0, "4"));
+        // A finished order removes it.
+        orders(&mut w).remove(&a);
+        frame(&mut w);
+        assert!(counts(&mut w).is_empty());
+    }
 }

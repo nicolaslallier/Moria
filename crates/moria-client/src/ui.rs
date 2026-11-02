@@ -983,6 +983,23 @@ mod tests {
     }
 
     #[test]
+    fn order_window_closes_when_the_workshop_is_gone() {
+        use moria_core::{Dir, Tile};
+        let mut g = crate::game::tests::game();
+        let e = g.hero.pos.step(Dir::E);
+        g.mountain.set(e, Tile::Forge);
+        g.order_menu = Some(Dir::E);
+        // Dismantled since the menu opened: the tile is plain floor again.
+        g.mountain.set(e, Tile::Floor);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert_eq!(order_window(ui.ctx(), &mut g), None);
+        });
+        out.textures_delta.clear();
+        assert_eq!(g.order_menu, None);
+    }
+
+    #[test]
     fn prefs_never_store_secrets() {
         let f = LoginForm {
             addr: "1.2.3.4:7777".into(),
