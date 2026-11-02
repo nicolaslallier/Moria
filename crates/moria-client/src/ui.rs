@@ -927,12 +927,16 @@ mod tests {
         let e = g.hero.pos.step(Dir::E);
         g.mountain.set(e, workshop);
         g.order_menu = Some(Dir::E);
-        let ctx = egui::Context::default();
+        order_frames(&egui::Context::default(), &mut g)
+    }
+
+    /// All text painted by `order_window` on `g`, after two frames of `ctx`.
+    fn order_frames(ctx: &egui::Context, g: &mut Game) -> String {
         // Two frames: a new window is laid out hidden on its first.
         let mut text = String::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                order_window(ui.ctx(), &mut g);
+                order_window(ui.ctx(), g);
             });
             out.textures_delta.clear();
             text = out
@@ -989,13 +993,12 @@ mod tests {
         let e = g.hero.pos.step(Dir::E);
         g.mountain.set(e, Tile::Forge);
         g.order_menu = Some(Dir::E);
-        // Dismantled since the menu opened: the tile is plain floor again.
-        g.mountain.set(e, Tile::Floor);
         let ctx = egui::Context::default();
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            assert_eq!(order_window(ui.ctx(), &mut g), None);
-        });
-        out.textures_delta.clear();
+        assert!(order_frames(&ctx, &mut g).contains("Forge"));
+        assert_eq!(g.order_menu, Some(Dir::E));
+        // Dismantled while the window was shown: the tile is plain floor again.
+        g.mountain.set(e, Tile::Floor);
+        order_frames(&ctx, &mut g);
         assert_eq!(g.order_menu, None);
     }
 

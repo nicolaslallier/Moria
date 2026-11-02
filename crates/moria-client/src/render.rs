@@ -525,28 +525,42 @@ mod tests {
         assert_eq!(visible_orders(&g, 0), BTreeMap::from([(b, 2)]));
     }
 
-    /// Every count entity: (entity, workshop, text).
-    fn counts(w: &mut World) -> Vec<(Entity, TilePos, String)> {
-        w.query::<(Entity, &OrderCount, &Text2d)>()
+    /// Every count entity, by workshop: (entity, workshop, text, visibility).
+    fn counts(w: &mut World) -> Vec<(Entity, TilePos, String, Visibility)> {
+        let mut v: Vec<_> = w
+            .query::<(Entity, &OrderCount, &Text2d, &Visibility)>()
             .iter(w)
-            .map(|(e, c, t)| (e, c.0, t.0.clone()))
-            .collect()
+            .map(|(e, c, t, v)| (e, c.0, t.0.clone(), *v))
+            .collect();
+        v.sort_by_key(|c| c.1);
+        v
+    }
+
+    /// Whether any count's text was written after the world's change tick `since`.
+    fn rewritten_since(w: &mut World, since: bevy::ecs::change_detection::Tick) -> bool {
+        let now = w.change_tick();
+        w.query::<Ref<Text2d>>()
+            .iter(w)
+            .any(|t| t.last_changed().is_newer_than(since, now))
     }
 
     #[test]
     fn order_counts_reuse_their_entity() {
         use bevy::ecs::system::RunSystemOnce;
         let mut g = crate::game::tests::game();
-        // The hero's tile: lit by the hero.
-        let a = TilePos::new(2, 1, 0);
-        g.mountain.orders.insert(a, 5);
+        // Underground (level 0 is outdoors, lit by day): a workshop by a torch, and one
+        // walled off in rock, never seen.
+        let (a, dark) = (TilePos::new(1, 1, 1), TilePos::new(5, 5, 1));
+        g.mountain.set(TilePos::new(2, 1, 1), Tile::Torch);
+        g.browse_z = Some(1);
+        g.mountain.orders.extend([(a, 5), (dark, 1)]);
         let area = Area {
             x0: 0,
             y0: 0,
             x1: 5,
             y1: 5,
         };
-        let light = light_map(&g.mountain, 0, area, &g.light_sources(0), g.tick);
+        let light = light_map(&g.mountain, 1, area, &g.light_sources(1), g.tick);
         let mut w = World::new();
         w.insert_resource(Client {
             session: crate::game::Session {
@@ -562,24 +576,31 @@ mod tests {
             &mut g.session.game.as_mut().unwrap().mountain.orders
         }
 
-        // Spawned on the first frame, written on the next.
+        // Spawned on the first frame, written on the next: shown where lit, hidden in the dark.
         frame(&mut w);
         frame(&mut w);
         let first = counts(&mut w);
-        assert_eq!(first.len(), 1);
-        assert_eq!((first[0].1, first[0].2.as_str()), (a, "5"));
-        // An unchanged order keeps its entity.
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            (first[0].1, first[0].2.as_str(), first[0].3),
+            (a, "5", Visibility::Inherited)
+        );
+        assert_eq!((first[1].1, first[1].3), (dark, Visibility::Hidden));
+        // An unchanged order keeps its entity and is not rewritten.
+        // A system stamps its writes with the tick it starts on: start one tick later.
+        let before = w.increment_change_tick();
         frame(&mut w);
         assert_eq!(counts(&mut w), first);
+        assert!(!rewritten_since(&mut w, before));
         // A new count rewrites the same entity.
         orders(&mut w).insert(a, 4);
         frame(&mut w);
         let now = counts(&mut w);
-        assert_eq!(now.len(), 1);
+        assert_eq!(now.len(), 2);
         assert_eq!((now[0].0, now[0].2.as_str()), (first[0].0, "4"));
         // A finished order removes it.
         orders(&mut w).remove(&a);
         frame(&mut w);
-        assert!(counts(&mut w).is_empty());
+        assert_eq!(counts(&mut w).len(), 1);
     }
 }

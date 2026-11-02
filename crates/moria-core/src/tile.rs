@@ -224,48 +224,38 @@ impl DesignationKind {
     }
 
     pub fn cost(self) -> Resources {
-        const NONE: Resources = Resources {
-            stone: 0,
-            gold: 0,
-            mithril: 0,
-            wood: 0,
-            iron_ore: 0,
-            coal: 0,
-            iron: 0,
-            iron_door: 0,
-            food: 0,
-        };
+        let none = Resources::default();
         match self {
-            Self::Dig | Self::Stairs | Self::Chop | Self::Farm => NONE,
-            Self::Wall | Self::Bed | Self::Table | Self::Chair => Resources { stone: 1, ..NONE },
-            Self::WoodTable => Resources { wood: 4, ..NONE },
-            Self::WoodBed | Self::Campfire | Self::WoodDoor => Resources { wood: 3, ..NONE },
-            Self::WoodChair => Resources { wood: 2, ..NONE },
-            Self::Candle | Self::Torch => Resources { wood: 1, ..NONE },
+            Self::Dig | Self::Stairs | Self::Chop | Self::Farm => none,
+            Self::Wall | Self::Bed | Self::Table | Self::Chair => Resources { stone: 1, ..none },
+            Self::WoodTable => Resources { wood: 4, ..none },
+            Self::WoodBed | Self::Campfire | Self::WoodDoor => Resources { wood: 3, ..none },
+            Self::WoodChair => Resources { wood: 2, ..none },
+            Self::Candle | Self::Torch => Resources { wood: 1, ..none },
             Self::Lamp => Resources {
                 stone: 1,
                 gold: 1,
-                ..NONE
+                ..none
             },
-            Self::Hearth => Resources { stone: 4, ..NONE },
+            Self::Hearth => Resources { stone: 4, ..none },
             Self::Stove => Resources {
                 stone: 3,
                 wood: 2,
-                ..NONE
+                ..none
             },
-            Self::Forge => Resources { stone: 6, ..NONE },
-            Self::StoneDoor => Resources { stone: 3, ..NONE },
-            Self::Anvil => Resources { iron: 3, ..NONE },
+            Self::Forge => Resources { stone: 6, ..none },
+            Self::StoneDoor => Resources { stone: 3, ..none },
+            Self::Anvil => Resources { iron: 3, ..none },
             Self::IronDoor => Resources {
                 iron_door: 1,
-                ..NONE
+                ..none
             },
             Self::Smelt => Resources {
                 iron_ore: 2,
                 coal: 1,
-                ..NONE
+                ..none
             },
-            Self::Smith => Resources { iron: 2, ..NONE },
+            Self::Smith => Resources { iron: 2, ..none },
         }
     }
 }
@@ -524,34 +514,32 @@ mod tests {
     #[test]
     fn every_kind_has_its_cost() {
         use DesignationKind as K;
-        // (kind, stone, wood, gold, iron_ore, coal, iron, iron_door)
-        let table = [
-            (K::Dig, 0, 0, 0, 0, 0, 0, 0),
-            (K::Stairs, 0, 0, 0, 0, 0, 0, 0),
-            (K::Wall, 1, 0, 0, 0, 0, 0, 0),
-            (K::Bed, 1, 0, 0, 0, 0, 0, 0),
-            (K::Table, 1, 0, 0, 0, 0, 0, 0),
-            (K::Chair, 1, 0, 0, 0, 0, 0, 0),
-            (K::Chop, 0, 0, 0, 0, 0, 0, 0),
-            (K::WoodBed, 0, 3, 0, 0, 0, 0, 0),
-            (K::WoodTable, 0, 4, 0, 0, 0, 0, 0),
-            (K::WoodChair, 0, 2, 0, 0, 0, 0, 0),
-            (K::Candle, 0, 1, 0, 0, 0, 0, 0),
-            (K::Torch, 0, 1, 0, 0, 0, 0, 0),
-            (K::Lamp, 1, 0, 1, 0, 0, 0, 0),
-            (K::Campfire, 0, 3, 0, 0, 0, 0, 0),
-            (K::Hearth, 4, 0, 0, 0, 0, 0, 0),
-            (K::Stove, 3, 2, 0, 0, 0, 0, 0),
-            (K::Forge, 6, 0, 0, 0, 0, 0, 0),
-            (K::Anvil, 0, 0, 0, 0, 0, 3, 0),
-            (K::WoodDoor, 0, 3, 0, 0, 0, 0, 0),
-            (K::StoneDoor, 3, 0, 0, 0, 0, 0, 0),
-            (K::IronDoor, 0, 0, 0, 0, 0, 0, 1),
-            (K::Smelt, 0, 0, 0, 2, 1, 0, 0),
-            (K::Smith, 0, 0, 0, 0, 0, 2, 0),
-            (K::Farm, 0, 0, 0, 0, 0, 0, 0),
-        ];
-        for (k, stone, wood, gold, iron_ore, coal, iron, iron_door) in table {
+        // (stone, wood, gold, iron_ore, coal, iron, iron_door). No wildcard: a new kind
+        // does not compile until it has its row.
+        let expected = |k: K| match k {
+            K::Dig | K::Stairs | K::Chop | K::Farm => (0, 0, 0, 0, 0, 0, 0),
+            K::Wall | K::Bed | K::Table | K::Chair => (1, 0, 0, 0, 0, 0, 0),
+            K::WoodBed | K::Campfire | K::WoodDoor => (0, 3, 0, 0, 0, 0, 0),
+            K::WoodTable => (0, 4, 0, 0, 0, 0, 0),
+            K::WoodChair => (0, 2, 0, 0, 0, 0, 0),
+            K::Candle | K::Torch => (0, 1, 0, 0, 0, 0, 0),
+            K::Lamp => (1, 0, 1, 0, 0, 0, 0),
+            K::Hearth => (4, 0, 0, 0, 0, 0, 0),
+            K::Stove => (3, 2, 0, 0, 0, 0, 0),
+            K::Forge => (6, 0, 0, 0, 0, 0, 0),
+            K::StoneDoor => (3, 0, 0, 0, 0, 0, 0),
+            K::Anvil => (0, 0, 0, 0, 0, 3, 0),
+            K::IronDoor => (0, 0, 0, 0, 0, 0, 1),
+            K::Smelt => (0, 0, 0, 2, 1, 0, 0),
+            K::Smith => (0, 0, 0, 0, 0, 2, 0),
+        };
+        // Every variant, in wire order: the postcard tag is its index.
+        let kinds: Vec<K> = (0..=u8::MAX)
+            .map_while(|i| postcard::from_bytes::<K>(&[i]).ok())
+            .collect();
+        assert!(kinds.len() >= 24, "{kinds:?}");
+        for k in kinds {
+            let (stone, wood, gold, iron_ore, coal, iron, iron_door) = expected(k);
             let want = Resources {
                 stone,
                 wood,
@@ -567,27 +555,15 @@ mod tests {
     }
 
     #[test]
-    fn iron_chain_costs_and_recipes() {
+    fn iron_chain_recipes() {
+        // Costs are pinned by `every_kind_has_its_cost`.
         use DesignationKind as K;
         let r = |f: fn(&mut Resources)| {
             let mut r = Resources::default();
             f(&mut r);
             r
         };
-        assert_eq!(K::Forge.cost(), r(|r| r.stone = 6));
-        assert_eq!(K::Anvil.cost(), r(|r| r.iron = 3));
-        assert_eq!(K::WoodDoor.cost(), r(|r| r.wood = 3));
-        assert_eq!(K::StoneDoor.cost(), r(|r| r.stone = 3));
-        assert_eq!(K::IronDoor.cost(), r(|r| r.iron_door = 1));
-        assert_eq!(
-            K::Smelt.cost(),
-            r(|r| {
-                r.iron_ore = 2;
-                r.coal = 1
-            })
-        );
         assert_eq!(K::Smelt.product(), r(|r| r.iron = 1));
-        assert_eq!(K::Smith.cost(), r(|r| r.iron = 2));
         assert_eq!(K::Smith.product(), r(|r| r.iron_door = 1));
         assert_eq!((K::Smelt.work_ticks(), K::Smith.work_ticks()), (30, 40));
         assert_eq!(Tile::Forge.recipe(), Some(K::Smelt));
