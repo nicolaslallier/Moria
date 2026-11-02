@@ -5,7 +5,7 @@ use moria_core::ai::Assignments;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
 use moria_core::srd::hero_dig_ticks;
-use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, Hero, World};
+use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, HEALTH_MAX, Hero, World};
 use moria_core::{
     DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, Resources, Tile,
     TilePos,
@@ -19,6 +19,10 @@ const WALL_BUILD_TICKS: u16 = 15;
 const COW_EVERY: u64 = 10;
 /// Each dwarf eats one food four times a game day: a full food gauge.
 const EAT_EVERY: u64 = FOOD_MAX as u64;
+/// A hungry dwarf loses 1 health this often (starves from full health in 9000 ticks).
+const HUNGER_DAMAGE_EVERY: u64 = 90;
+/// A fed dwarf regains 1 health this often.
+const REGEN_EVERY: u64 = 30;
 /// Ticks between two growth checks; a field ripens with odds 1 in `RIPEN_ODDS` at each,
 /// so in about a sixth of a day: one field feeds about two dwarves, walking included.
 const GROW_EVERY: u64 = 100;
@@ -485,10 +489,13 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         // and eats as soon as there is food.
         let meal = tick != 0 && tick.is_multiple_of(EAT_EVERY); // a new world starts fed
         for d in f.dwarves.iter_mut() {
+            d.ticks_alive += 1;
+            d.food = d.food.saturating_sub(1);
             d.hungry |= meal;
             if d.hungry && f.resources.food > 0 {
                 f.resources.food -= 1;
                 d.hungry = false;
+                d.food = FOOD_MAX;
             } else if d.hungry
                 && !d
                     .task
@@ -496,6 +503,13 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     .is_some_and(|t| food_work(m, t.target, t.kind))
             {
                 d.task = None; // a hungry dwarf only goes after food
+            }
+            if d.hungry {
+                if tick.is_multiple_of(HUNGER_DAMAGE_EVERY) {
+                    d.health = d.health.saturating_sub(1); // death is handled elsewhere
+                }
+            } else if tick.is_multiple_of(REGEN_EVERY) {
+                d.health = (d.health + 1).min(HEALTH_MAX);
             }
         }
 
@@ -640,6 +654,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                         f.resources.add(r);
                         f.resources.take(&task.kind.cost());
                     }
+                    if !blocked {
+                        f.dwarves[i].jobs_done += 1;
+                    }
                     continue;
                 }
             }
@@ -674,7 +691,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
 mod tests {
     use super::*;
     use moria_core::srd::{Class, Race, roll_abilities};
-    use moria_core::world::{HEALTH_MAX, Hero, claim_mountain, generate};
+    use moria_core::world::{Hero, claim_mountain, generate};
     use moria_core::{DwarfId, PlayerId};
     use std::time::Instant;
 
@@ -2337,5 +2354,92 @@ mod tests {
         assert!(w.mountains[&M].orders.is_empty());
         assert_eq!(w.fortresses[&M].resources.stone, stone + 6);
         assert!(reported);
+    }
+
+    fn dwarf0(w: &mut World) -> &mut Dwarf {
+        &mut w.fortresses.get_mut(&M).unwrap().dwarves[0]
+    }
+
+    #[test]
+    fn vitals_food_gauge_drains_and_refills_on_meal() {
+        let mut w = setup();
+        w.tick = 1;
+        for _ in 0..10 {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).food, FOOD_MAX - 10);
+        w.tick = EAT_EVERY;
+        res(&mut w).food = 5;
+        step(&mut w);
+        assert_eq!(dwarf0(&mut w).food, FOOD_MAX, "a meal refills the gauge");
+        dwarf0(&mut w).food = 0;
+        w.tick = 1;
+        step(&mut w);
+        assert_eq!(dwarf0(&mut w).food, 0, "floor at zero");
+    }
+
+    #[test]
+    fn vitals_hungry_dwarf_loses_health_over_time() {
+        let mut w = setup();
+        w.tick = 1;
+        res(&mut w).food = 0;
+        dwarf0(&mut w).hungry = true;
+        for _ in 0..HUNGER_DAMAGE_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX - 1);
+        dwarf0(&mut w).health = 0;
+        for _ in 0..HUNGER_DAMAGE_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, 0, "saturates at zero");
+    }
+
+    #[test]
+    fn vitals_fed_dwarf_regenerates_health() {
+        let mut w = setup();
+        w.tick = 1;
+        dwarf0(&mut w).health = HEALTH_MAX - 5;
+        for _ in 0..REGEN_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX - 4);
+        dwarf0(&mut w).health = HEALTH_MAX;
+        for _ in 0..REGEN_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX, "capped");
+    }
+
+    #[test]
+    fn vitals_ticks_alive_and_jobs_done_count() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = p(5, 1, 0);
+        assign(&mut w, 1, rock);
+        w.tick = 1;
+        for _ in 0..500 {
+            step(&mut w);
+        }
+        let d = &w.fortresses[&M].dwarves[1];
+        assert_eq!(d.ticks_alive, 500);
+        assert_eq!(d.jobs_done, 1);
+        assert_eq!(w.fortresses[&M].dwarves[0].jobs_done, 0);
+    }
+
+    #[test]
+    fn vitals_hero_stays_fed_and_healthy() {
+        let mut w = setup();
+        w.tick = 1;
+        res(&mut w).food = 0;
+        for d in &mut w.fortresses.get_mut(&M).unwrap().dwarves {
+            d.hungry = true;
+        }
+        for _ in 0..HUNGER_DAMAGE_EVERY * 3 {
+            step(&mut w);
+        }
+        let h = w.fortresses[&M].hero.as_ref().unwrap();
+        assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));
     }
 }
