@@ -6,6 +6,7 @@ pub mod bridge;
 mod inventory;
 pub mod metrics;
 pub mod net;
+mod quest;
 pub mod sim;
 
 use inventory::InvSync;
