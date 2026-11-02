@@ -1,7 +1,7 @@
 //! Keyboard, gamepad and mouse to protocol messages, through the `Game` rules.
 
 use crate::Client;
-use crate::game::{Dialog, Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
+use crate::game::{Game, ORDER_ROWS, PAUSE_ROWS, Screen, drag_msg};
 use crate::render::to_tile;
 use bevy::input::keyboard::Key;
 use bevy::prelude::*;
@@ -245,7 +245,7 @@ fn play(
         g.pause = false;
     }
     // Dialogue ouvert : le clavier sert à la saisie (egui), rien n'atteint le héros ni les menus.
-    if g.dialog.is_some() {
+    if g.dialog.open {
         return;
     }
     // Pause menu open: moves and the action button drive it, nothing reaches the hero.
@@ -282,7 +282,7 @@ fn play(
         return;
     }
     if k.talk {
-        g.dialog = Some(Dialog::default());
+        g.dialog.open = true;
         return;
     }
     let mut out = vec![];
@@ -521,11 +521,11 @@ mod tests {
         assert_ne!(g.hero.pos, crate::game::tests::game().hero.pos);
         let mut g = crate::game::tests::game();
         let start = g.hero.pos;
-        g.dialog = Some(crate::game::Dialog::default());
+        g.dialog.open = true;
         let g = play_frame(g, &keys);
         assert_eq!(g.hero.pos, start);
         assert!(!g.status && !g.build_menu && g.browse_z.is_none());
-        assert!(g.dialog.is_some());
+        assert!(g.dialog.open);
     }
 
     #[test]
@@ -533,6 +533,53 @@ mod tests {
         let mut g = crate::game::tests::game();
         g.king = moria_core::TilePos::new(1, 0, 0);
         let g = play_frame(g, &[KeyCode::KeyE]);
-        assert!(g.dialog.is_some() && g.browse_z.is_none());
+        assert!(g.dialog.open && g.browse_z.is_none());
+    }
+
+    /// Question posée dans le dialogue, Échap via `play`, puis la réponse arrive.
+    fn asked_closed_then_answered(king: moria_core::TilePos) -> crate::game::Game {
+        use crate::game::{Session, Who};
+        use moria_core::king::{Lang, QuestId};
+        use moria_core::protocol::ServerMsg;
+        let mut g = crate::game::tests::game();
+        g.king = king;
+        g.dialog.open = true;
+        g.dialog.input = "Une tâche ?".into();
+        g.send_talk(std::time::Instant::now(), Lang::Fr).unwrap();
+        let g = play_frame(g, &[KeyCode::Escape]);
+        assert!(!g.dialog.open);
+        let mut s = Session {
+            game: Some(g),
+            ..Default::default()
+        };
+        s.handle(crate::net::NetEvent::Msg(ServerMsg::KingSay {
+            text: "Rapporte des vivres.".into(),
+            offer: Some(QuestId::Food),
+        }));
+        let g = s.game.take().unwrap();
+        assert_eq!(
+            g.dialog.log.last(),
+            Some(&(Who::King, "Rapporte des vivres.".to_string()))
+        );
+        g
+    }
+
+    #[test]
+    fn hero_moves_normally_after_escape_even_if_a_reply_arrives_later() {
+        let g = asked_closed_then_answered(moria_core::TilePos::new(0, 0, 0));
+        let start = g.hero.pos;
+        let g = play_frame(g, &[KeyCode::KeyD]);
+        assert!(!g.dialog.open);
+        assert_ne!(g.hero.pos, start);
+    }
+
+    #[test]
+    fn reopening_with_e_shows_the_late_reply_and_its_offer() {
+        use moria_core::king::QuestId;
+        let g = asked_closed_then_answered(moria_core::TilePos::new(1, 0, 0));
+        let g = play_frame(g, &[KeyCode::KeyE]);
+        assert!(g.dialog.open);
+        assert_eq!(g.dialog.log.len(), 2);
+        assert_eq!(g.can_accept(), Some(QuestId::Food));
     }
 }

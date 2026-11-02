@@ -168,6 +168,8 @@ mod tests {
             }
             assert!(fr.0 != en.0 && fr.1 != en.1, "{id:?}");
         }
+        let (fr, en) = crate::ui::WAIT_HINT;
+        assert!(!fr.is_empty() && !en.is_empty() && fr != en);
         // Langue du client par défaut : français, envoyée telle quelle dans `Talk`.
         assert_eq!(talk_lang(false), Lang::Fr);
         assert_eq!(talk_lang(true), Lang::En);

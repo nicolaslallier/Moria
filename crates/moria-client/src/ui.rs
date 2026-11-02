@@ -415,17 +415,25 @@ fn king_dialog(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     Ok(())
 }
 
+/// Entrée pendant que le roi réfléchit : rien ne part, le texte attend.
+pub(crate) const WAIT_HINT: (&str, &str) = (
+    "Le roi n'a pas fini : votre texte partira après sa réponse.",
+    "The king is not done: your text can go after his answer.",
+);
+
 /// Id du champ de saisie : seul contrôle du dialogue qui garde le focus.
 const KING_INPUT: &str = "roi_saisie";
 
 /// Dialogue avec le roi : journal, saisie, Accepter, remise de la nourriture.
 fn king_window(ctx: &egui::Context, g: &mut Game, now: Instant) -> Option<ClientMsg> {
-    g.dialog.as_ref()?;
+    if !g.dialog.open {
+        return None;
+    }
     let waiting = g.dialog_waiting(now);
     let accept = g.can_accept();
     let turn_in = g.can_turn_in();
     let quest = quest_lines(g);
-    let d = g.dialog.as_mut()?;
+    let d = &mut g.dialog;
     let (mut out, mut send) = (None, false);
     centered(tr("Le roi nain", "The dwarf king")).show(ctx, |ui| {
         egui::ScrollArea::vertical()
@@ -454,6 +462,9 @@ fn king_window(ctx: &egui::Context, g: &mut Game, now: Instant) -> Option<Client
         send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         r.request_focus();
         ui.small(format!("{} / {MAX_TALK_CHARS}", d.input.chars().count()));
+        if waiting && !d.input.trim().is_empty() {
+            ui.small(tr(WAIT_HINT.0, WAIT_HINT.1));
+        }
         // Les boutons rendent le focus : Tab puis Espace ou Entrée ne doit rien accepter.
         if let Some(id) = accept {
             let title = quest_text(id, lang()).0;
@@ -1217,10 +1228,11 @@ mod tests {
 
     fn with_dialog(offer: Option<QuestId>) -> Game {
         let mut g = crate::game::tests::game();
-        g.dialog = Some(Dialog {
+        g.dialog = Dialog {
+            open: true,
             offer,
             ..Default::default()
-        });
+        };
         g
     }
 
@@ -1289,6 +1301,20 @@ mod tests {
         assert!(shows(&texts, "Le roi réfléchit"), "{texts:?}");
     }
 
+    #[test]
+    fn enter_while_the_king_thinks_keeps_the_text_and_says_why() {
+        let mut g = with_dialog(None);
+        g.dialog.waiting_since = Some(Instant::now());
+        let ctx = egui::Context::default();
+        king_frame(&ctx, &mut g, vec![]);
+        king_frame(&ctx, &mut g, vec![egui::Event::Text("Alors ?".into())]);
+        let (_, msg) = king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]);
+        assert_eq!(msg, None);
+        assert_eq!(g.dialog.input, "Alors ?");
+        let (texts, _) = king_frame(&ctx, &mut g, vec![]);
+        assert!(shows(&texts, WAIT_HINT.0), "{texts:?}");
+    }
+
     /// Tab puis Espace ou Entrée ne doivent jamais presser Accepter ni la remise.
     #[test]
     fn king_dialog_never_takes_focus_by_accident() {
@@ -1312,6 +1338,6 @@ mod tests {
             let f = ctx.memory(|m| m.focused());
             assert!(f.is_none() || f == Some(input), "{k:?}: {f:?}");
         }
-        assert!(g.dialog.is_some());
+        assert!(g.dialog.open);
     }
 }

@@ -264,6 +264,8 @@ pub enum Who {
 /// Fenêtre de dialogue avec le roi (touche E à côté de lui).
 #[derive(Default)]
 pub struct Dialog {
+    /// Fenêtre affichée ; la fermer ne touche ni au journal ni à l'attente.
+    pub open: bool,
     pub input: String,
     pub log: Vec<(Who, String)>,
     /// Question envoyée, réponse attendue depuis cet instant.
@@ -374,7 +376,7 @@ pub struct Game {
     pub quest: Option<Quest>,
     /// Quêtes terminées : chacune ne se fait qu'une fois.
     pub done: Vec<QuestId>,
-    pub dialog: Option<Dialog>,
+    pub dialog: Dialog,
 }
 
 /// Everything the player can build: mode and label; the cost is `kind.cost()`.
@@ -468,12 +470,12 @@ impl Game {
 
     /// Closes the build, order and status menus and the king's dialogue; true if one was open.
     pub fn close_menus(&mut self) -> bool {
-        let open =
-            self.build_menu || self.status || self.order_menu.is_some() || self.dialog.is_some();
+        let open = self.build_menu || self.status || self.order_menu.is_some() || self.dialog.open;
         self.build_menu = false;
         self.status = false;
         self.order_menu = None;
-        self.dialog = None;
+        // Ferme seulement la fenêtre : une question en vol le reste (une seule à la fois).
+        self.dialog.open = false;
         open
     }
 
@@ -531,7 +533,7 @@ impl Game {
             king: v.king,
             quest: v.quest,
             done: v.done,
-            dialog: None,
+            dialog: Dialog::default(),
         }
     }
 
@@ -732,7 +734,7 @@ impl Game {
         if self.dialog_waiting(now) {
             return None;
         }
-        let d = self.dialog.as_mut()?;
+        let d = &mut self.dialog;
         let text: String = d.input.trim().chars().take(MAX_TALK_CHARS).collect();
         if text.is_empty() {
             return None;
@@ -745,9 +747,7 @@ impl Game {
 
     /// Une réponse est attendue ; l'attente cesse d'elle-même après `KING_TIMEOUT`.
     pub fn dialog_waiting(&mut self, now: Instant) -> bool {
-        let Some(d) = &mut self.dialog else {
-            return false;
-        };
+        let d = &mut self.dialog;
         if d.waiting_since
             .is_some_and(|t| now.saturating_duration_since(t) >= KING_TIMEOUT)
         {
@@ -756,9 +756,9 @@ impl Game {
         d.waiting_since.is_some()
     }
 
-    /// Réplique du roi : rouvre le dialogue s'il a été fermé entre-temps.
+    /// Réplique du roi : notée au journal sans rouvrir la fenêtre (E la rouvre à côté du roi).
     pub fn king_say(&mut self, text: String, offer: Option<QuestId>) {
-        let d = self.dialog.get_or_insert_with(Dialog::default);
+        let d = &mut self.dialog;
         // Texte venu du réseau : borné comme côté serveur.
         push_log(
             &mut d.log,
@@ -771,7 +771,7 @@ impl Game {
 
     /// La quête que le bouton Accepter enverrait.
     pub fn can_accept(&self) -> Option<QuestId> {
-        let id = self.dialog.as_ref()?.offer?;
+        let id = self.dialog.offer?;
         (self.quest.is_none() && !self.done.contains(&id)).then_some(id)
     }
 
@@ -1845,23 +1845,24 @@ pub(crate) mod tests {
     #[test]
     fn dialog_closes_on_escape() {
         let mut g = game();
-        g.dialog = Some(Dialog::default());
+        g.dialog.open = true;
         g.escape();
-        assert!(g.dialog.is_none() && !g.pause);
+        assert!(!g.dialog.open && !g.pause);
     }
 
     #[test]
     fn waiting_indicator_clears_after_75s() {
         let mut g = game();
-        g.dialog = Some(Dialog {
+        g.dialog = Dialog {
+            open: true,
             input: "Salut".into(),
             ..Default::default()
-        });
+        };
         let t0 = Instant::now();
         assert!(g.send_talk(t0, Lang::Fr).is_some());
         assert!(g.dialog_waiting(t0 + Duration::from_secs(74)));
         // Pas de seconde question tant que le roi réfléchit.
-        g.dialog.as_mut().unwrap().input = "Encore".into();
+        g.dialog.input = "Encore".into();
         assert_eq!(g.send_talk(t0 + Duration::from_secs(74), Lang::Fr), None);
         assert!(!g.dialog_waiting(t0 + KING_TIMEOUT));
         assert!(g.send_talk(t0 + KING_TIMEOUT, Lang::Fr).is_some());
@@ -1870,18 +1871,19 @@ pub(crate) mod tests {
     #[test]
     fn talk_sends_the_trimmed_input_in_the_chosen_language_never_empty() {
         let mut g = game();
-        g.dialog = Some(Dialog {
+        g.dialog = Dialog {
+            open: true,
             input: "   ".into(),
             ..Default::default()
-        });
+        };
         let t0 = Instant::now();
         assert_eq!(g.send_talk(t0, Lang::En), None);
-        g.dialog.as_mut().unwrap().input = format!(" {} ", "é".repeat(300));
+        g.dialog.input = format!(" {} ", "é".repeat(300));
         let Some(ClientMsg::Talk { text, lang }) = g.send_talk(t0, Lang::En) else {
             panic!("no Talk")
         };
         assert_eq!((text.chars().count(), lang), (MAX_TALK_CHARS, Lang::En));
-        let d = g.dialog.as_ref().unwrap();
+        let d = &g.dialog;
         assert!(d.input.is_empty());
         assert_eq!(d.log, vec![(Who::Player, text)]);
         assert!(d.waiting_since.is_some());
@@ -1905,10 +1907,11 @@ pub(crate) mod tests {
             game: Some(game()),
             ..Default::default()
         };
-        s.game.as_mut().unwrap().dialog = Some(Dialog {
+        s.game.as_mut().unwrap().dialog = Dialog {
+            open: true,
             input: "Une tâche ?".into(),
             ..Default::default()
-        });
+        };
         let t0 = Instant::now();
         s.game.as_mut().unwrap().send_talk(t0, Lang::Fr).unwrap();
         s.handle(NetEvent::Msg(ServerMsg::KingSay {
@@ -1919,7 +1922,7 @@ pub(crate) mod tests {
         assert!(!g.dialog_waiting(t0));
         assert_eq!(g.can_accept(), Some(QuestId::Food));
         assert_eq!(
-            g.dialog.as_ref().unwrap().log.last(),
+            g.dialog.log.last(),
             Some(&(Who::King, "Rapporte-moi des vivres.".to_string()))
         );
         // Refus : le serveur renvoie l'état réel, ici une autre quête déjà active.
@@ -1936,23 +1939,61 @@ pub(crate) mod tests {
         let g = s.game.as_mut().unwrap();
         assert_eq!((g.quest, g.done.clone()), (None, vec![QuestId::Depth]));
         assert_eq!(g.can_accept(), Some(QuestId::Food));
-        g.dialog.as_mut().unwrap().offer = Some(QuestId::Depth);
+        g.dialog.offer = Some(QuestId::Depth);
         assert_eq!(g.can_accept(), None);
     }
 
+    /// Une question en vol, puis Échap.
+    fn asked_then_closed(t0: Instant) -> Game {
+        let mut g = game();
+        g.dialog = Dialog {
+            open: true,
+            input: "Une tâche ?".into(),
+            ..Default::default()
+        };
+        g.send_talk(t0, Lang::Fr).unwrap();
+        g.escape();
+        assert!(!g.dialog.open);
+        g
+    }
+
     #[test]
-    fn a_late_kingsay_reopens_the_dialog() {
+    fn escape_keeps_the_wait_state_so_a_second_talk_is_refused() {
+        let t0 = Instant::now();
+        let mut g = asked_then_closed(t0);
+        g.dialog.open = true;
+        g.dialog.input = "Alors ?".into();
+        let later = t0 + Duration::from_secs(5);
+        assert!(g.dialog_waiting(later));
+        assert_eq!(g.send_talk(later, Lang::Fr), None);
+        // Le texte tapé reste là pour plus tard.
+        assert_eq!(g.dialog.input, "Alors ?");
+        assert_eq!(g.dialog.log.len(), 1);
+    }
+
+    #[test]
+    fn late_kingsay_after_escape_does_not_reopen_the_window() {
+        let t0 = Instant::now();
         let mut s = Session {
             screen: Screen::Playing,
-            game: Some(game()),
+            game: Some(asked_then_closed(t0)),
             ..Default::default()
         };
         s.handle(NetEvent::Msg(ServerMsg::KingSay {
             text: "Hm.".into(),
-            offer: None,
+            offer: Some(QuestId::Food),
         }));
-        let d = s.game.as_ref().unwrap().dialog.as_ref().unwrap();
-        assert_eq!(d.log, vec![(Who::King, "Hm.".to_string())]);
+        let g = s.game.as_mut().unwrap();
+        assert!(!g.dialog.open);
+        assert!(!g.dialog_waiting(t0));
+        assert_eq!(g.dialog.log.last(), Some(&(Who::King, "Hm.".to_string())));
+        assert_eq!(g.dialog.offer, Some(QuestId::Food));
+    }
+
+    #[test]
+    fn a_new_game_starts_with_a_closed_empty_dialog() {
+        let d = game().dialog;
+        assert!(!d.open && d.log.is_empty() && d.waiting_since.is_none() && d.offer.is_none());
     }
 
     #[test]
