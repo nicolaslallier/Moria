@@ -2,6 +2,7 @@
 //! `apply_command` / `apply_assignments` between ticks and `step` once per tick.
 
 use moria_core::ai::Assignments;
+use moria_core::food::FoodAction;
 use moria_core::light::DAY_TICKS;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
@@ -16,14 +17,8 @@ use std::collections::{BTreeMap, HashSet};
 const MOVE_COOLDOWN: u8 = 2;
 const STAIRS_EXTRA_TICKS: u16 = 10;
 const WALL_BUILD_TICKS: u16 = 15;
-/// Ticks between two grazing steps of the herd.
-const COW_EVERY: u64 = 10;
 /// Each dwarf eats one food four times a game day.
 const EAT_EVERY: u64 = DAY_TICKS / 4;
-/// Ticks between two growth checks; a field ripens with odds 1 in `RIPEN_ODDS` at each,
-/// so in about a sixth of a day: one field feeds about two dwarves, walking included.
-const GROW_EVERY: u64 = 100;
-const RIPEN_ODDS: u64 = 60;
 const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
 
 /// The dwarf as clients see it: an empty path means it is at its work spot.
@@ -82,6 +77,8 @@ pub struct Changes {
     pub designations: BTreeMap<TilePos, Option<DesignationKind>>,
     pub tiles: Vec<(TilePos, Tile)>,
     pub orders: BTreeMap<TilePos, u8>,
+    /// What the food simulation must hear; not part of the client's delta.
+    pub food: Vec<FoodAction>,
 }
 
 impl Changes {
@@ -90,6 +87,7 @@ impl Changes {
         self.designations.extend(later.designations);
         self.tiles.extend(later.tiles);
         self.orders.extend(later.orders);
+        self.food.extend(later.food);
     }
 
     /// Merges into the tick delta. These changes happened before `step`, so whatever `d`
@@ -397,6 +395,7 @@ fn dig_at(
     for (q, old_tile, had) in old {
         if let Some(now) = m.get(q).filter(|n| Some(*n) != old_tile) {
             tiles.push((q, now));
+            ch.food.extend(food_action(q, old_tile, now));
         }
         if had && !m.designations.contains_key(&q) {
             ch.designations.insert(q, None);
@@ -405,8 +404,21 @@ fn dig_at(
     Some(res)
 }
 
+/// What the food simulation must hear when an action turns `q` from `old` into `now`.
+/// Every action that changes a tile goes through `dig_at`, so this is the only place.
+fn food_action(q: TilePos, old: Option<Tile>, now: Tile) -> Option<FoodAction> {
+    let farm = |t| matches!(t, Some(Tile::Field | Tile::Crop));
+    match (old, now) {
+        (Some(Tile::Cow), _) => Some(FoodAction::CowRemoved(q)),
+        (Some(Tile::Crop), Tile::Field) => Some(FoodAction::FieldHarvested(q)),
+        (o, Tile::Field) if !farm(o) => Some(FoodAction::FieldSown(q)),
+        (o, n) if farm(o) && !farm(Some(n)) => Some(FoodAction::FieldRemoved(q)),
+        _ => None,
+    }
+}
+
 /// Every `t` tile of the ground level.
-fn on_ground(m: &Mountain, t: Tile) -> Vec<TilePos> {
+pub(crate) fn on_ground(m: &Mountain, t: Tile) -> Vec<TilePos> {
     let ground = |x, y| TilePos::new(x, y, GROUND_Z);
     m.rect(ground(0, 0), ground(i16::MAX, i16::MAX))
         .into_iter()
@@ -414,67 +426,18 @@ fn on_ground(m: &Mountain, t: Tile) -> Vec<TilePos> {
         .collect()
 }
 
-/// ponytail: a hash of a tile and a step number (splitmix64 finalizer) stands in for an RNG.
-/// Deterministic and stateless; a seeded RNG if it ever shows patterns.
-fn mix(q: TilePos, n: u64) -> u64 {
-    let mut h = ((q.x as u64) << 40 ^ (q.y as u64) << 20 ^ n).wrapping_add(0x9e37_79b9_7f4a_7c15);
-    h = (h ^ h >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    h = (h ^ h >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
-    h ^ h >> 31
-}
-
-/// Sown fields of the ground level may ripen. A ripe one asks for its harvest, and asks
-/// again if that was cancelled or the designations were full.
-fn grow(m: &mut Mountain, n: u64, tiles: &mut Vec<(TilePos, Tile)>, ch: &mut Changes) {
-    for q in on_ground(m, Tile::Field) {
-        if mix(q, n).is_multiple_of(RIPEN_ODDS) {
-            m.set(q, Tile::Crop);
-            tiles.push((q, Tile::Crop));
-        }
-    }
-    // Past the designation cap: crops are bounded by the ground, and a famine hides every
-    // other designation, so a capped harvest would never come.
-    for q in on_ground(m, Tile::Crop) {
-        if let std::collections::btree_map::Entry::Vacant(e) = m.designations.entry(q) {
-            e.insert(DesignationKind::Chop);
-            ch.designations.insert(q, Some(DesignationKind::Chop));
-        }
-    }
-}
-
-/// Each cow on the ground level may step onto a free neighbouring grass tile. A cow that is
-/// designated, or being butchered by the hero, stands still so its job is not lost.
-fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)>) {
-    let hero_target = f
-        .hero
-        .as_ref()
-        .and_then(|h| h.dig.as_ref())
-        .map(|j| j.target);
-    let pinned = |m: &Mountain, q| m.work_at(q).is_some() || hero_target == Some(q);
-    let occupied =
-        |q| f.hero.as_ref().is_some_and(|h| h.pos == q) || f.dwarves.iter().any(|d| d.pos == q);
-    for c in on_ground(m, Tile::Cow) {
-        // Half the time the cow stays.
-        let Some(&d) = Dir::HORIZONTAL.get((mix(c, n) >> 61) as usize) else {
-            continue;
-        };
-        let to = c.step(d);
-        if pinned(m, c) || m.get(to) != Some(Tile::Grass) || pinned(m, to) || occupied(to) {
-            continue;
-        }
-        m.set(c, Tile::Grass);
-        m.set(to, Tile::Cow);
-        tiles.extend([(c, Tile::Grass), (to, Tile::Cow)]);
-    }
-}
-
 /// Advances every fortress by one tick, owner connected or not. Returns a delta for each
-/// fortress that has a hero.
-pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
+/// fortress that has a hero, and the food actions of every mountain that has some.
+pub fn step_with_food(
+    w: &mut World,
+) -> (
+    BTreeMap<MountainId, TickDelta>,
+    BTreeMap<MountainId, Vec<FoodAction>>,
+) {
     let tick = w.tick;
     w.tick += 1;
     let no_block = HashSet::new();
-    let mut out = BTreeMap::new();
+    let (mut out, mut food) = (BTreeMap::new(), BTreeMap::new());
     for (&id, f) in w.fortresses.iter_mut() {
         let Some(m) = w.mountains.get_mut(&id) else {
             continue;
@@ -572,13 +535,6 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             }
         }
 
-        if tick.is_multiple_of(COW_EVERY) {
-            graze(m, f, tick / COW_EVERY, &mut tiles);
-        }
-        if tick.is_multiple_of(GROW_EVERY) {
-            grow(m, tick / GROW_EVERY, &mut tiles, &mut ch);
-        }
-
         for i in 0..f.dwarves.len() {
             let Some(mut task) = f.dwarves[i].task.take() else {
                 continue;
@@ -647,6 +603,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             f.dwarves[i].task = Some(task);
         }
 
+        if !ch.food.is_empty() {
+            food.insert(id, std::mem::take(&mut ch.food));
+        }
         if let Some(h) = &f.hero {
             let mut d = TickDelta {
                 tick: w.tick,
@@ -668,26 +627,32 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             out.insert(id, d);
         }
     }
-    out
+    (out, food)
+}
+
+/// `step_with_food` without the food actions.
+#[cfg(test)]
+pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
+    step_with_food(w).0
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use moria_core::srd::{Class, Race, roll_abilities};
     use moria_core::world::{Hero, claim_mountain, generate};
     use moria_core::{DwarfId, PlayerId};
     use std::time::Instant;
 
-    const M: MountainId = MountainId(0);
+    pub(crate) const M: MountainId = MountainId(0);
     /// Offset from the entrance room's north-west corner (z 0 = `GROUND_Z`).
-    fn p(x: i16, y: i16, z: u8) -> TilePos {
+    pub(crate) fn p(x: i16, y: i16, z: u8) -> TilePos {
         let e = moria_core::world::entrance_tiles().next().unwrap();
         TilePos::new(e.x + x, e.y + y, e.z + z)
     }
 
     /// One claimed mountain with a hero at p(2, 1, 0), in the entrance room.
-    fn setup() -> World {
+    pub(crate) fn setup() -> World {
         let mut w = generate(1);
         claim_mountain(&mut w, PlayerId(1)).unwrap();
         w.fortresses.get_mut(&M).unwrap().hero = Some(Hero {
@@ -705,10 +670,10 @@ mod tests {
         w.fortresses.get_mut(&M).unwrap().resources = Resources::default();
         w
     }
-    fn hero(w: &World) -> &Hero {
+    pub(crate) fn hero(w: &World) -> &Hero {
         w.fortresses[&M].hero.as_ref().unwrap()
     }
-    fn set_str(w: &mut World, s: u8) {
+    pub(crate) fn set_str(w: &mut World, s: u8) {
         w.fortresses
             .get_mut(&M)
             .unwrap()
@@ -718,10 +683,10 @@ mod tests {
             .abilities
             .str = s;
     }
-    fn tile(w: &World, q: TilePos) -> Tile {
+    pub(crate) fn tile(w: &World, q: TilePos) -> Tile {
         w.mountains[&M].get(q).unwrap()
     }
-    fn designate(w: &mut World, q: TilePos, kind: DesignationKind) {
+    pub(crate) fn designate(w: &mut World, q: TilePos, kind: DesignationKind) {
         apply_command(w, M, Command::Designate { a: q, b: q, kind });
     }
 
@@ -1490,7 +1455,7 @@ mod tests {
         assert_eq!(w, before);
     }
 
-    fn assign(w: &mut World, i: usize, t: TilePos) {
+    pub(crate) fn assign(w: &mut World, i: usize, t: TilePos) {
         let id = w.fortresses[&M].dwarves[i].id;
         apply_assignments(
             w,
@@ -1562,7 +1527,7 @@ mod tests {
     }
 
     /// A cow at `c` (outdoors, on the ground) fenced by trees except toward `open`.
-    fn cow_pen(w: &mut World, c: TilePos, open: &[Dir]) {
+    pub(crate) fn cow_pen(w: &mut World, c: TilePos, open: &[Dir]) {
         let m = w.mountains.get_mut(&M).unwrap();
         m.set(c, Tile::Cow);
         for d in Dir::HORIZONTAL {
@@ -1574,7 +1539,7 @@ mod tests {
             m.set(c.step(d), t);
         }
     }
-    fn cows(w: &World) -> usize {
+    pub(crate) fn cows(w: &World) -> usize {
         let m = &w.mountains[&M];
         m.rect(
             TilePos::new(0, 0, moria_core::GROUND_Z),
@@ -1583,38 +1548,6 @@ mod tests {
         .into_iter()
         .filter(|&q| m.get(q) == Some(Tile::Cow))
         .count()
-    }
-
-    #[test]
-    fn cows_wander_onto_grass() {
-        let mut w = setup();
-        let c = p(-6, 1, 0);
-        cow_pen(&mut w, c, &[Dir::N]);
-        let herd = cows(&w);
-        let mut seen = vec![];
-        for _ in 0..300 {
-            seen.extend(step(&mut w).remove(&M).unwrap().tiles);
-            assert_eq!(cows(&w), herd, "a moving cow is neither lost nor cloned");
-        }
-        assert!(seen.contains(&(c, Tile::Grass)) && seen.contains(&(c.step(Dir::N), Tile::Cow)));
-    }
-
-    #[test]
-    fn a_free_cow_roams_the_meadow() {
-        let f = setup().fortresses[&M].clone(); // hero and dwarves sit off this small meadow
-        let mut m = Mountain::new(M, 41, 41, GROUND_Z + 1, Tile::Grass);
-        let mut c = TilePos::new(20, 20, GROUND_Z);
-        m.set(c, Tile::Cow);
-        let mut seen = HashSet::from([c]);
-        for n in 0..300 {
-            let mut tiles = vec![];
-            graze(&mut m, &f, n, &mut tiles);
-            if let Some(&(to, _)) = tiles.iter().find(|t| t.1 == Tile::Cow) {
-                c = to;
-            }
-            seen.insert(c);
-        }
-        assert!(seen.len() > 20, "the cow only visits {} tiles", seen.len());
     }
 
     #[test]
@@ -1734,21 +1667,6 @@ mod tests {
     }
 
     #[test]
-    fn a_crop_asks_for_its_harvest_even_when_designations_are_full() {
-        let mut m = Mountain::new(M, 80, 80, GROUND_Z + 1, Tile::Rock);
-        m.designate(
-            TilePos::new(0, 0, 0),
-            TilePos::new(79, 79, 0),
-            DesignationKind::Dig,
-        );
-        assert_eq!(m.designations.len(), MAX_DESIGNATIONS);
-        let c = TilePos::new(1, 1, GROUND_Z);
-        m.set(c, Tile::Crop);
-        grow(&mut m, 0, &mut vec![], &mut Changes::default());
-        assert_eq!(m.designations.get(&c), Some(&DesignationKind::Chop));
-    }
-
-    #[test]
     fn the_hero_does_not_trample_a_field() {
         let mut w = setup();
         w.mountains
@@ -1775,76 +1693,6 @@ mod tests {
         }
         assert_eq!(tile(&w, c), Tile::Field);
         assert_eq!(w.fortresses[&M].resources.food, 2);
-    }
-
-    #[test]
-    fn an_unasked_crop_asks_again() {
-        let mut m = Mountain::new(M, 4, 4, GROUND_Z + 1, Tile::Grass);
-        let c = TilePos::new(1, 1, GROUND_Z);
-        m.set(c, Tile::Crop); // e.g. its harvest was cancelled
-        let (mut tiles, mut ch) = (vec![], Changes::default());
-        grow(&mut m, 0, &mut tiles, &mut ch);
-        assert_eq!(m.designations.get(&c), Some(&DesignationKind::Chop));
-        assert_eq!(ch.designations.get(&c), Some(&Some(DesignationKind::Chop)));
-    }
-
-    #[test]
-    fn fields_ripen_and_call_for_harvest() {
-        let mut m = Mountain::new(M, 10, 10, GROUND_Z + 1, Tile::Grass);
-        let fields: Vec<_> = m.rect(TilePos::new(0, 0, GROUND_Z), TilePos::new(9, 9, GROUND_Z));
-        for &q in &fields {
-            m.set(q, Tile::Field);
-        }
-        let ripe = |m: &Mountain| {
-            fields
-                .iter()
-                .filter(|&&q| m.get(q) == Some(Tile::Crop))
-                .count()
-        };
-        let (mut tiles, mut ch) = (vec![], Changes::default());
-        grow(&mut m, 0, &mut tiles, &mut ch);
-        assert!(ripe(&m) <= 10, "a field takes its time: {}", ripe(&m));
-        for n in 1..200 {
-            grow(&mut m, n, &mut tiles, &mut ch);
-        }
-        assert!(
-            ripe(&m) >= 60,
-            "most fields ripen within a few hours: {}",
-            ripe(&m)
-        );
-        for &q in fields.iter().filter(|&&q| m.get(q) == Some(Tile::Crop)) {
-            assert_eq!(
-                m.designations.get(&q),
-                Some(&DesignationKind::Chop),
-                "harvest asked"
-            );
-            assert_eq!(ch.designations.get(&q), Some(&Some(DesignationKind::Chop)));
-            assert!(tiles.contains(&(q, Tile::Crop)));
-        }
-    }
-
-    #[test]
-    fn designated_cow_stands_still() {
-        let mut w = setup();
-        let c = p(-6, 1, 0);
-        cow_pen(&mut w, c, &[Dir::N]);
-        designate(&mut w, c, DesignationKind::Chop);
-        for _ in 0..300 {
-            step(&mut w);
-        }
-        assert_eq!(tile(&w, c), Tile::Cow);
-    }
-
-    #[test]
-    fn cow_never_steps_onto_the_hero() {
-        let mut w = setup();
-        let c = p(-6, 1, 0);
-        cow_pen(&mut w, c, &[Dir::N]);
-        w.fortresses.get_mut(&M).unwrap().hero.as_mut().unwrap().pos = c.step(Dir::N);
-        for _ in 0..300 {
-            step(&mut w);
-        }
-        assert_eq!(tile(&w, c), Tile::Cow);
     }
 
     #[test]

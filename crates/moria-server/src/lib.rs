@@ -3,6 +3,7 @@
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
 pub mod bridge;
+mod food;
 mod inventory;
 pub mod metrics;
 pub mod net;
@@ -258,6 +259,7 @@ pub async fn run_with_listener(
         last_view: None,
         saving: None,
         pending: HashMap::new(),
+        food_sim: Some(food::InProcess::default()),
     };
     let r = state.run(shutdown).await;
     accept.abort();
@@ -296,6 +298,8 @@ struct State {
     saving: Option<JoinHandle<()>>,
     /// Commands received but not yet applied (per-player cap), oldest first.
     pending: HashMap<PlayerId, VecDeque<Command>>,
+    /// The food simulation run here; `None` when it comes from the bus.
+    food_sim: Option<food::InProcess>,
 }
 
 impl State {
@@ -358,7 +362,8 @@ impl State {
             sim::apply_assignments(&mut self.w, &a);
         }
         let mut changes = self.commands();
-        let deltas = sim::step(&mut self.w);
+        let (deltas, acts) = sim::step_with_food(&mut self.w);
+        let mut fed = food::step(&mut self.w, self.food_sim.as_mut(), &acts);
         for b in self.inv.end_tick(&self.w) {
             if let Some(tx) = &self.batch_tx
                 && tx.try_send(b).is_err()
@@ -368,6 +373,11 @@ impl State {
             }
         }
         for (m, mut d) in deltas {
+            // Food first: it happened after the step, and what a delta already says wins
+            // over the commands' changes.
+            if let Some(ch) = fed.remove(&m) {
+                food::fold(ch, &mut d);
+            }
             if let Some(ch) = changes.remove(&m) {
                 ch.merge_into(&mut d);
             }
@@ -653,6 +663,7 @@ mod tests {
             last_view: None,
             saving: None,
             pending: HashMap::new(),
+            food_sim: Some(food::InProcess::default()),
         };
         (s, cmd_tx, batch_rx)
     }
@@ -686,6 +697,38 @@ mod tests {
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
         assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
+    }
+
+    #[test]
+    fn in_process_mode_moves_cows_like_before() {
+        use moria_core::Tile;
+        let (mut s, _cmd) = state();
+        let (tx, mut rx) = mpsc::channel(64);
+        s.sessions.insert(PlayerId(0), tx);
+        for _ in 0..10 {
+            s.step();
+        }
+        let mut last = BTreeMap::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ServerMsg::Tick(d) = m {
+                last.extend(d.tiles);
+            }
+        }
+        assert!(
+            last.values().any(|&t| t == Tile::Cow),
+            "no cow moved in 10 ticks"
+        );
+        let (m, f) = (
+            &s.w.mountains[&MountainId(0)],
+            &s.w.fortresses[&MountainId(0)],
+        );
+        for (q, t) in last {
+            assert_eq!(m.get(q), Some(t), "the owner sees the grid at {q:?}");
+        }
+        for q in sim::occupied(&s.w, MountainId(0)) {
+            assert_ne!(m.get(q), Some(Tile::Cow), "a cow under someone");
+        }
+        assert!(f.hero.is_some());
     }
 
     #[test]
