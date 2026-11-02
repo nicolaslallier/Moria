@@ -190,18 +190,18 @@ impl FoodSim {
             let st = self.cows[&q];
             let near = |k: u64| {
                 let (dx, dy) = [(1, 0), (-1, 0), (0, 1), (0, -1)][(k % 4) as usize];
-                TilePos::new(q.x + dx, q.y + dy, q.z)
+                TilePos::new(q.x.saturating_add(dx), q.y.saturating_add(dy), q.z)
             };
-            let fertile = tick >= st.born + ADULT_TICKS && tick >= st.fertile_at;
+            let fertile = tick >= st.born.saturating_add(ADULT_TICKS) && tick >= st.fertile_at;
             if breeds && fertile && (h >> 8).is_multiple_of(BIRTH_ODDS) && self.cows.len() < COW_CAP
             {
                 let at = near(h >> 16);
                 if let std::collections::btree_map::Entry::Vacant(e) = self.cows.entry(at) {
                     e.insert(CowState {
                         born: tick,
-                        fertile_at: tick + ADULT_TICKS,
+                        fertile_at: tick.saturating_add(ADULT_TICKS),
                     });
-                    self.cows.get_mut(&q).unwrap().fertile_at = tick + BIRTH_COOLDOWN;
+                    self.cows.get_mut(&q).unwrap().fertile_at = tick.saturating_add(BIRTH_COOLDOWN);
                     out.push(FoodEvent::CowBorn { at });
                 }
                 continue;
@@ -227,7 +227,7 @@ impl FoodSim {
                 if mix(q, (tick / GROW_EVERY) ^ self.seed).is_multiple_of(odds) {
                     f.ripe = true;
                 } else {
-                    f.progress += 1;
+                    f.progress = f.progress.saturating_add(1);
                 }
             }
             if f.ripe {
@@ -328,6 +328,35 @@ mod tests {
     }
     fn cell(pos: TilePos, kind: CellKind) -> Cell {
         Cell { pos, kind }
+    }
+
+    #[test]
+    fn forged_ticks_and_edge_coordinates_never_panic() {
+        // A forged World/Tick: cows at the i16 corners, ticks up to u64::MAX.
+        let (lo, hi) = (i16::MIN, i16::MAX);
+        let corners = [(lo, lo), (lo, hi), (hi, lo), (hi, hi), (hi, 0), (0, lo)];
+        let mut cells: Vec<Cell> = corners
+            .iter()
+            .map(|&(x, y)| cell(TilePos::new(x, y, u8::MAX), CellKind::Cow))
+            .collect();
+        cells.push(cell(p(hi, hi), CellKind::Field));
+        let mut s = FoodSim::new(u64::MAX);
+        s.adopt(&cells, u64::MAX);
+        s.adopt(&cells, u64::MAX - 3 * DAY_TICKS);
+        for t in u64::MAX - 3 * DAY_TICKS..=u64::MAX {
+            for ev in s.step(t) {
+                if t % 3 == 0 {
+                    s.reject(&ev);
+                }
+            }
+        }
+        // Spring and summer (births) at huge ticks too.
+        use crate::calendar::{SEASON_TICKS, YEAR_TICKS};
+        let summer = u64::MAX - u64::MAX % YEAR_TICKS - YEAR_TICKS + SEASON_TICKS;
+        s.adopt(&cells, summer);
+        for t in (summer..summer + 2 * DAY_TICKS).step_by(COW_EVERY as usize) {
+            s.step(t);
+        }
     }
 
     #[test]
