@@ -14,7 +14,7 @@ use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::inventory::{Batch, State as InvState};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
-use moria_core::world::{self, Account, Hero, World};
+use moria_core::world::{self, Account, FOOD_MAX, HEALTH_MAX, Hero, World};
 use moria_core::{MountainId, PlayerId, TilePos};
 use sim::{Changes, Command};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -494,6 +494,8 @@ impl State {
                     move_cooldown: 0,
                     pending_move: None,
                     pending_dig: None,
+                    food: FOOD_MAX,
+                    health: HEALTH_MAX,
                 });
                 self.send_snapshot(player, m);
             }
@@ -632,6 +634,8 @@ mod tests {
                 move_cooldown: 0,
                 pending_move: None,
                 pending_dig: None,
+                food: FOOD_MAX,
+                health: HEALTH_MAX,
             });
         }
         let (_req_tx, req_rx) = mpsc::channel(1);

@@ -2,11 +2,10 @@
 //! `apply_command` / `apply_assignments` between ticks and `step` once per tick.
 
 use moria_core::ai::Assignments;
-use moria_core::light::DAY_TICKS;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
 use moria_core::srd::hero_dig_ticks;
-use moria_core::world::{DigJob, Dwarf, DwarfTask, Fortress, Hero, World};
+use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, Hero, World};
 use moria_core::{
     DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, Resources, Tile,
     TilePos,
@@ -18,8 +17,8 @@ const STAIRS_EXTRA_TICKS: u16 = 10;
 const WALL_BUILD_TICKS: u16 = 15;
 /// Ticks between two grazing steps of the herd.
 const COW_EVERY: u64 = 10;
-/// Each dwarf eats one food four times a game day.
-const EAT_EVERY: u64 = DAY_TICKS / 4;
+/// Each dwarf eats one food four times a game day: a full food gauge.
+const EAT_EVERY: u64 = FOOD_MAX as u64;
 /// Ticks between two growth checks; a field ripens with odds 1 in `RIPEN_ODDS` at each,
 /// so in about a sixth of a day: one field feeds about two dwarves, walking included.
 const GROW_EVERY: u64 = 100;
@@ -675,7 +674,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
 mod tests {
     use super::*;
     use moria_core::srd::{Class, Race, roll_abilities};
-    use moria_core::world::{Hero, claim_mountain, generate};
+    use moria_core::world::{HEALTH_MAX, Hero, claim_mountain, generate};
     use moria_core::{DwarfId, PlayerId};
     use std::time::Instant;
 
@@ -700,6 +699,8 @@ mod tests {
             move_cooldown: 0,
             pending_move: None,
             pending_dig: None,
+            food: FOOD_MAX,
+            health: HEALTH_MAX,
         });
         // No starting food: these tests count resources from zero; meals have their own tests.
         w.fortresses.get_mut(&M).unwrap().resources = Resources::default();
@@ -1156,10 +1157,8 @@ mod tests {
             progress: 0,
         };
         let d = |task| Dwarf {
-            id: DwarfId(7),
-            pos: p(1, 1, 0),
             task,
-            hungry: false,
+            ..Dwarf::new(DwarfId(7), p(1, 1, 0))
         };
         let job = |working| {
             Some(DwarfJob {
@@ -2071,6 +2070,8 @@ mod tests {
                 move_cooldown: 0,
                 pending_move: None,
                 pending_dig: None,
+                food: FOOD_MAX,
+                health: HEALTH_MAX,
             });
             let m = w.mountains.get_mut(&id).unwrap();
             for k in 0..50 {
