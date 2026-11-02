@@ -13,13 +13,13 @@
 services:
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
-    image: ghcr.io/nicolaslallier/moria-worldgen:sha-cc8215752ce19ad28be807dadabd92be699fcb02
+    image: ghcr.io/nicolaslallier/moria-worldgen:sha-1d205a97793f926267747744f55cb1cfd45939bc
     volumes: ["moria-data:/data"]
     command: ["--out", "/data/world.bin"]
     restart: "no"
 
   server:
-    image: ghcr.io/nicolaslallier/moria-server:sha-cc8215752ce19ad28be807dadabd92be699fcb02
+    image: ghcr.io/nicolaslallier/moria-server:sha-1d205a97793f926267747744f55cb1cfd45939bc
     # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
     stop_grace_period: 30s
     # 7777 n'est plus publié ici : le nginx de l'infra (stream.d/moria.conf) l'expose et
@@ -42,7 +42,7 @@ services:
       worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
-    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-cc8215752ce19ad28be807dadabd92be699fcb02
+    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-1d205a97793f926267747744f55cb1cfd45939bc
     environment:
       AMQP_URL: *amqp
     networks: [infra-net]
@@ -54,7 +54,7 @@ services:
   # épinglage provisoire : le commit du bot CI le remplace au premier build sur main (d'ici là,
   # le pull peut échouer et être réessayé).
   inventory:
-    image: ghcr.io/nicolaslallier/moria-inventory:sha-cc8215752ce19ad28be807dadabd92be699fcb02
+    image: ghcr.io/nicolaslallier/moria-inventory:sha-1d205a97793f926267747744f55cb1cfd45939bc
     # Sauvegarde finale sur SIGTERM.
     stop_grace_period: 30s
     volumes: ["moria-inventory:/data"]
