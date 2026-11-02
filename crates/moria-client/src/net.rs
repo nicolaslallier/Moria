@@ -265,6 +265,7 @@ mod smoke {
             amqp_url: None,
             invite: Some("secret".into()),
             max_per_ip: 4,
+            king_timeout: moria_server::king::KING_TIMEOUT,
         };
         let _server = rt.spawn(moria_server::run_with_listener(
             cfg,

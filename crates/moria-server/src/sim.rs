@@ -3,7 +3,7 @@
 
 use crate::quest;
 use moria_core::ai::Assignments;
-use moria_core::king::{QuestId, king_in_reach};
+use moria_core::king::{Lang, QuestId, king_in_reach};
 use moria_core::light::DAY_TICKS;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
@@ -61,6 +61,11 @@ pub enum Command {
     AcceptQuest(QuestId),
     /// Remise de la nourriture au roi.
     TurnIn,
+    /// Parole au roi : traitée par `State` (bus et cadence), sans effet sur le monde.
+    Talk {
+        text: String,
+        lang: Lang,
+    },
 }
 
 impl Command {
@@ -78,8 +83,7 @@ impl Command {
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
             ClientMsg::AcceptQuest(id) => Command::AcceptQuest(id),
             ClientMsg::TurnIn => Command::TurnIn,
-            // Le dialogue sera traité par la tâche 6.
-            ClientMsg::Talk { .. } => return None,
+            ClientMsg::Talk { text, lang } => Command::Talk { text, lang },
         })
     }
 }
@@ -200,6 +204,7 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
             let pos = h.pos;
             quest::turn_in(f, pos);
         }
+        Command::Talk { .. } => {}
         Command::Cancel { a, b } => {
             ch.designations = mt
                 .cancel_designations(a, b)

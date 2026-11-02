@@ -43,6 +43,7 @@ impl Server {
             amqp_url: None,
             invite: invite.map(Into::into),
             max_per_ip,
+            king_timeout: moria_server::king::KING_TIMEOUT,
         };
         let done = tokio::spawn(run_with_listener(cfg, listener, async {
             let _ = rx.await;
@@ -320,6 +321,7 @@ async fn missing_world_file_is_an_error() {
         amqp_url: None,
         invite: None,
         max_per_ip: 4,
+        king_timeout: moria_server::king::KING_TIMEOUT,
     };
     let e = run_with_listener(cfg, listener, async {})
         .await

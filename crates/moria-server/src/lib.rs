@@ -4,6 +4,7 @@
 
 pub mod bridge;
 mod inventory;
+pub mod king;
 pub mod metrics;
 pub mod net;
 mod quest;
@@ -13,6 +14,7 @@ use inventory::InvSync;
 use metrics::{M, inc};
 use moria_core::ai::{AiView, Assignments, DwarfView};
 use moria_core::inventory::{Batch, State as InvState};
+use moria_core::king::{Ask, Lang, Reply};
 use moria_core::protocol::{FortressView, HeroView, Reject, ServerMsg, encode};
 use moria_core::srd::{Class, Race, roll_abilities};
 use moria_core::world::{self, Account, Hero, World};
@@ -48,6 +50,9 @@ const MAX_QUEUED_PER_PLAYER: usize = 256;
 const MAX_REQS_PER_TICK: usize = 64;
 const MAX_ASSIGN_PER_TICK: usize = 16;
 const MAX_STATES_PER_TICK: usize = 16;
+const MAX_REPLIES_PER_TICK: usize = 16;
+/// Questions au roi en attente de publication ; pleine, le joueur reçoit le repli aussitôt.
+const ASK_CHANNEL: usize = 16;
 /// Batches queued for the bridge; a full channel drops (logged and counted), never blocks.
 const BATCH_CHANNEL: usize = 65_536;
 
@@ -60,6 +65,8 @@ pub struct Config {
     pub invite: Option<String>,
     /// Concurrent connections allowed per source IP.
     pub max_per_ip: usize,
+    /// Délai avant le repli du roi (`king::KING_TIMEOUT` en production).
+    pub king_timeout: Duration,
 }
 
 pub enum Lookup {
@@ -164,12 +171,15 @@ pub async fn run_with_listener(
     let (cmd_tx, cmd_rx) = mpsc::channel(4096);
     let (assign_tx, assign_rx) = mpsc::channel(64);
     let (states_tx, states_rx) = mpsc::channel(16);
-    let (mut view_tx, mut batch_tx) = (None, None);
+    let (reply_tx, reply_rx) = mpsc::channel(MAX_REPLIES_PER_TICK);
+    let (mut view_tx, mut batch_tx, mut ask_tx) = (None, None, None);
     let bridge = cfg.amqp_url.clone().map(|url| {
         let (tx, rx) = mpsc::channel(16);
         view_tx = Some(tx);
         let (btx, brx) = mpsc::channel(BATCH_CHANNEL);
         batch_tx = Some(btx);
+        let (atx, arx) = mpsc::channel(ASK_CHANNEL);
+        ask_tx = Some(atx);
         let known = w.mountains.keys().copied().collect();
         tokio::spawn(bridge::run(
             url,
@@ -178,6 +188,7 @@ pub async fn run_with_listener(
             assign_tx.clone(),
             brx,
             states_tx,
+            (arx, reply_tx),
         ))
     });
     drop(assign_tx);
@@ -259,6 +270,9 @@ pub async fn run_with_listener(
         last_view: None,
         saving: None,
         pending: HashMap::new(),
+        talks: king::Talks::new(cfg.king_timeout),
+        ask_tx,
+        reply_rx,
     };
     let r = state.run(shutdown).await;
     accept.abort();
@@ -297,6 +311,10 @@ struct State {
     saving: Option<JoinHandle<()>>,
     /// Commands received but not yet applied (per-player cap), oldest first.
     pending: HashMap<PlayerId, VecDeque<Command>>,
+    talks: king::Talks,
+    /// `None` sans pont : chaque parole au roi reçoit le repli aussitôt.
+    ask_tx: Option<mpsc::Sender<Ask>>,
+    reply_rx: mpsc::Receiver<Reply>,
 }
 
 impl State {
@@ -344,8 +362,8 @@ impl State {
             };
             self.inv.on_state(st);
         }
-        // Every change to `Fortress.resources` happens in sim::step (requests and commands
-        // never touch them), so begin_tick .. end_tick brackets them all.
+        // Commands (TurnIn takes food) and sim::step both change `Fortress.resources`; both run
+        // inside begin_tick .. end_tick, which brackets every change. Requests never touch them.
         self.inv.begin_tick(&mut self.w);
         // Bounded drains: senders on other threads cannot keep the tick looping.
         for _ in 0..MAX_REQS_PER_TICK {
@@ -359,7 +377,19 @@ impl State {
             sim::apply_assignments(&mut self.w, &a);
         }
         let mut changes = self.commands();
+        // Quêtes actives avant le tick : une validation par la sim est signalée au joueur.
+        let active: Vec<_> = (self.w.fortresses.iter())
+            .filter_map(|(&m, f)| f.quest.map(|q| (m, q)))
+            .collect();
         let deltas = sim::step(&mut self.w);
+        for (m, q) in active {
+            let f = &self.w.fortresses[&m];
+            if f.quest != Some(q) {
+                let (owner, now) = (f.owner, f.quest);
+                self.send(owner, ServerMsg::Quest(now));
+            }
+        }
+        self.king();
         for b in self.inv.end_tick(&self.w) {
             if let Some(tx) = &self.batch_tx
                 && tx.try_send(b).is_err()
@@ -412,13 +442,82 @@ impl State {
                 continue;
             };
             for c in q.drain(..n) {
-                let ch = sim::apply_command(&mut self.w, m, c);
-                changes.entry(m).or_default().then(ch);
+                match c {
+                    Command::Talk { text, lang } => self.talk(player, m, &text, lang),
+                    c => {
+                        // Accepter ou remettre : le joueur reçoit l'état, refus compris.
+                        let quest = matches!(c, Command::AcceptQuest(_) | Command::TurnIn);
+                        let ch = sim::apply_command(&mut self.w, m, c);
+                        changes.entry(m).or_default().then(ch);
+                        if quest {
+                            let q = self.w.fortresses[&m].quest;
+                            self.send(player, ServerMsg::Quest(q));
+                        }
+                    }
+                }
             }
         }
         pending.retain(|_, q| !q.is_empty());
         self.pending = pending;
         changes
+    }
+
+    /// Une parole au roi : question sur le bus, ou réponse immédiate (refus, pas de pont).
+    fn talk(&mut self, player: PlayerId, m: MountainId, text: &str, lang: Lang) {
+        let Some(f) = self.w.fortresses.get(&m) else {
+            return;
+        };
+        let Some(hero) = f.hero.as_ref().map(|h| h.pos) else {
+            return;
+        };
+        // Pont absent, coupé ou débordé : on ne prend pas la question, repli tout de suite.
+        let room = (self.ask_tx.as_ref()).is_some_and(|tx| !tx.is_closed() && tx.capacity() > 0);
+        let ctx = king::context(f);
+        let now = std::time::Instant::now();
+        let msg = match self.talks.ask(now, m, hero, f.king, text, lang, ctx) {
+            Err(r) => r.say(lang),
+            Ok(_) if !room => {
+                self.talks.cancel(m);
+                king::fallback(lang)
+            }
+            Ok(a) => {
+                tracing::debug!("question au roi {m:?} #{} : {}", a.seq, a.text);
+                // La place a été vérifiée et la tâche du monde est seule à envoyer.
+                if let Some(tx) = &self.ask_tx {
+                    let _ = tx.try_send(a);
+                }
+                return;
+            }
+        };
+        self.send(player, msg);
+    }
+
+    /// Réponses du roi arrivées par le pont, puis replis des questions restées sans réponse.
+    fn king(&mut self) {
+        for _ in 0..MAX_REPLIES_PER_TICK {
+            let Ok(r) = self.reply_rx.try_recv() else {
+                break;
+            };
+            let Some(f) = self.w.fortresses.get(&r.mountain) else {
+                continue;
+            };
+            // Une offre n'a de sens que sans quête en cours.
+            let offered = match f.quest {
+                None => quest::offered(f),
+                Some(_) => vec![],
+            };
+            let (owner, m) = (f.owner, r.mountain);
+            if let Some(msg) = self.talks.reply(r, &offered) {
+                self.send(owner, msg);
+            } else {
+                tracing::debug!("reponse du roi ignoree pour {m:?} (hors sequence)");
+            }
+        }
+        for (m, msg) in self.talks.expired(std::time::Instant::now()) {
+            if let Some(owner) = self.w.fortresses.get(&m).map(|f| f.owner) {
+                self.send(owner, msg);
+            }
+        }
     }
 
     fn mountain_of(&self, player: PlayerId) -> Option<MountainId> {
@@ -610,7 +709,9 @@ fn entrance(w: &World, m: MountainId) -> Option<TilePos> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use king::Refusal;
     use moria_core::DesignationKind;
+    use moria_core::king::{Lang, QuestId};
 
     fn state() -> (State, mpsc::Sender<(PlayerId, Command)>) {
         let (s, tx, _) = state_with_batches();
@@ -657,6 +758,9 @@ mod tests {
             last_view: None,
             saving: None,
             pending: HashMap::new(),
+            talks: king::Talks::new(king::KING_TIMEOUT),
+            ask_tx: None,
+            reply_rx: mpsc::channel(1).1,
         };
         (s, cmd_tx, batch_rx)
     }
@@ -706,6 +810,160 @@ mod tests {
     #[test]
     fn epoch_falls_back_without_mtime() {
         assert_eq!(start_epoch(1_000, None), 1_000);
+    }
+
+    // --- Roi : routage des paroles et état des quêtes ---
+
+    const P: PlayerId = PlayerId(0);
+    const M0: MountainId = MountainId(0);
+
+    /// Branche une session pour le joueur 0 et met son héros à `at` ou sur le roi.
+    fn session(s: &mut State, near_king: bool) -> mpsc::Receiver<ServerMsg> {
+        let (tx, rx) = mpsc::channel(256);
+        s.sessions.insert(P, tx);
+        let f = s.w.fortresses.get_mut(&M0).unwrap();
+        let king = f.king;
+        f.hero.as_mut().unwrap().pos = if near_king {
+            king
+        } else {
+            TilePos::new(king.x + 3, king.y, king.z)
+        };
+        rx
+    }
+
+    /// Branche le pont du roi (côté test).
+    fn bridge(s: &mut State) -> (mpsc::Receiver<Ask>, mpsc::Sender<Reply>) {
+        let (atx, arx) = mpsc::channel(16);
+        let (rtx, rrx) = mpsc::channel(16);
+        s.ask_tx = Some(atx);
+        s.reply_rx = rrx;
+        (arx, rtx)
+    }
+
+    /// Messages reçus, sans les ticks.
+    fn got(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<ServerMsg> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|m| !matches!(m, ServerMsg::Tick(_)))
+            .collect()
+    }
+
+    fn talk(text: &str) -> Command {
+        Command::Talk {
+            text: text.into(),
+            lang: Lang::Fr,
+        }
+    }
+
+    #[test]
+    fn refused_accept_quest_resends_quest_state() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, false);
+        tx.try_send((P, Command::AcceptQuest(QuestId::Food)))
+            .unwrap();
+        s.step();
+        assert_eq!(got(&mut rx), vec![ServerMsg::Quest(None)]);
+    }
+
+    #[test]
+    fn quest_completion_sends_quest_none() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, true);
+        tx.try_send((P, Command::AcceptQuest(QuestId::ForgeDoors)))
+            .unwrap();
+        s.step();
+        let q = s.w.fortresses[&M0].quest;
+        assert!(q.is_some());
+        assert_eq!(got(&mut rx), vec![ServerMsg::Quest(q)]);
+        s.step();
+        assert_eq!(got(&mut rx), vec![], "rien ne change, rien n'est envoyé");
+        s.w.fortresses.get_mut(&M0).unwrap().made.doors = 2;
+        s.step();
+        assert_eq!(got(&mut rx), vec![ServerMsg::Quest(None)]);
+    }
+
+    #[test]
+    fn talk_goes_to_the_bus_and_the_reply_reaches_the_player() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, true);
+        let (mut asks, replies) = bridge(&mut s);
+        tx.try_send((P, talk("Salut"))).unwrap();
+        s.step();
+        let a = asks.try_recv().expect("question publiée");
+        assert_eq!((a.mountain, a.text.as_str()), (M0, "Salut"));
+        assert_eq!(a.offered, QuestId::ALL.to_vec());
+        assert_eq!(got(&mut rx), vec![]);
+        replies
+            .try_send(Reply {
+                mountain: M0,
+                seq: a.seq,
+                text: "Bienvenue".into(),
+                offer: Some(QuestId::Food),
+            })
+            .unwrap();
+        s.step();
+        assert_eq!(
+            got(&mut rx),
+            vec![ServerMsg::KingSay {
+                text: "Bienvenue".into(),
+                offer: Some(QuestId::Food)
+            }]
+        );
+    }
+
+    #[test]
+    fn talk_out_of_reach_is_answered_without_the_bus() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, false);
+        let (mut asks, _replies) = bridge(&mut s);
+        tx.try_send((P, talk("Salut"))).unwrap();
+        s.step();
+        assert!(asks.try_recv().is_err());
+        assert_eq!(got(&mut rx), vec![Refusal::OutOfReach.say(Lang::Fr)]);
+    }
+
+    #[test]
+    fn talk_without_a_bridge_gets_the_fallback_at_once() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, true);
+        tx.try_send((P, talk("Salut"))).unwrap();
+        s.step();
+        assert_eq!(got(&mut rx), vec![king::fallback(Lang::Fr)]);
+        // Rien ne reste en vol : pas de « occupé » ensuite, ni de second repli au délai.
+        s.talks = king::Talks::new(Duration::ZERO);
+        tx.try_send((P, talk("Encore"))).unwrap();
+        s.step();
+        s.step();
+        assert_eq!(got(&mut rx), vec![king::fallback(Lang::Fr)]);
+    }
+
+    #[test]
+    fn offer_is_dropped_while_a_quest_is_active() {
+        let (mut s, tx) = state();
+        let mut rx = session(&mut s, true);
+        let (mut asks, replies) = bridge(&mut s);
+        tx.try_send((P, Command::AcceptQuest(QuestId::Food)))
+            .unwrap();
+        tx.try_send((P, talk("Et ensuite ?"))).unwrap();
+        s.step();
+        let a = asks.try_recv().unwrap();
+        assert_eq!(a.active, Some(QuestId::Food));
+        got(&mut rx);
+        replies
+            .try_send(Reply {
+                mountain: M0,
+                seq: a.seq,
+                text: "Plus tard".into(),
+                offer: Some(QuestId::Depth),
+            })
+            .unwrap();
+        s.step();
+        assert_eq!(
+            got(&mut rx),
+            vec![ServerMsg::KingSay {
+                text: "Plus tard".into(),
+                offer: None
+            }]
+        );
     }
 
     #[test]
