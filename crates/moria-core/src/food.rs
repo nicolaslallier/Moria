@@ -5,14 +5,33 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::TilePos;
+use crate::calendar::{Season, season};
+use crate::light::DAY_TICKS;
 
 /// Ticks between two grazing steps of the herd.
 pub const COW_EVERY: u64 = 10;
 /// Ticks between two growth checks; a field ripens with odds 1 in `RIPEN_ODDS` at each.
 pub const GROW_EVERY: u64 = 100;
 pub const RIPEN_ODDS: u64 = 60;
+/// Growth odds in spring and autumn (slower than summer).
+pub const SLOW_RIPEN_ODDS: u64 = 90;
+/// A cow is adult after this many ticks.
+pub const ADULT_TICKS: u64 = DAY_TICKS;
+/// Ticks before a cow may breed again.
+pub const BIRTH_COOLDOWN: u64 = 2 * DAY_TICKS;
+/// An adult, fertile cow breeds at a cow step with odds 1 in `BIRTH_ODDS`.
+pub const BIRTH_ODDS: u64 = 20;
 /// Herd ceiling per mountain.
 pub const COW_CAP: usize = 24;
+
+/// ponytail: a hash of a tile and a step number (splitmix64 finalizer) stands in for an RNG.
+/// Deterministic and stateless; a seeded RNG if it ever shows patterns.
+fn mix(q: TilePos, n: u64) -> u64 {
+    let mut h = ((q.x as u64) << 40 ^ (q.y as u64) << 20 ^ n).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    h = (h ^ h >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ h >> 27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ h >> 31
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellKind {
@@ -86,7 +105,7 @@ impl FoodSim {
                 // Default cow: an adult, free to breed at once.
                 CellKind::Cow => {
                     let st = old_cows.get(&c.pos).copied().unwrap_or(CowState {
-                        born: tick.saturating_sub(1),
+                        born: tick.saturating_sub(ADULT_TICKS),
                         fertile_at: tick,
                     });
                     self.cows.insert(c.pos, st);
@@ -140,6 +159,102 @@ impl FoodSim {
 
     pub fn has_cow(&self, p: TilePos) -> bool {
         self.cows.contains_key(&p)
+    }
+
+    /// Advances the simulation to `tick` and returns what it proposes. The sim's own state
+    /// already assumes the proposals hold; `reject` undoes the refused ones.
+    pub fn step(&mut self, tick: u64) -> Vec<FoodEvent> {
+        let (mut out, season) = (vec![], season(tick));
+        let cow_every = if season == Season::Winter {
+            2 * COW_EVERY
+        } else {
+            COW_EVERY
+        };
+        if tick.is_multiple_of(cow_every) {
+            self.step_cows(tick, season, &mut out);
+        }
+        if tick.is_multiple_of(GROW_EVERY) {
+            self.step_fields(tick, season, &mut out);
+        }
+        out
+    }
+
+    /// Blind proposals: the sim has no map, the server refuses what does not fit.
+    fn step_cows(&mut self, tick: u64, season: Season, out: &mut Vec<FoodEvent>) {
+        let breeds = matches!(season, Season::Spring | Season::Summer);
+        let keys: Vec<TilePos> = self.cows.keys().copied().collect();
+        for q in keys {
+            let h = mix(q, (tick / COW_EVERY) ^ self.seed);
+            let st = self.cows[&q];
+            let near = |k: u64| {
+                let (dx, dy) = [(1, 0), (-1, 0), (0, 1), (0, -1)][(k % 4) as usize];
+                TilePos::new(q.x + dx, q.y + dy, q.z)
+            };
+            let fertile = tick >= st.born + ADULT_TICKS && tick >= st.fertile_at;
+            if breeds && fertile && (h >> 8).is_multiple_of(BIRTH_ODDS) && self.cows.len() < COW_CAP
+            {
+                let at = near(h >> 16);
+                if let std::collections::btree_map::Entry::Vacant(e) = self.cows.entry(at) {
+                    e.insert(CowState {
+                        born: tick,
+                        fertile_at: tick + ADULT_TICKS,
+                    });
+                    self.cows.get_mut(&q).unwrap().fertile_at = tick + BIRTH_COOLDOWN;
+                    out.push(FoodEvent::CowBorn { at });
+                }
+                continue;
+            }
+            let to = near(h);
+            if !self.cows.contains_key(&to) {
+                let st = self.cows.remove(&q).unwrap();
+                self.cows.insert(to, st);
+                out.push(FoodEvent::CowMoved { from: q, to });
+            }
+        }
+    }
+
+    /// A ripe crop stays ripe and asks for its harvest again at every check; winter freezes growth.
+    fn step_fields(&mut self, tick: u64, season: Season, out: &mut Vec<FoodEvent>) {
+        let odds = match season {
+            Season::Summer => RIPEN_ODDS,
+            Season::Winter => 0,
+            _ => SLOW_RIPEN_ODDS,
+        };
+        for (&q, f) in self.fields.iter_mut() {
+            if !f.ripe && odds != 0 {
+                if mix(q, (tick / GROW_EVERY) ^ self.seed).is_multiple_of(odds) {
+                    f.ripe = true;
+                } else {
+                    f.progress += 1;
+                }
+            }
+            if f.ripe {
+                out.push(FoodEvent::CropRipe { at: q });
+            }
+        }
+    }
+
+    /// The server refused `ev`: undo its optimistic effect.
+    pub fn reject(&mut self, ev: &FoodEvent) {
+        match *ev {
+            FoodEvent::CowMoved { from, to } => {
+                if let Some(st) = self.cows.remove(&to) {
+                    // origin taken meanwhile: the cow is forgotten, the snapshot will tell
+                    self.cows.entry(from).or_insert(st);
+                }
+            }
+            FoodEvent::CowBorn { at } => {
+                self.cows.remove(&at);
+            }
+            FoodEvent::CropRipe { at } => {
+                if let Some(f) = self.fields.get_mut(&at) {
+                    *f = FieldState {
+                        progress: 0,
+                        ripe: false,
+                    };
+                }
+            }
+        }
     }
 
     /// Tick of the last `adopt`, 0 before the first.
@@ -270,5 +385,293 @@ mod tests {
         assert_eq!(s.adopted_at(), 0);
         s.adopt(&[], 42);
         assert_eq!(s.adopted_at(), 42);
+    }
+
+    const SUMMER: u64 = crate::calendar::SEASON_TICKS;
+    const AUTUMN: u64 = 2 * crate::calendar::SEASON_TICKS;
+    const WINTER: u64 = 3 * crate::calendar::SEASON_TICKS;
+    const YEAR: u64 = crate::calendar::YEAR_TICKS;
+
+    fn herd(n: i16) -> Vec<Cell> {
+        (0..n).map(|i| cell(p(i * 2, 0), CellKind::Cow)).collect()
+    }
+
+    fn count(s: &mut FoodSim, from: u64, to: u64, pick: fn(&FoodEvent) -> bool) -> usize {
+        (from..to).flat_map(|t| s.step(t)).filter(pick).count()
+    }
+    fn is_move(e: &FoodEvent) -> bool {
+        matches!(e, FoodEvent::CowMoved { .. })
+    }
+    fn is_birth(e: &FoodEvent) -> bool {
+        matches!(e, FoodEvent::CowBorn { .. })
+    }
+
+    #[test]
+    fn cows_step_only_on_cow_ticks() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(5), 0);
+        for t in SUMMER..SUMMER + 200 {
+            if t % COW_EVERY != 0 {
+                assert!(s.step(t).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cow_proposes_a_horizontal_neighbour() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], 0);
+        let mut seen = 0;
+        for t in SUMMER..SUMMER + 2000 {
+            for ev in s.step(t) {
+                if let FoodEvent::CowMoved { from, to } = ev {
+                    seen += 1;
+                    assert_eq!(from.z, to.z);
+                    assert_eq!((from.x - to.x).abs() + (from.y - to.y).abs(), 1);
+                }
+            }
+        }
+        assert!(seen > 0);
+    }
+
+    #[test]
+    fn winter_cows_step_half_as_often() {
+        let (mut a, mut b) = (FoodSim::new(1), FoodSim::new(1));
+        a.adopt(&herd(10), 0);
+        b.adopt(&herd(10), 0);
+        let summer = count(&mut a, AUTUMN, AUTUMN + 20_000, is_move); // no births in autumn
+        let winter = count(&mut b, WINTER, WINTER + 20_000, is_move);
+        assert!(
+            winter * 10 < summer * 7 && winter * 10 > summer * 3,
+            "{winter} vs {summer}"
+        );
+    }
+
+    #[test]
+    fn no_birth_in_winter() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(10), WINTER);
+        assert_eq!(count(&mut s, WINTER, WINTER + 20_000, is_birth), 0);
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(10), AUTUMN);
+        assert_eq!(
+            count(&mut s, AUTUMN, AUTUMN + 20_000, is_birth),
+            0,
+            "nor in autumn"
+        );
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(10), SUMMER);
+        assert!(
+            count(&mut s, SUMMER, SUMMER + 20_000, is_birth) > 0,
+            "but in summer"
+        );
+    }
+
+    #[test]
+    fn births_need_an_adult_and_a_cooldown() {
+        // a calf: no birth during its first day
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], SUMMER);
+        s.cows.insert(
+            p(5, 5),
+            CowState {
+                born: SUMMER,
+                fertile_at: SUMMER,
+            },
+        );
+        assert_eq!(count(&mut s, SUMMER, SUMMER + ADULT_TICKS - 1, is_birth), 0);
+        // an adult that just gave birth waits for its cooldown
+        let mut s = FoodSim::new(3);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], SUMMER);
+        s.cows.insert(
+            p(5, 5),
+            CowState {
+                born: 0,
+                fertile_at: SUMMER + 100_000,
+            },
+        );
+        assert_eq!(count(&mut s, SUMMER, SUMMER + 100_000, is_birth), 0);
+        // cooldown is set on birth
+        let mut s = FoodSim::new(3);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], SUMMER);
+        let t0 = (SUMMER..SUMMER + 20_000)
+            .find(|&t| s.step(t).iter().any(is_birth))
+            .expect("an adult cow breeds in summer");
+        let parent = s
+            .cows
+            .values()
+            .find(|c| c.born == SUMMER - ADULT_TICKS)
+            .unwrap();
+        assert_eq!(parent.fertile_at, t0 + BIRTH_COOLDOWN);
+        let calf = s.cows.values().find(|c| c.born == t0).unwrap();
+        assert!(calf.fertile_at >= t0 + ADULT_TICKS);
+    }
+
+    #[test]
+    fn birth_proposal_is_next_to_a_parent() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(3), SUMMER);
+        let mut seen = 0;
+        for t in SUMMER..SUMMER + 20_000 {
+            for ev in s.step(t) {
+                if let FoodEvent::CowBorn { at } = ev {
+                    seen += 1;
+                    assert_eq!(at.z, 0);
+                    assert!(s.has_cow(at));
+                    // someone is next to the newborn (no cow moved far since: moves are 1 tile)
+                    let near = s.cows.keys().any(|&c| {
+                        c != at && c.z == at.z && (c.x - at.x).abs() + (c.y - at.y).abs() <= 2
+                    });
+                    assert!(near);
+                }
+            }
+        }
+        assert!(seen > 0);
+    }
+
+    #[test]
+    fn herd_never_exceeds_cap_over_two_years() {
+        for refuse_half in [false, true] {
+            let mut s = FoodSim::new(7);
+            s.adopt(&herd(10), 0);
+            let mut n = 0u32;
+            for t in 0..2 * YEAR {
+                for ev in s.step(t) {
+                    n += 1;
+                    if refuse_half && n.is_multiple_of(2) {
+                        s.reject(&ev);
+                    }
+                    assert!(s.cow_count() <= COW_CAP);
+                }
+                assert!(s.cow_count() <= COW_CAP);
+            }
+        }
+    }
+
+    fn sown(n: i16) -> FoodSim {
+        let mut s = FoodSim::new(1);
+        for i in 0..n {
+            s.apply_action(&FoodAction::FieldSown(p(i % 10, i / 10)));
+        }
+        s
+    }
+    fn ripe_count(s: &FoodSim) -> usize {
+        s.fields.values().filter(|f| f.ripe).count()
+    }
+    fn grow_checks(s: &mut FoodSim, start: u64, n: u64) {
+        for k in 0..n {
+            s.step(start + k * GROW_EVERY);
+        }
+    }
+
+    #[test]
+    fn no_crop_grows_in_winter() {
+        let mut s = sown(100);
+        grow_checks(&mut s, WINTER, 1000);
+        assert_eq!(ripe_count(&s), 0);
+    }
+
+    #[test]
+    fn summer_ripening_matches_the_old_odds() {
+        let mut s = sown(100);
+        grow_checks(&mut s, SUMMER, 1);
+        assert!(ripe_count(&s) <= 10, "{}", ripe_count(&s));
+        grow_checks(&mut s, SUMMER + GROW_EVERY, 199);
+        assert!(ripe_count(&s) >= 60, "{}", ripe_count(&s));
+    }
+
+    #[test]
+    fn crops_grow_slower_in_spring_and_autumn() {
+        let ripe_after = |start| {
+            let mut s = sown(100);
+            grow_checks(&mut s, start, 60);
+            ripe_count(&s)
+        };
+        let summer = ripe_after(SUMMER);
+        let (spring, autumn) = (ripe_after(0), ripe_after(AUTUMN));
+        assert!(
+            spring < summer && autumn < summer,
+            "{spring} {autumn} {summer}"
+        );
+        assert!(spring > 0 && autumn > 0);
+    }
+
+    #[test]
+    fn a_ripe_crop_stays_ripe_and_asks_again() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(1, 1), CellKind::Crop)], 0);
+        for t in [SUMMER, SUMMER + GROW_EVERY, WINTER] {
+            assert_eq!(s.step(t), vec![FoodEvent::CropRipe { at: p(1, 1) }]);
+            assert!(s.is_ripe(p(1, 1)));
+        }
+    }
+
+    #[test]
+    fn step_is_deterministic() {
+        let go = || {
+            let mut s = FoodSim::new(9);
+            s.adopt(&herd(6), 0);
+            for i in 0..20 {
+                s.apply_action(&FoodAction::FieldSown(p(i, 9)));
+            }
+            (SUMMER..SUMMER + 5_000)
+                .flat_map(|t| s.step(t))
+                .collect::<Vec<_>>()
+        };
+        let a = go();
+        assert!(!a.is_empty());
+        assert_eq!(a, go());
+    }
+
+    #[test]
+    fn reject_of_a_move_puts_the_cow_back() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(6, 5), CellKind::Cow)], 0); // already moved there
+        s.reject(&FoodEvent::CowMoved {
+            from: p(5, 5),
+            to: p(6, 5),
+        });
+        assert!(s.has_cow(p(5, 5)) && !s.has_cow(p(6, 5)));
+    }
+
+    #[test]
+    fn reject_of_a_move_forgets_the_cow_if_its_origin_is_gone() {
+        let mut s = FoodSim::new(1);
+        // origin taken by another cow meanwhile: the moved one is forgotten
+        s.adopt(
+            &[cell(p(5, 5), CellKind::Cow), cell(p(6, 5), CellKind::Cow)],
+            0,
+        );
+        s.reject(&FoodEvent::CowMoved {
+            from: p(5, 5),
+            to: p(6, 5),
+        });
+        assert_eq!(s.cow_count(), 1);
+        assert!(s.has_cow(p(5, 5)));
+        // the cow is not at the destination any more: nothing to put back
+        s.reject(&FoodEvent::CowMoved {
+            from: p(1, 1),
+            to: p(2, 1),
+        });
+        assert_eq!(s.cow_count(), 1);
+        assert!(!s.has_cow(p(1, 1)));
+    }
+
+    #[test]
+    fn reject_of_a_birth_removes_it() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], 0);
+        s.reject(&FoodEvent::CowBorn { at: p(5, 5) });
+        assert_eq!(s.cow_count(), 0);
+    }
+
+    #[test]
+    fn reject_of_ripe_marks_the_field_growing_again_with_zero_progress() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&[cell(p(3, 3), CellKind::Crop)], 0);
+        s.fields.get_mut(&p(3, 3)).unwrap().progress = 4;
+        s.reject(&FoodEvent::CropRipe { at: p(3, 3) });
+        assert!(!s.is_ripe(p(3, 3)));
+        assert_eq!(s.fields[&p(3, 3)].progress, 0);
     }
 }
