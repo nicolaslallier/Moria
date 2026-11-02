@@ -1,5 +1,6 @@
 pub mod calendar;
 pub mod food;
+pub mod food_msg;
 pub mod geo;
 pub mod inventory;
 pub mod inventory_cache;
