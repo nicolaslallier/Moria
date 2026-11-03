@@ -86,6 +86,8 @@ pub struct Link {
     touched: HashMap<(MountainId, TilePos), u64>,
     /// Set by the bus side when it dropped events: the container is out of step.
     dropped: Arc<AtomicBool>,
+    /// Events were dropped since the last `World`: another one after `WORLD_RETRY`.
+    resync: bool,
 }
 
 /// The food freezes, and meals are skipped, while a configured container is silent.
@@ -105,6 +107,7 @@ impl Link {
             inbox: vec![],
             touched: HashMap::new(),
             dropped: Arc::default(),
+            resync: false,
         }
     }
 
@@ -120,9 +123,9 @@ impl Link {
 
     /// Start of a tick: takes the heartbeats and keeps the events for `step`.
     pub fn poll(&mut self, now: Instant) {
-        if self.dropped.swap(false, Relaxed) {
-            self.world_at = None; // its unanswered proposals stay in its state: resync it
-        }
+        // Its unanswered proposals stay in its state: resync it, at most every WORLD_RETRY
+        // (sustained drops must not build a big `World` every tick).
+        self.resync |= self.dropped.swap(false, Relaxed);
         for _ in 0..MAX_IN_PER_TICK {
             match self.rx.try_recv() {
                 Ok(Incoming::Status(s)) => {
@@ -220,7 +223,7 @@ impl Link {
         out.retain(|_, ch| *ch != Changes::default());
 
         // Heartbeat tick 0: the container has adopted no `World` since it started.
-        let every = if self.status_tick == 0 {
+        let every = if self.status_tick == 0 || self.resync {
             WORLD_RETRY
         } else {
             WORLD_EVERY
@@ -241,6 +244,7 @@ impl Link {
                 .collect();
             if self.send(Outgoing::World(World { tick, mountains })) {
                 self.world_at = Some(now);
+                self.resync = false;
                 self.world_ids = w.fortresses.keys().copied().collect();
             }
         }
@@ -546,24 +550,37 @@ mod tests {
         // the bus side finds the world task's channel full: the events are lost
         let (full, _rx) = mpsc::channel(1);
         full.try_send(Incoming::Status(Status { tick: 1 })).unwrap();
-        let ev = Events {
-            tick: 1,
-            mountain: M,
-            list: vec![],
-        };
         let before = METRICS.food_events_dropped.load(Relaxed);
-        forward(&full, Incoming::Events(ev), &l.drop_flag());
+        let drop_one = |l: &Link| {
+            let ev = Events {
+                tick: 1,
+                mountain: M,
+                list: vec![],
+            };
+            forward(&full, Incoming::Events(ev), &l.drop_flag());
+        };
+        drop_one(&l);
         assert!(METRICS.food_events_dropped.load(Relaxed) > before);
-        beat(&inc);
-        tick(&mut l, &mut w, &[], secs(t0, 1));
+        // throttled to WORLD_RETRY: no 2 MiB World every tick while drops go on
+        let mut worlds_at = |l: &mut Link, w: &mut GameWorld, s| {
+            beat(&inc);
+            tick(l, w, &[], secs(t0, s));
+            worlds(&sent(&mut out)).len()
+        };
         assert_eq!(
-            worlds(&sent(&mut out)).len(),
+            worlds_at(&mut l, &mut w, 1),
+            0,
+            "too soon after the last World"
+        );
+        assert_eq!(
+            worlds_at(&mut l, &mut w, WORLD_RETRY.as_secs()),
             1,
             "container left out of step"
         );
-        beat(&inc);
-        tick(&mut l, &mut w, &[], secs(t0, 2));
-        assert!(worlds(&sent(&mut out)).is_empty(), "once");
+        assert_eq!(worlds_at(&mut l, &mut w, 6), 0, "once");
+        drop_one(&l);
+        assert_eq!(worlds_at(&mut l, &mut w, 7), 0, "throttled");
+        assert_eq!(worlds_at(&mut l, &mut w, 10), 1);
     }
 
     #[test]
