@@ -91,8 +91,6 @@ pub fn inspect(w: &World, owner: PlayerId, t: InspectTarget) -> Option<Inspectio
             .iter()
             .find(|d| d.id == id)
             .map(|d| (d.food, d.health, d.ticks_alive, d.jobs_done))?,
-        // ponytail: cows carry no vitals yet (stage 3).
-        InspectTarget::Cow(_) => return None,
     };
     Some(Inspection {
         target: t,
@@ -2607,7 +2605,6 @@ mod tests {
             (h.food, h.health, h.ticks_alive, h.jobs_done),
             (FOOD_MAX, HEALTH_MAX, 0, 0)
         );
-        assert_eq!(inspect(&w, PlayerId(1), T::Cow(moria_core::CowId(0))), None);
     }
 
     #[test]

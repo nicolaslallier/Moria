@@ -1,5 +1,5 @@
 use crate::srd::{Abilities, Class, Race};
-use crate::{CowId, DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
+use crate::{DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read};
 
@@ -87,7 +87,6 @@ pub struct DwarfJob {
 pub enum InspectTarget {
     Hero,
     Dwarf(DwarfId),
-    Cow(CowId),
 }
 
 /// A dwarf as clients see it; `None` is idle.

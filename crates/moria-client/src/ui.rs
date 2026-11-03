@@ -536,7 +536,6 @@ pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
                 v
             })
             .unwrap_or_default(),
-        InspectTarget::Cow(_) => vec![],
     }
 }
 
