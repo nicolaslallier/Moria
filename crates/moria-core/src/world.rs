@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 6;
+pub const SAVE_VERSION: u32 = 7;
+/// A full food gauge: one meal interval (`DAY_TICKS / 4`), as the server's `EAT_EVERY`.
+pub const FOOD_MAX: u16 = (crate::light::DAY_TICKS / 4) as u16;
+pub const HEALTH_MAX: u16 = 100;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -57,6 +60,8 @@ pub struct Hero {
     /// Not saved.
     #[serde(skip)]
     pub pending_dig: Option<(Dir, DesignationKind)>,
+    pub food: u16,
+    pub health: u16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -74,6 +79,26 @@ pub struct Dwarf {
     pub task: Option<DwarfTask>,
     /// Missed a meal: only goes after food until it has eaten.
     pub hungry: bool,
+    pub food: u16,
+    pub health: u16,
+    pub ticks_alive: u64,
+    pub jobs_done: u32,
+}
+
+impl Dwarf {
+    /// A newborn dwarf: fed, healthy, no history.
+    pub fn new(id: DwarfId, pos: TilePos) -> Self {
+        Dwarf {
+            id,
+            pos,
+            task: None,
+            hungry: false,
+            food: FOOD_MAX,
+            health: HEALTH_MAX,
+            ticks_alive: 0,
+            jobs_done: 0,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -385,7 +410,7 @@ pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
 pub fn reset_if_outdated(path: &Path, fallback_seed: u64) -> io::Result<Option<PathBuf>> {
     match save_version(path)? {
         None => Ok(None),
-        Some(v) if v == SAVE_VERSION => Ok(None),
+        Some(v) if v == SAVE_VERSION || v == v5::VERSION => Ok(None),
         Some(v) if v > SAVE_VERSION => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -418,12 +443,7 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
     let dwarves = entrance_tiles()
         .take(3)
         .zip(w.next_dwarf..)
-        .map(|(pos, i)| Dwarf {
-            id: DwarfId(i),
-            pos,
-            task: None,
-            hungry: false,
-        })
+        .map(|(pos, i)| Dwarf::new(DwarfId(i), pos))
         .collect();
     w.next_dwarf += 3;
     w.fortresses.insert(
@@ -466,7 +486,117 @@ pub fn load(path: &Path) -> io::Result<World> {
     };
     match u32::from_le_bytes(*v) {
         SAVE_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+        v5::VERSION => postcard::from_bytes::<v5::World>(body)
+            .map(World::from)
+            .map_err(io::Error::other),
         n => Err(bad(format!("format de sauvegarde v{n} non supporté"))),
+    }
+}
+
+/// The v5 save layout (`Dwarf` and `Hero` without vitals), loaded with full vitals.
+/// postcard is not self-describing: an old layout needs its own structs.
+/// It reuses the live `Region`/`Mountain`/`Account`/`DigJob`/`DwarfTask` types: a future
+/// change to their serialized shape must freeze copies of them here.
+mod v5 {
+    use super::{Account, DigJob, DwarfTask, FOOD_MAX, HEALTH_MAX, Region};
+    use crate::srd::{Abilities, Class, Race};
+    use crate::*;
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    pub const VERSION: u32 = 5;
+
+    #[derive(Deserialize)]
+    pub struct Hero {
+        name: String,
+        race: Race,
+        class: Class,
+        abilities: Abilities,
+        pos: TilePos,
+        dig: Option<DigJob>,
+        move_cooldown: u8,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Dwarf {
+        id: DwarfId,
+        pos: TilePos,
+        task: Option<DwarfTask>,
+        hungry: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Fortress {
+        owner: PlayerId,
+        hero: Option<Hero>,
+        dwarves: Vec<Dwarf>,
+        resources: Resources,
+    }
+
+    #[derive(Deserialize)]
+    pub struct World {
+        seed: u64,
+        regions: Vec<Region>,
+        mountains: BTreeMap<MountainId, Mountain>,
+        fortresses: BTreeMap<MountainId, Fortress>,
+        accounts: BTreeMap<String, Account>,
+        next_dwarf: u32,
+        tick: u64,
+    }
+
+    impl From<World> for super::World {
+        fn from(w: World) -> Self {
+            let fortresses = w.fortresses.into_iter().map(|(id, f)| {
+                let hero = f.hero.map(|h| super::Hero {
+                    name: h.name,
+                    race: h.race,
+                    class: h.class,
+                    abilities: h.abilities,
+                    pos: h.pos,
+                    dig: h.dig,
+                    move_cooldown: h.move_cooldown,
+                    pending_move: None,
+                    pending_dig: None,
+                    food: FOOD_MAX,
+                    health: HEALTH_MAX,
+                });
+                let dwarves = f
+                    .dwarves
+                    .into_iter()
+                    .map(|d| super::Dwarf {
+                        task: d.task,
+                        hungry: d.hungry,
+                        // A hungry dwarf shows an empty gauge; `ticks_alive` restarts at 0.
+                        food: if d.hungry { 0 } else { FOOD_MAX },
+                        ..super::Dwarf::new(d.id, d.pos)
+                    })
+                    .collect();
+                let f = super::Fortress {
+                    owner: f.owner,
+                    hero,
+                    dwarves,
+                    resources: f.resources,
+                    king: super::throne_pos(),
+                    quest: None,
+                    done: vec![],
+                    made: super::Production::default(),
+                    max_depth: 0,
+                };
+                (id, f)
+            });
+            let mut world = super::World {
+                seed: w.seed,
+                regions: w.regions,
+                mountains: w.mountains,
+                fortresses: fortresses.collect(),
+                accounts: w.accounts,
+                next_dwarf: w.next_dwarf,
+                tick: w.tick,
+            };
+            // A v5 mountain predates the throne room: carve it (fixed layout).
+            super::add_throne_room(&mut world);
+            world
+        }
     }
 }
 
@@ -921,6 +1051,126 @@ mod tests {
         assert_eq!(e.to_string(), "format de sauvegarde v2 non supporté");
         std::fs::write(&p, [1u8, 0]).unwrap(); // too short for a version
         assert!(load(&p).is_err());
+    }
+
+    #[test]
+    fn new_dwarf_starts_fed_and_healthy() {
+        let mut w = generate(1);
+        let m = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        for d in &w.fortresses[&m].dwarves {
+            assert_eq!((d.food, d.health), (FOOD_MAX, HEALTH_MAX));
+            assert_eq!((d.ticks_alive, d.jobs_done), (0, 0));
+        }
+    }
+
+    #[test]
+    fn food_max_is_a_meal_interval() {
+        assert_eq!(u64::from(FOOD_MAX), crate::light::DAY_TICKS / 4);
+    }
+
+    /// The v5 layout, frozen here: `Dwarf` and `Hero` without vitals.
+    mod old {
+        use crate::srd::{Abilities, Class, Race};
+        use crate::world::{Account, DigJob, DwarfTask, Region};
+        use crate::*;
+        use serde::Serialize;
+        use std::collections::BTreeMap;
+        #[derive(Serialize)]
+        pub struct Hero {
+            pub name: String,
+            pub race: Race,
+            pub class: Class,
+            pub abilities: Abilities,
+            pub pos: TilePos,
+            pub dig: Option<DigJob>,
+            pub move_cooldown: u8,
+        }
+        #[derive(Serialize)]
+        pub struct Dwarf {
+            pub id: DwarfId,
+            pub pos: TilePos,
+            pub task: Option<DwarfTask>,
+            pub hungry: bool,
+        }
+        #[derive(Serialize)]
+        pub struct Fortress {
+            pub owner: PlayerId,
+            pub hero: Option<Hero>,
+            pub dwarves: Vec<Dwarf>,
+            pub resources: Resources,
+        }
+        #[derive(Serialize)]
+        pub struct World {
+            pub seed: u64,
+            pub regions: Vec<Region>,
+            pub mountains: BTreeMap<MountainId, Mountain>,
+            pub fortresses: BTreeMap<MountainId, Fortress>,
+            pub accounts: BTreeMap<String, Account>,
+            pub next_dwarf: u32,
+            pub tick: u64,
+        }
+    }
+
+    #[test]
+    fn old_save_loads_with_full_vitals() {
+        let w = generate(3);
+        let pos = entrance_tiles().next().unwrap();
+        let fortress = old::Fortress {
+            owner: PlayerId(1),
+            hero: Some(old::Hero {
+                name: "Gimli".into(),
+                race: Race::Dwarf,
+                class: Class::Barbarian,
+                abilities: crate::srd::roll_abilities(Race::Dwarf, Class::Barbarian),
+                pos,
+                dig: None,
+                move_cooldown: 1,
+            }),
+            dwarves: vec![
+                old::Dwarf {
+                    id: DwarfId(7),
+                    pos,
+                    task: None,
+                    hungry: true,
+                },
+                old::Dwarf {
+                    id: DwarfId(8),
+                    pos,
+                    task: None,
+                    hungry: false,
+                },
+            ],
+            resources: Resources::default(),
+        };
+        let old = old::World {
+            seed: w.seed,
+            regions: w.regions,
+            mountains: w.mountains,
+            fortresses: BTreeMap::from([(MountainId(0), fortress)]),
+            accounts: w.accounts,
+            next_dwarf: 8,
+            tick: 1234,
+        };
+        let p = tmpdir("v5").join("w.bin");
+        let mut bytes = 5u32.to_le_bytes().to_vec();
+        bytes.extend(postcard::to_allocvec(&old).unwrap());
+        std::fs::write(&p, &bytes).unwrap();
+
+        // Startup must not set a v5 world aside: it migrates on load.
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        let w = load(&p).unwrap();
+        assert_eq!((w.tick, w.next_dwarf), (1234, 8));
+        let f = &w.fortresses[&MountainId(0)];
+        let d = &f.dwarves[0];
+        assert_eq!((d.id, d.pos, d.hungry), (DwarfId(7), pos, true));
+        // A hungry dwarf loads with an empty gauge, a fed one with a full gauge.
+        assert_eq!((d.food, d.health), (0, HEALTH_MAX));
+        assert_eq!((d.ticks_alive, d.jobs_done), (0, 0));
+        assert_eq!(f.dwarves[1].food, FOOD_MAX);
+        let h = f.hero.as_ref().unwrap();
+        assert_eq!((h.name.as_str(), h.move_cooldown), ("Gimli", 1));
+        assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));
     }
 
     #[test]

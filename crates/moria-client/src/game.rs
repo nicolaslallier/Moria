@@ -11,7 +11,8 @@ use moria_core::king::{
 };
 use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
-    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
+    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, InspectTarget, Inspection, Reject,
+    ServerMsg, TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
@@ -345,6 +346,14 @@ pub struct Game {
     pub map_rev: u32,
     /// Status page (key C) open.
     pub status: bool,
+    /// Creature shown in the status panel (middle click).
+    pub inspect: Option<InspectTarget>,
+    /// Latest vitals the server sent for `inspect`.
+    pub inspection: Option<Inspection>,
+    /// Last `Inspect` request: target (`None` once the panel closed) and time (s).
+    pub inspect_asked: (Option<InspectTarget>, f64),
+    /// One-line notice and the `ticks` value it was raised at.
+    pub toast: Option<(String, u64)>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
     /// Highlighted row of the pause menu, for keyboard and gamepad.
@@ -369,7 +378,7 @@ pub struct Game {
     pub confirmed: TilePos,
     /// Predicted positions not yet seen in a tick, with the local tick count at send.
     pub pending: VecDeque<(TilePos, u64)>,
-    ticks: u64,
+    pub ticks: u64,
     /// Case du roi.
     pub king: TilePos,
     /// Quête active, tenue à jour par le snapshot et `ServerMsg::Quest`.
@@ -468,10 +477,16 @@ impl Game {
         }
     }
 
-    /// Closes the build, order and status menus and the king's dialogue; true if one was open.
+    /// Closes the build, order, status and inspect menus and the king's dialogue; true if one
+    /// was open.
     pub fn close_menus(&mut self) -> bool {
-        let open = self.build_menu || self.status || self.order_menu.is_some() || self.dialog.open;
+        let open = self.build_menu
+            || self.status
+            || self.order_menu.is_some()
+            || self.inspect.is_some()
+            || self.dialog.open;
         self.build_menu = false;
+        self.close_inspect();
         self.status = false;
         self.order_menu = None;
         // Ferme seulement la fenêtre : une question en vol le reste (une seule à la fois).
@@ -517,6 +532,10 @@ impl Game {
             memory: None,
             map_rev: 0,
             status: false,
+            inspect: None,
+            inspection: None,
+            inspect_asked: (None, f64::NEG_INFINITY),
+            toast: None,
             pause: false,
             pause_sel: 0,
             pause_pick: false,
@@ -585,6 +604,57 @@ impl Game {
         }
     }
 
+    /// The `Inspect` request to send now, if the panel needs one.
+    pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
+        if self.inspect.is_none() {
+            // Closed: reopening the same target asks soon. Relies on this running every
+            // frame (the `inspect_poll` system), so a close is always seen here.
+            self.inspect_asked.0 = None;
+        }
+        if !inspect_due(self.inspect, self.inspect_asked, now) {
+            return None;
+        }
+        let t = self.inspect?;
+        self.inspect_asked = (Some(t), now);
+        Some(ClientMsg::Inspect(t))
+    }
+
+    /// Server reply about `t`: kept if `t` is the open panel's target (a late reply for a
+    /// closed or previous panel is dropped); `None` means it is gone.
+    pub fn on_inspected(&mut self, t: InspectTarget, i: Option<Inspection>) {
+        if self.inspect != Some(t) {
+            return;
+        }
+        match i {
+            Some(i) => self.inspection = Some(i),
+            None => {
+                self.close_inspect();
+                self.say(tr("Disparu", "Gone"));
+            }
+        }
+    }
+
+    /// Closes the inspect panel and forgets its vitals.
+    fn close_inspect(&mut self) {
+        self.inspect = None;
+        self.inspection = None;
+    }
+
+    /// Shows a one-line notice for a few seconds.
+    pub fn say(&mut self, text: &str) {
+        self.toast = Some((text.to_string(), self.ticks));
+    }
+
+    /// Creatures on this tile of level `z`: the hero first, then the dwarves.
+    pub fn targets_at(&self, tile: (i16, i16), z: u8) -> Vec<InspectTarget> {
+        let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
+        let hero = at(self.hero.pos).then_some(InspectTarget::Hero);
+        let dwarves = self.dwarves.iter().filter(|d| at(d.1));
+        hero.into_iter()
+            .chain(dwarves.map(|d| InspectTarget::Dwarf(d.0)))
+            .collect()
+    }
+
     pub fn current_z(&self) -> u8 {
         self.browse_z.unwrap_or(self.hero.pos.z)
     }
@@ -625,6 +695,12 @@ impl Game {
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
         self.hungry.clone_from(&d.hungry);
+        for id in &d.died {
+            if self.inspect == Some(InspectTarget::Dwarf(*id)) {
+                self.close_inspect();
+            }
+            self.say(tr("Un nain est mort de faim", "A dwarf starved to death"));
+        }
         self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -793,6 +869,21 @@ impl Game {
     }
 }
 
+/// Whether to send `Inspect` for `open` now, given the last request `asked`: once a second
+/// for the same target, soon after opening or changing target, never two within
+/// `INSPECT_GAP` (the server drops an Inspect under 100 ms after the previous one).
+pub fn inspect_due(
+    open: Option<InspectTarget>,
+    asked: (Option<InspectTarget>, f64),
+    now: f64,
+) -> bool {
+    let (last, at) = asked;
+    open.is_some_and(|t| now - at >= if last == Some(t) { 1.0 } else { INSPECT_GAP })
+}
+
+/// Shortest gap between two `Inspect`, in seconds: above the server's 100 ms limit.
+const INSPECT_GAP: f64 = 0.15;
+
 /// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
 pub fn outlined(
     designations: &std::collections::BTreeMap<TilePos, DesignationKind>,
@@ -876,6 +967,12 @@ impl Session {
                 }
                 false
             }
+            NetEvent::Msg(ServerMsg::Inspected(t, i)) => {
+                if let Some(g) = &mut self.game {
+                    g.on_inspected(t, i);
+                }
+                false
+            }
             NetEvent::Disconnected(reason) => {
                 // Before login, the reason shows on the login screen itself.
                 let to = match self.screen {
@@ -945,6 +1042,29 @@ pub(crate) mod tests {
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)
+    }
+
+    #[test]
+    fn targets_at_lists_hero_then_dwarves() {
+        let mut g = game();
+        g.dwarves = vec![
+            (DwarfId(1), p(2, 1, 0), None),
+            (DwarfId(2), p(3, 1, 0), None),
+            (DwarfId(3), p(2, 1, 0), None),
+        ];
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        assert_eq!(g.targets_at((2, 1), 0), [InspectTarget::Hero, dw(1), dw(3)]);
+        assert_eq!(g.targets_at((3, 1), 0), [dw(2)]);
+    }
+
+    #[test]
+    fn targets_at_ignores_other_levels_and_empty_tiles() {
+        let mut g = game();
+        g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
+        assert!(g.targets_at((3, 1), 1).is_empty());
+        assert!(g.targets_at((4, 1), 0).is_empty());
+        // Browsing another level: the hero is not under the cursor there.
+        assert!(g.targets_at((2, 1), 1).is_empty());
     }
 
     /// 6×6×3 rock; floor at (1..=3, 1, 0); stairs at (1,1,0)-(1,1,1).
@@ -1067,6 +1187,7 @@ pub(crate) mod tests {
     fn tick(hero_pos: TilePos) -> TickDelta {
         TickDelta {
             hungry: vec![],
+            died: vec![],
             tick: 1,
             hero_pos,
             dwarves: vec![],
@@ -1076,6 +1197,130 @@ pub(crate) mod tests {
             resources: Resources::default(),
             orders: vec![],
         }
+    }
+
+    fn inspection(target: InspectTarget) -> Inspection {
+        Inspection {
+            target,
+            vitals: None,
+        }
+    }
+
+    fn playing(g: Game) -> Session {
+        Session {
+            game: Some(g),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inspected_none_closes_panel_with_message() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut s = playing(g);
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        // A late "not found" for a previously inspected dwarf leaves this panel alone.
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(2), None)));
+        let g = s.game.as_ref().unwrap();
+        assert_eq!(g.inspect, Some(dw(1)));
+        assert_eq!(g.toast, None);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(1), None)));
+        let g = s.game.unwrap();
+        assert_eq!(g.inspect, None);
+        assert_eq!(g.inspection, None);
+        assert_eq!(g.toast.unwrap().0, "Disparu");
+    }
+
+    #[test]
+    fn stale_inspected_for_another_target_is_ignored() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        let mut s = playing(g);
+        let dw = InspectTarget::Dwarf(DwarfId(1));
+        let other = inspection(dw);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw, Some(other))));
+        assert_eq!(s.game.as_ref().unwrap().inspection, None);
+        let mine = inspection(InspectTarget::Hero);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(
+            InspectTarget::Hero,
+            Some(mine),
+        )));
+        assert_eq!(s.game.unwrap().inspection, Some(mine));
+    }
+
+    #[test]
+    fn inspect_requested_on_open_then_at_most_once_per_second() {
+        let hero = Some(InspectTarget::Hero);
+        let dw = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let never = (None, f64::NEG_INFINITY);
+        assert!(!inspect_due(None, never, 0.0));
+        assert!(inspect_due(hero, never, 0.0));
+        assert!(!inspect_due(hero, (hero, 0.0), 0.9));
+        assert!(inspect_due(hero, (hero, 0.0), 1.0));
+        // Another target asks within the second, but never within 150 ms of the last
+        // request: the server drops an Inspect under 100 ms after the previous one.
+        assert!(inspect_due(dw, (hero, 0.0), 0.5));
+        assert!(!inspect_due(dw, (hero, 0.0), 0.05));
+        assert!(inspect_due(dw, (hero, 0.0), 0.15));
+        assert!(
+            !inspect_due(hero, (None, 0.0), 0.05),
+            "closed then reopened"
+        );
+        let mut g = game();
+        g.inspect = hero;
+        assert_eq!(
+            g.poll_inspect(5.0),
+            Some(ClientMsg::Inspect(InspectTarget::Hero))
+        );
+        assert_eq!(g.poll_inspect(5.5), None);
+        assert!(g.poll_inspect(6.0).is_some());
+    }
+
+    #[test]
+    fn inspected_none_with_no_open_panel_shows_no_toast() {
+        let mut g = game();
+        g.on_inspected(InspectTarget::Hero, None);
+        assert_eq!(g.toast, None);
+    }
+
+    #[test]
+    fn reopening_same_target_asks_at_once() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.0).is_some());
+        g.inspect = None;
+        assert_eq!(g.poll_inspect(5.2), None);
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.3).is_some());
+        // Switching target at once is delayed, not lost.
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        assert_eq!(g.poll_inspect(5.35), None);
+        assert!(g.poll_inspect(5.45).is_some());
+    }
+
+    #[test]
+    fn died_in_delta_reports_message() {
+        let mut g = game();
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+    }
+
+    #[test]
+    fn died_inspected_dwarf_closes_panel() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!((g.inspect, g.inspection), (None, None));
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+        // Another dwarf's death leaves the panel open.
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(2)));
+        g.apply_tick(&d);
+        assert!(g.inspect.is_some());
     }
 
     #[test]
