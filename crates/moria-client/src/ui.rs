@@ -441,10 +441,14 @@ fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> R
 }
 
 /// No title bar: its collapse and close buttons could hold focus, and Space digs.
-fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
+fn status_window(
+    ctx: &egui::Context,
+    g: &mut Game,
+    portrait: egui::TextureId,
+) -> Option<egui::Rect> {
     let rows = g.dwarf_rows();
     let h = &g.hero;
-    egui::Window::new("Statut")
+    let rect = egui::Window::new("Statut")
         .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, below_bar(ctx)])
         .resizable(false)
@@ -487,7 +491,12 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
                 "C ou Échap : fermer · manette : Select ou B/○",
                 "C or Esc: close · gamepad: Select or B/○",
             ));
-        });
+        })
+        .map(|r| r.response.rect);
+    if let Some(r) = rect {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(STATUS_BOTTOM), r.bottom()));
+    }
+    rect
 }
 
 /// Middle-click panel: what is known about the inspected creature.
@@ -591,14 +600,18 @@ fn toast(mut ctx: EguiContexts, client: Res<Client>) -> Result {
 const TOAST_TICKS: u64 = 100;
 
 /// No title bar (Space digs); sits under the status page when both are open.
-fn inspect_window(ctx: &egui::Context, g: &Game) {
-    let Some(t) = g.inspect else { return };
+fn inspect_window(ctx: &egui::Context, g: &Game) -> Option<egui::Rect> {
+    let t = g.inspect?;
     let lines = inspect_lines(g, t);
     if lines.is_empty() {
-        return;
+        return None;
     }
-    // ponytail: fixed offset; a measured status-window height if it ever overlaps.
-    let dy = below_bar(ctx) + if g.status { STATUS_HEIGHT } else { 0.0 };
+    // The status page is drawn first in the frame (`status` runs before `inspect`).
+    let status_bottom = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(STATUS_BOTTOM)));
+    let dy = match status_bottom {
+        Some(b) if g.status => b + 8.0,
+        _ => below_bar(ctx),
+    };
     egui::Window::new("Inspection")
         .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, dy])
@@ -615,11 +628,12 @@ fn inspect_window(ctx: &egui::Context, g: &Game) {
                 "Clic du milieu ou Échap : fermer",
                 "Middle click or Esc: close",
             ));
-        });
+        })
+        .map(|r| r.response.rect)
 }
 
-/// Room left for the status page above the inspect panel.
-const STATUS_HEIGHT: f32 = 480.0;
+/// Where `status_window` leaves the status page's bottom edge, in egui's temp memory.
+const STATUS_BOTTOM: &str = "statut_bas";
 
 /// Where `bar_window` leaves the bar's bottom edge, in egui's temp memory.
 const BAR_BOTTOM: &str = "barre_bas";
@@ -955,7 +969,7 @@ mod tests {
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                status_window(ui.ctx(), &mut g, egui::TextureId::default())
+                status_window(ui.ctx(), &mut g, egui::TextureId::default());
             })
             .textures_delta
             .clear();
@@ -1041,6 +1055,35 @@ mod tests {
         })
         .textures_delta
         .clear();
+    }
+
+    #[test]
+    fn inspect_panel_sits_just_under_the_status_page() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1500.0));
+        for status in [true, true, false, false] {
+            g.status = status;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let (mut page, mut panel) = (None, None);
+            ctx.run_ui(input, |ui| {
+                if g.status {
+                    page = status_window(ui.ctx(), &mut g, egui::TextureId::default());
+                }
+                panel = inspect_window(ui.ctx(), &g);
+            })
+            .textures_delta
+            .clear();
+            let top = panel.unwrap().top();
+            match page {
+                Some(page) => assert_eq!(top, page.bottom() + 8.0),
+                None => assert_eq!(top, below_bar(&ctx)),
+            }
+        }
     }
 
     /// A painted text: its string, screen rect and number of rows.
