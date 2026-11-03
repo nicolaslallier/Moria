@@ -4,6 +4,7 @@
 //! only checks its proposals against the grid.
 
 use crate::food::{apply_bus_events, snapshot};
+use crate::metrics::{M, inc};
 use crate::sim::Changes;
 use futures::StreamExt;
 use moria_bus::{Bus, Queue, redact_url};
@@ -239,7 +240,8 @@ pub fn chunk_actions(tick: u64, mountain: MountainId, acts: &[FoodAction]) -> Ve
 
 /// Encodes for the bus; a message the container would refuse as too big is dropped here.
 // ponytail: `World` is never split (the container forgets mountains a `World` leaves out);
-// 256 KiB is ~32k cells for the whole world. Split it with a "last part" flag if logged.
+// 2 MiB holds every ground tile of all 16 mountains. Split it with a "last part" flag if
+// `moria_food_world_dropped_total` ever moves.
 fn encode(o: &Outgoing) -> Option<(&'static str, Vec<u8>)> {
     let (key, max, bytes) = match o {
         Outgoing::Tick(t) => (KEY_TICK, MAX_FOOD_MSG_BYTES, postcard::to_allocvec(t)),
@@ -250,6 +252,9 @@ fn encode(o: &Outgoing) -> Option<(&'static str, Vec<u8>)> {
     match bytes {
         Ok(b) if b.len() <= max => Some((key, b)),
         Ok(b) => {
+            if key == KEY_WORLD {
+                inc(&M.food_world_dropped);
+            }
             tracing::error!("message {key} trop gros ({} octets), perdu", b.len());
             None
         }
@@ -678,6 +683,33 @@ mod tests {
         let v = sent(&mut out);
         assert_eq!(worlds(&v).len(), 1);
         assert_eq!(worlds(&v)[0].mountains[0].0, MountainId(5));
+    }
+
+    #[test]
+    fn an_oversized_world_is_dropped_and_counted() {
+        use crate::metrics::M as METRICS;
+        use moria_core::food::{Cell, CellKind};
+        use std::sync::atomic::Ordering::Relaxed;
+        let cells = |n: i16| -> Vec<Cell> {
+            (0..n)
+                .map(|i| Cell {
+                    pos: TilePos::new(i16::MAX - i, i16::MIN + i, u8::MAX),
+                    kind: CellKind::Cow,
+                })
+                .collect()
+        };
+        let small = Outgoing::World(World {
+            tick: 1,
+            mountains: vec![(M, cells(10))],
+        });
+        assert!(encode(&small).is_some());
+        let big = Outgoing::World(World {
+            tick: 1,
+            mountains: (0..60).map(|i| (MountainId(i), cells(i16::MAX))).collect(),
+        });
+        let before = METRICS.food_world_dropped.load(Relaxed);
+        assert!(encode(&big).is_none());
+        assert!(METRICS.food_world_dropped.load(Relaxed) > before);
     }
 
     #[test]
