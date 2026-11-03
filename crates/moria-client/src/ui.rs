@@ -541,10 +541,14 @@ pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
 
 /// Food, health, age and jobs from the server's latest reply for `t`.
 fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
-    let Some(i) = g.inspection.filter(|i| i.target == t) else {
+    let Some(i) = g
+        .inspection
+        .filter(|i| i.target == t)
+        .and_then(|i| i.vitals)
+    else {
         return vec![];
     };
-    let mut v = vec![
+    vec![
         (
             tr("Satiété", "Food").to_string(),
             format!("{} %", u32::from(i.food) * 100 / u32::from(FOOD_MAX)),
@@ -553,20 +557,16 @@ fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
             tr("Santé", "Health").to_string(),
             format!("{} / {HEALTH_MAX}", i.health),
         ),
-    ];
-    // The server sends no age or job count for the hero.
-    if matches!(t, InspectTarget::Dwarf(_)) {
-        v.push((
+        (
             tr("Âge", "Age").to_string(),
             format!(
                 "{:.1} {}",
                 i.ticks_alive as f64 / DAY_TICKS as f64,
                 tr("j", "d")
             ),
-        ));
-        v.push((tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()));
-    }
-    v
+        ),
+        (tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()),
+    ]
 }
 
 /// Transient one-line notice (a death, a vanished creature), top center.
@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn inspect_lines_show_gauges_and_stats() {
         use moria_core::DwarfId;
-        use moria_core::protocol::Inspection;
+        use moria_core::protocol::{Inspection, Vitals};
         use moria_core::world::{FOOD_MAX, HEALTH_MAX};
         let mut g = crate::game::tests::game();
         let p = g.hero.pos;
@@ -1001,10 +1001,12 @@ mod tests {
         let known = inspect_lines(&g, t).len();
         g.inspection = Some(Inspection {
             target: t,
-            food: FOOD_MAX / 2,
-            health: HEALTH_MAX,
-            ticks_alive: moria_core::light::DAY_TICKS * 3 / 2,
-            jobs_done: 12,
+            vitals: Some(Vitals {
+                food: FOOD_MAX / 2,
+                health: HEALTH_MAX,
+                ticks_alive: moria_core::light::DAY_TICKS * 3 / 2,
+                jobs_done: 12,
+            }),
         });
         let l = inspect_lines(&g, t);
         assert_eq!(l.len(), known + 4);
@@ -1012,16 +1014,16 @@ mod tests {
         assert!(l.contains(&("Santé".into(), "100 / 100".into())));
         assert!(l.contains(&("Âge".into(), "1.5 j".into())));
         assert!(l.contains(&("Tâches".into(), "12".into())));
-        // Hero: no jobs row.
+        // Hero: no vitals at all (no hunger or health mechanics).
+        let hero = InspectTarget::Hero;
+        let known_hero = inspect_lines(&g, hero).len();
         g.inspection = Some(Inspection {
-            target: InspectTarget::Hero,
-            jobs_done: 0,
-            ..g.inspection.unwrap()
+            target: hero,
+            vitals: None,
         });
-        let l = inspect_lines(&g, InspectTarget::Hero);
-        assert!(l.iter().any(|(k, _)| k == "Satiété"));
-        assert!(!l.iter().any(|(k, _)| k == "Tâches"));
-        assert!(!l.iter().any(|(k, _)| k == "Âge"));
+        let l = inspect_lines(&g, hero);
+        assert_eq!(l.len(), known_hero);
+        assert!(!l.iter().any(|(k, _)| k == "Satiété" || k == "Santé"));
         // A reply for another target adds nothing.
         assert_eq!(inspect_lines(&g, t).len(), known);
     }

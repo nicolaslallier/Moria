@@ -3,7 +3,9 @@
 
 use moria_core::ai::Assignments;
 use moria_core::path::{find_path, work_spot_goal};
-use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, InspectTarget, Inspection, TickDelta};
+use moria_core::protocol::{
+    ClientMsg, DwarfJob, DwarfState, InspectTarget, Inspection, TickDelta, Vitals,
+};
 use moria_core::srd::hero_dig_ticks;
 use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, HEALTH_MAX, Hero, World};
 use moria_core::{
@@ -84,21 +86,18 @@ impl Command {
 /// `t`'s vitals, looked up only in `owner`'s fortress; `None` if not found there.
 pub fn inspect(w: &World, owner: PlayerId, t: InspectTarget) -> Option<Inspection> {
     let f = w.fortresses.values().find(|f| f.owner == owner)?;
-    let (food, health, ticks_alive, jobs_done) = match t {
-        InspectTarget::Hero => f.hero.as_ref().map(|h| (h.food, h.health, 0, 0))?,
-        InspectTarget::Dwarf(id) => f
-            .dwarves
-            .iter()
-            .find(|d| d.id == id)
-            .map(|d| (d.food, d.health, d.ticks_alive, d.jobs_done))?,
+    let vitals = match t {
+        InspectTarget::Hero => f.hero.as_ref().map(|_| None)?,
+        InspectTarget::Dwarf(id) => f.dwarves.iter().find(|d| d.id == id).map(|d| {
+            Some(Vitals {
+                food: d.food,
+                health: d.health,
+                ticks_alive: d.ticks_alive,
+                jobs_done: d.jobs_done,
+            })
+        })?,
     };
-    Some(Inspection {
-        target: t,
-        food,
-        health,
-        ticks_alive,
-        jobs_done,
-    })
+    Some(Inspection { target: t, vitals })
 }
 
 /// Changes caused by commands, folded into that tick's delta. Designations per tile:
@@ -2623,7 +2622,7 @@ mod tests {
 
     #[test]
     fn inspect_returns_dwarf_vitals() {
-        use moria_core::protocol::{InspectTarget as T, Inspection};
+        use moria_core::protocol::{InspectTarget as T, Inspection, Vitals};
         let mut w = setup();
         let d = &mut w.fortresses.get_mut(&M).unwrap().dwarves[1];
         (d.food, d.health, d.ticks_alive, d.jobs_done) = (40, 55, 1234, 7);
@@ -2632,16 +2631,21 @@ mod tests {
             inspect(&w, PlayerId(1), T::Dwarf(id)),
             Some(Inspection {
                 target: T::Dwarf(id),
-                food: 40,
-                health: 55,
-                ticks_alive: 1234,
-                jobs_done: 7,
+                vitals: Some(Vitals {
+                    food: 40,
+                    health: 55,
+                    ticks_alive: 1234,
+                    jobs_done: 7,
+                }),
             })
         );
-        let h = inspect(&w, PlayerId(1), T::Hero).unwrap();
+        // The hero has no hunger or health mechanics: found, but no vitals.
         assert_eq!(
-            (h.food, h.health, h.ticks_alive, h.jobs_done),
-            (FOOD_MAX, HEALTH_MAX, 0, 0)
+            inspect(&w, PlayerId(1), T::Hero),
+            Some(Inspection {
+                target: T::Hero,
+                vitals: None
+            })
         );
     }
 

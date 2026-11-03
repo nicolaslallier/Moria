@@ -121,10 +121,16 @@ pub struct TickDelta {
     pub died: Vec<DwarfId>,
 }
 
-/// One creature's vitals, for the status panel.
+/// What the status panel learns from the server about one creature.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inspection {
     pub target: InspectTarget,
+    /// `None` for a creature without hunger or health (the hero).
+    pub vitals: Option<Vitals>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vitals {
     pub food: u16,
     pub health: u16,
     pub ticks_alive: u64,
@@ -230,14 +236,17 @@ mod tests {
     fn inspect_roundtrip() {
         let q = ClientMsg::Inspect(InspectTarget::Dwarf(DwarfId(7)));
         assert_eq!(decode::<ClientMsg>(&encode(&q)[4..]).unwrap(), q);
+        let t = InspectTarget::Dwarf(DwarfId(7));
         let a = ServerMsg::Inspected(
-            InspectTarget::Hero,
+            t,
             Some(Inspection {
-                target: InspectTarget::Hero,
-                food: 3,
-                health: 4,
-                ticks_alive: 1 << 40,
-                jobs_done: 9,
+                target: t,
+                vitals: Some(Vitals {
+                    food: 3,
+                    health: 4,
+                    ticks_alive: 1 << 40,
+                    jobs_done: 9,
+                }),
             }),
         );
         assert_eq!(decode::<ServerMsg>(&encode(&a)[4..]).unwrap(), a);

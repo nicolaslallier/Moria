@@ -1020,10 +1020,7 @@ pub(crate) mod tests {
     fn inspection(target: InspectTarget) -> Inspection {
         Inspection {
             target,
-            food: 10,
-            health: 90,
-            ticks_alive: 5,
-            jobs_done: 2,
+            vitals: None,
         }
     }
 
