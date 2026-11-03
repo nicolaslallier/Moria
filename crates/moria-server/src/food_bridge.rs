@@ -7,14 +7,14 @@ use crate::food::{apply_bus_events, snapshot};
 use crate::sim::Changes;
 use futures::StreamExt;
 use moria_bus::{Bus, Queue, redact_url};
-use moria_core::food::FoodAction;
+use moria_core::food::{FoodAction, FoodEvent};
 use moria_core::food_msg::{
     Actions, Events, KEY_ACTION, KEY_EVENTS, KEY_REJECT, KEY_STATE, KEY_TICK, KEY_WORLD,
     MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
 };
 use moria_core::inventory::STOPPED_AFTER;
 use moria_core::world::World as GameWorld;
-use moria_core::{MountainId, TilePos};
+use moria_core::{MountainId, Tile, TilePos};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -164,12 +164,29 @@ impl Link {
                 let ch = out.entry(id).or_default();
                 apply_bus_events(m, f, &ev.list, stale, &mut ch.tiles)
             };
+            // A move refused because its cow is gone (butchered after the container moved
+            // it): the reject would put a ghost back at `from`, and the earlier CowRemoved
+            // missed it. Remove both ends; rejects and actions travel on separate queues, so
+            // this holds in either order of arrival.
+            let fix: Vec<FoodAction> = rejected
+                .iter()
+                .filter_map(|e| match *e {
+                    FoodEvent::CowMoved { from, to } if m.get(from) != Some(Tile::Cow) => {
+                        Some([FoodAction::CowRemoved(from), FoodAction::CowRemoved(to)])
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             if !rejected.is_empty() {
                 self.send(Outgoing::Rejects(Rejects {
                     tick: ev.tick,
                     mountain: id,
                     list: rejected,
                 }));
+            }
+            for a in chunk_actions(tick, id, &fix) {
+                self.send(Outgoing::Actions(a));
             }
         }
         out.retain(|_, ch| *ch != Changes::default());
@@ -305,8 +322,7 @@ pub async fn run(url: String, mut out: mpsc::Receiver<Outgoing>, inc: mpsc::Send
 mod tests {
     use super::*;
     use crate::sim::tests::{M, cow_pen, p, setup};
-    use moria_core::food::FoodEvent;
-    use moria_core::{Dir, Tile};
+    use moria_core::Dir;
 
     type Ends = (mpsc::Receiver<Outgoing>, mpsc::Sender<Incoming>);
 
@@ -565,6 +581,58 @@ mod tests {
             tick(&mut l, &mut w, &[], t0);
         }
         assert!(l.touched.is_empty());
+    }
+
+    #[test]
+    fn a_move_refused_for_a_missing_origin_removes_the_cow_in_the_container() {
+        let (mut l, (mut out, inc)) = link();
+        let mut w = setup();
+        w.tick = 1_000;
+        let c = p(-6, 1, 0);
+        cow_pen(&mut w, c, &[Dir::N]);
+        let kept = FoodEvent::CowMoved {
+            from: c,
+            to: c.step(Dir::S), // a tree: refused, but the cow is still there
+        };
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Grass); // butchered meanwhile
+        let gone = FoodEvent::CowMoved {
+            from: c,
+            to: c.step(Dir::N),
+        };
+        inc.try_send(Incoming::Events(Events {
+            tick: 1_000,
+            mountain: M,
+            list: vec![gone],
+        }))
+        .unwrap();
+        tick(&mut l, &mut w, &[], Instant::now());
+        let v = sent(&mut out);
+        let r = v
+            .iter()
+            .position(|o| matches!(o, Outgoing::Rejects(r) if r.list == vec![gone]))
+            .unwrap();
+        let fix = v.iter().position(|o| {
+            matches!(o, Outgoing::Actions(a) if a.mountain == M && a.tick == w.tick
+                && a.list == vec![FoodAction::CowRemoved(c), FoodAction::CowRemoved(c.step(Dir::N))])
+        });
+        assert!(
+            fix.is_some_and(|f| f > r),
+            "no correction after the reject: {fix:?}"
+        );
+        assert_eq!(w.mountains[&M].get(c.step(Dir::N)), Some(Tile::Grass));
+
+        // a move refused while its cow is still there needs no correction
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Cow);
+        inc.try_send(Incoming::Events(Events {
+            tick: w.tick,
+            mountain: M,
+            list: vec![kept],
+        }))
+        .unwrap();
+        tick(&mut l, &mut w, &[], Instant::now());
+        let v = sent(&mut out);
+        assert_eq!(rejects(&v)[0].list, vec![kept]);
+        assert!(!v.iter().any(|o| matches!(o, Outgoing::Actions(_))));
     }
 
     #[test]
