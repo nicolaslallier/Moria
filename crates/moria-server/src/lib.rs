@@ -787,6 +787,52 @@ mod tests {
     }
 
     #[test]
+    fn a_client_arriving_later_sees_food_changes_made_without_a_hero() {
+        use moria_core::food::FoodEvent;
+        use moria_core::food_msg::{Events, Status};
+        use moria_core::{GROUND_Z, Tile};
+        let (mut s, _cmd) = state();
+        let m0 = MountainId(0);
+        // nobody on the mountain: no delta carries its food changes
+        s.w.fortresses.get_mut(&m0).unwrap().hero = None;
+        let q = TilePos::new(world::ENTRANCE_X.start - 6, 47, GROUND_Z);
+        s.w.mountains.get_mut(&m0).unwrap().set(q, Tile::Field);
+        let (tx, _out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
+        s.food_link = Some(food_bridge::Link::new(tx, rx));
+        s.food_sim = None;
+        inc.try_send(food_bridge::Incoming::Status(Status { tick: 1 }))
+            .unwrap();
+        inc.try_send(food_bridge::Incoming::Events(Events {
+            tick: s.w.tick,
+            mountain: m0,
+            list: vec![FoodEvent::CropRipe { at: q }],
+        }))
+        .unwrap();
+        s.step_at(std::time::Instant::now());
+        // the player comes back and makes a hero: the snapshot carries the crop and its harvest
+        let (ctx, mut crx) = mpsc::channel(64);
+        s.sessions.insert(PlayerId(0), ctx);
+        s.request(Request::CreateHero {
+            player: PlayerId(0),
+            name: "h".into(),
+            race: Race::Dwarf,
+            class: Class::Fighter,
+        });
+        let snap = std::iter::from_fn(|| crx.try_recv().ok())
+            .find_map(|m| match m {
+                ServerMsg::Snapshot(v) => Some(v),
+                _ => None,
+            })
+            .expect("no snapshot");
+        assert_eq!(snap.mountain.get(q), Some(Tile::Crop));
+        assert_eq!(
+            snap.mountain.designations.get(&q),
+            Some(&DesignationKind::Chop)
+        );
+    }
+
+    #[test]
     fn epoch_never_below_world_mtime() {
         assert_eq!(start_epoch(1_000, Some(5_000)), 5_001);
         assert_eq!(start_epoch(5_000, Some(5_000)), 5_001);
