@@ -6,6 +6,7 @@ use moria_bus::{Bus, Queue};
 use moria_core::MountainId;
 use moria_core::ai::{AiView, Assignments, KEY_ASSIGN, KEY_VIEW, MAX_DWARVES_PER_VIEW};
 use moria_core::inventory::{Batch, KEY_APPLY, KEY_STATE, State};
+use moria_core::king::{Ask, KEY_ASK, KEY_REPLY, Reply};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
@@ -75,6 +76,31 @@ pub fn decode_state(bytes: &[u8]) -> Option<State> {
     }
 }
 
+/// Une réponse fait au plus ~1000 caractères (4 Ko en UTF-8) : au-delà, ce n'est pas le roi.
+const MAX_REPLY_BYTES: usize = 8 * 1024;
+
+/// Durée de vie d'une question dans la file `king` : le broker jette les questions périmées.
+const ASK_TTL: Duration = Duration::from_secs(70);
+
+/// Décode une réponse du roi (entrée non fiable) ; la montagne doit exister.
+pub fn decode_reply(bytes: &[u8], known: &BTreeSet<MountainId>) -> Option<Reply> {
+    if bytes.len() > MAX_REPLY_BYTES {
+        tracing::warn!("reponse du roi ignoree: {} octets", bytes.len());
+        return None;
+    }
+    match postcard::from_bytes::<Reply>(bytes) {
+        Ok(r) if known.contains(&r.mountain) => Some(r),
+        Ok(r) => {
+            tracing::warn!("reponse du roi ignoree: montagne inconnue {:?}", r.mountain);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("reponse du roi illisible ignoree: {e}");
+            None
+        }
+    }
+}
+
 /// Publishes unsent batches in order until one fails (it stays at the front for the next
 /// try). `false` = a publish failed: the caller reconnects (which re-declares the queue).
 async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) -> bool {
@@ -97,6 +123,16 @@ async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) -> bool {
         unsent.pop_front();
     }
     true
+}
+
+/// Jette les questions au roi arrivées pendant la coupure : le serveur a déjà envoyé (ou
+/// enverra à 70 s) son repli, les publier maintenant ferait travailler le LLM pour rien.
+fn drop_asks(asks: &mut mpsc::Receiver<Ask>) -> usize {
+    let mut n = 0;
+    while asks.try_recv().is_ok() {
+        n += 1;
+    }
+    n
 }
 
 /// Waits 2 s before a reconnect, still taking batches. `false` = the world task is gone.
@@ -134,7 +170,8 @@ async fn finish(bus: &Bus, unsent: &mut VecDeque<Batch>, batches: &mut mpsc::Rec
 /// confirm (up to 10 s), `batches` is not drained, so the real cap there is the 65_536-slot
 /// channel, where the world side drops the NEWEST batches (counter
 /// `moria_inventory_dropped_total`). `MAX_UNSENT` (oldest dropped) only applies once the
-/// bridge is running again.
+/// bridge is running again. Questions au roi : jetées si le bus est coupé, y compris celles
+/// en attente pendant la reconnexion (le serveur répond par le repli au délai).
 pub async fn run(
     url: String,
     known: BTreeSet<MountainId>,
@@ -142,10 +179,15 @@ pub async fn run(
     assign: mpsc::Sender<Assignments>,
     mut batches: mpsc::Receiver<Batch>,
     states: mpsc::Sender<State>,
+    (mut asks, replies): (mpsc::Receiver<Ask>, mpsc::Sender<Reply>),
 ) {
     let mut unsent: VecDeque<Batch> = VecDeque::new();
     loop {
         let bus = Bus::connect_forever(&url).await;
+        let n = drop_asks(&mut asks);
+        if n > 0 {
+            tracing::warn!("{n} questions au roi jetées pendant la coupure du bus");
+        }
         // A durable publish to an unbound key errors, so the queue must exist first.
         if let Err(e) = bus.declare(KEY_APPLY, Queue::Durable("inventory")).await {
             tracing::warn!(
@@ -156,12 +198,25 @@ pub async fn run(
             }
             continue;
         }
-        let (mut sub, mut state_sub) = match (
+        // Même déclaration que `moria-king` (file partagée), avant toute question.
+        let king = Queue::Shared {
+            name: "king",
+            latest_only: false,
+        };
+        if let Err(e) = bus.declare(KEY_ASK, king).await {
+            tracing::warn!("declaration de la file du roi impossible ({e}), nouvel essai dans 2 s");
+            if !pause(&mut batches, &mut unsent).await {
+                return;
+            }
+            continue;
+        }
+        let (mut sub, mut state_sub, mut reply_sub) = match (
             bus.subscribe(KEY_ASSIGN, Queue::Exclusive).await,
             bus.subscribe(KEY_STATE, Queue::Exclusive).await,
+            bus.subscribe(KEY_REPLY, Queue::Exclusive).await,
         ) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) => {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 tracing::warn!("abonnement impossible ({e}), nouvel essai dans 2 s");
                 if !pause(&mut batches, &mut unsent).await {
                     return;
@@ -204,6 +259,33 @@ pub async fn run(
                     push_unsent(&mut unsent, b);
                     if bus.is_connected() {
                         ok = flush(&bus, &mut unsent).await;
+                    }
+                }
+                a = asks.recv() => {
+                    // Fermé avec la tâche du monde, comme `views`.
+                    let Some(a) = a else {
+                        finish(&bus, &mut unsent, &mut batches).await;
+                        return;
+                    };
+                    if !bus.is_connected() {
+                        continue;
+                    }
+                    let res = match postcard::to_allocvec(&a) {
+                        Ok(b) => bus.publish_expiring(KEY_ASK, b, ASK_TTL).await,
+                        Err(e) => Err(e.into()),
+                    };
+                    if let Err(e) = res {
+                        tracing::warn!("publication de question au roi echouee, reconnexion: {e}");
+                        break;
+                    }
+                }
+                m = reply_sub.next() => {
+                    let Some(m) = m else {
+                        tracing::warn!("abonnement du roi termine, reconnexion");
+                        break;
+                    };
+                    if let Some(r) = decode_reply(&m, &known) {
+                        let _ = replies.try_send(r);
                     }
                 }
                 _ = retry.tick(), if !unsent.is_empty() && bus.is_connected() => {
@@ -327,5 +409,57 @@ mod tests {
         // trailing bytes would decode fine, so only the cap can reject this
         assert!(postcard::from_bytes::<Assignments>(&b).is_ok());
         assert!(decode_assignments(&b, &known).is_none());
+    }
+
+    #[test]
+    fn asks_waiting_during_a_reconnect_are_dropped() {
+        use moria_core::king::{KingState, Lang};
+        let (tx, mut rx) = mpsc::channel(8);
+        let a = Ask {
+            mountain: MountainId(0),
+            seq: 1,
+            lang: Lang::Fr,
+            text: "Bonjour".into(),
+            history: vec![],
+            state: KingState {
+                resources: Default::default(),
+                dwarves: 0,
+                depth: 0,
+            },
+            active: None,
+            offered: vec![],
+        };
+        for _ in 0..3 {
+            tx.try_send(a.clone()).unwrap();
+        }
+        assert_eq!(drop_asks(&mut rx), 3);
+        assert!(rx.try_recv().is_err(), "file vidée");
+        assert_eq!(drop_asks(&mut rx), 0);
+    }
+
+    fn reply(m: u16, text: &str) -> Vec<u8> {
+        postcard::to_allocvec(&Reply {
+            mountain: MountainId(m),
+            seq: 1,
+            text: text.into(),
+            offer: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn oversized_reply_body_is_rejected_by_the_bridge() {
+        let known = BTreeSet::from([MountainId(0)]);
+        assert!(decode_reply(&reply(0, "Oui"), &known).is_some());
+        assert!(
+            decode_reply(&reply(1, "Oui"), &known).is_none(),
+            "montagne inconnue"
+        );
+        assert!(decode_reply(&[0xff; 7], &known).is_none());
+        let mut big = reply(0, "Oui");
+        big.resize(MAX_REPLY_BYTES + 1, 0);
+        // des octets en trop se décodent quand même : seul le plafond les refuse
+        assert!(postcard::from_bytes::<Reply>(&big).is_ok());
+        assert!(decode_reply(&big, &known).is_none());
     }
 }

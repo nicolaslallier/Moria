@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         amqp_url: Some(env("AMQP_URL", "amqp://moria:moria@rabbitmq:5672/moria")),
         invite: std::env::var("MORIA_INVITE").ok().filter(|s| !s.is_empty()),
         max_per_ip,
+        king_timeout: moria_server::king::KING_TIMEOUT,
     };
     let metrics_bind: std::net::SocketAddr = env("MORIA_METRICS_BIND", "0.0.0.0:9464").parse()?;
     tokio::spawn(async move {

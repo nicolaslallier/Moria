@@ -226,7 +226,7 @@ mod tests {
 
     /// One tick of the server without bus: sim, then food, folded into the delta.
     fn run(w: &mut World, sims: &mut InProcess) -> (Option<TickDelta>, Vec<FoodAction>) {
-        let (mut d, mut acts) = step_with_food(w);
+        let (mut d, mut acts) = step_with_food(w, &mut vec![]);
         let mut ch = step(w, Some(sims), &acts);
         let mut d = d.remove(&M);
         if let (Some(d), Some(c)) = (d.as_mut(), ch.remove(&M)) {
@@ -459,7 +459,7 @@ mod tests {
     fn actions_until(w: &mut World, done: impl Fn(&World) -> bool) -> Vec<FoodAction> {
         let mut seen = vec![];
         for _ in 0..300 {
-            let (_, mut acts) = step_with_food(w);
+            let (_, mut acts) = step_with_food(w, &mut vec![]);
             seen.append(&mut acts.remove(&M).unwrap_or_default());
             if done(w) {
                 return seen;

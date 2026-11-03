@@ -23,7 +23,7 @@ pub struct Drag {
 pub fn plugin(app: &mut App) {
     app.init_resource::<Drag>().add_systems(
         Update,
-        (play, mouse)
+        (play, mouse, inspect_poll)
             .in_set(InputSet)
             .run_if(in_state(Screen::Playing)),
     );
@@ -52,10 +52,18 @@ struct Intent {
     use_: bool,
     /// Gamepad Start: the pause menu (the keyboard uses Escape, `close_menu`).
     pause: bool,
+    /// `E` à côté du roi : ouvre le dialogue au lieu de descendre.
+    talk: bool,
 }
 
-fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> Intent {
+fn keyboard_intent(
+    keys: &ButtonInput<KeyCode>,
+    logical: &ButtonInput<Key>,
+    near_king: bool,
+) -> Intent {
     let ch = |s: &str| logical.just_pressed(Key::Character(s.into()));
+    // `E` contextuel : parler au roi à côté de lui, sinon descendre ; `>` descend toujours.
+    let e = keys.just_pressed(KeyCode::KeyE);
     Intent {
         // Held keys keep walking; the cooldown paces them.
         walk: MOVES
@@ -63,7 +71,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
             .find(|(a, b, _)| keys.pressed(*a) || keys.pressed(*b))
             .map(|&(_, _, d)| d),
         up: ch("<") || keys.just_pressed(KeyCode::KeyQ),
-        down: ch(">") || keys.just_pressed(KeyCode::KeyE),
+        down: ch(">") || (e && !near_king),
         dig: keys.just_pressed(KeyCode::Space),
         toggle: keys.just_pressed(KeyCode::KeyX),
         mode: if keys.just_pressed(KeyCode::Digit1) {
@@ -80,6 +88,7 @@ fn keyboard_intent(keys: &ButtonInput<KeyCode>, logical: &ButtonInput<Key>) -> I
         status: keys.just_pressed(KeyCode::KeyC),
         use_: keys.just_pressed(KeyCode::KeyF),
         pause: false,
+        talk: e && near_king,
     }
 }
 
@@ -206,6 +215,18 @@ fn pause_frame(g: &mut Game, menu_dir: &mut Option<Dir>, walk: Option<Dir>, act:
     g.pause_pick |= act;
 }
 
+/// Asks the server for the open panel's vitals (see `inspect_due`).
+fn inspect_poll(time: Res<Time>, mut client: ResMut<Client>) {
+    let msg = client
+        .session
+        .game
+        .as_mut()
+        .and_then(|g| g.poll_inspect(time.elapsed_secs_f64()));
+    if let Some(m) = msg {
+        client.send(m);
+    }
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -220,7 +241,7 @@ fn play(
     let Some(g) = &mut client.session.game else {
         return;
     };
-    let k = keyboard_intent(&keys, &logical);
+    let k = keyboard_intent(&keys, &logical, g.near_king());
     // gilrs keeps reporting pads in the background; only a focused window plays.
     let (stick, menu_dir) = &mut *prev;
     let p = if window.focused {
@@ -234,6 +255,10 @@ fn play(
     } else if p.close_menu {
         g.close_menus();
         g.pause = false;
+    }
+    // Dialogue ouvert : le clavier sert à la saisie (egui), rien n'atteint le héros ni les menus.
+    if g.dialog.open {
+        return;
     }
     // Pause menu open: moves and the action button drive it, nothing reaches the hero.
     if g.pause {
@@ -266,6 +291,10 @@ fn play(
         for m in out {
             client.send(m);
         }
+        return;
+    }
+    if k.talk {
+        g.dialog.open = true;
         return;
     }
     let mut out = vec![];
@@ -303,6 +332,18 @@ fn play(
     }
 }
 
+/// Middle click: opens the first creature under the cursor (the hero first); clicking the
+/// same tile again moves to the next one there, and closes after the last.
+pub fn middle_click(g: &mut Game, cursor: Option<(i16, i16)>) {
+    let Some(c) = cursor else { return };
+    let all = g.targets_at(c, g.current_z());
+    let Some(&first) = all.first() else { return };
+    g.inspect = match all.iter().position(|&t| Some(t) == g.inspect) {
+        Some(i) => all.get(i + 1).copied(),
+        None => Some(first),
+    };
+}
+
 fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -316,7 +357,7 @@ fn mouse(
         .cursor_position()
         .and_then(|p| cam.viewport_to_world_2d(cam_t, p).ok())
         .map(to_tile);
-    let Some(g) = &client.session.game else {
+    let Some(g) = &mut client.session.game else {
         return;
     };
     if g.pause {
@@ -324,6 +365,9 @@ fn mouse(
         return;
     }
     let (mode, z) = (g.mode, g.current_z());
+    if buttons.just_pressed(MouseButton::Middle) && !egui.wants_pointer_input() {
+        middle_click(g, drag.cursor);
+    }
     if drag.start.is_none() && !egui.wants_pointer_input() {
         for b in [MouseButton::Left, MouseButton::Right] {
             if buttons.just_pressed(b) {
@@ -349,6 +393,8 @@ fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moria_core::protocol::InspectTarget;
+    use moria_core::{DwarfId, TilePos};
 
     #[test]
     fn pause_menu_steps_on_new_presses_and_picks_with_the_action_button() {
@@ -372,7 +418,7 @@ mod tests {
     fn key_4_picks_chop() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::Digit4);
-        let i = keyboard_intent(&keys, &ButtonInput::default());
+        let i = keyboard_intent(&keys, &ButtonInput::default(), false);
         assert_eq!(i.mode, Some(DesignationKind::Chop));
     }
 
@@ -380,7 +426,7 @@ mod tests {
     fn key_f_is_use() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyF);
-        assert!(keyboard_intent(&keys, &ButtonInput::default()).use_);
+        assert!(keyboard_intent(&keys, &ButtonInput::default(), false).use_);
     }
 
     #[test]
@@ -413,10 +459,65 @@ mod tests {
     }
 
     #[test]
+    fn middle_click_opens_dwarf() {
+        let mut g = crate::game::tests::game();
+        g.dwarves = vec![(DwarfId(1), TilePos { x: 3, y: 1, z: 0 }, None)];
+        middle_click(&mut g, Some((3, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Dwarf(DwarfId(1))));
+    }
+
+    #[test]
+    fn middle_click_same_target_closes() {
+        let mut g = crate::game::tests::game();
+        middle_click(&mut g, Some((2, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Hero));
+        middle_click(&mut g, Some((2, 1)));
+        assert_eq!(g.inspect, None);
+    }
+
+    #[test]
+    fn middle_click_cycles_creatures_on_one_tile() {
+        let mut g = crate::game::tests::game();
+        let here = TilePos { x: 2, y: 1, z: 0 };
+        g.dwarves = vec![(DwarfId(1), here, None), (DwarfId(2), here, None)];
+        let mut seen = vec![];
+        for _ in 0..4 {
+            middle_click(&mut g, Some((2, 1)));
+            seen.push(g.inspect);
+        }
+        let dw = |n| Some(InspectTarget::Dwarf(DwarfId(n)));
+        assert_eq!(seen, [Some(InspectTarget::Hero), dw(1), dw(2), None]);
+    }
+
+    #[test]
+    fn middle_click_on_empty_tile_keeps_state() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        middle_click(&mut g, Some((4, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Hero));
+    }
+
+    #[test]
+    fn middle_click_without_cursor_does_nothing() {
+        let mut g = crate::game::tests::game();
+        middle_click(&mut g, None);
+        assert_eq!(g.inspect, None);
+    }
+
+    #[test]
+    fn escape_closes_inspect() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        g.escape();
+        assert_eq!(g.inspect, None);
+        assert!(!g.pause);
+    }
+
+    #[test]
     fn key_c_toggles_status() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyC);
-        assert!(keyboard_intent(&keys, &ButtonInput::default()).status);
+        assert!(keyboard_intent(&keys, &ButtonInput::default(), false).status);
     }
 
     #[test]
@@ -451,5 +552,118 @@ mod tests {
         assert_eq!(pad_dir(r, l, None), Some(Dir::E));
         assert_eq!(pad_dir(Vec2::ZERO, r, None), Some(Dir::E));
         assert_eq!(pad_dir(Vec2::ZERO, Vec2::ZERO, Some(Dir::N)), None);
+    }
+
+    #[test]
+    fn e_talks_when_king_is_adjacent_else_goes_down() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyE);
+        let near = keyboard_intent(&keys, &ButtonInput::default(), true);
+        assert!(near.talk && !near.down);
+        let far = keyboard_intent(&keys, &ButtonInput::default(), false);
+        assert!(far.down && !far.talk);
+    }
+
+    #[test]
+    fn greater_than_always_goes_down() {
+        let mut logical = ButtonInput::<Key>::default();
+        logical.press(Key::Character(">".into()));
+        for near in [true, false] {
+            let i = keyboard_intent(&ButtonInput::default(), &logical, near);
+            assert!(i.down && !i.talk, "near = {near}");
+        }
+    }
+
+    /// Une frame de `play` avec `pressed` enfoncées ; renvoie la partie.
+    fn play_frame(g: crate::game::Game, pressed: &[KeyCode]) -> crate::game::Game {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut w = World::new();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        for &k in pressed {
+            keys.press(k);
+        }
+        w.insert_resource(keys);
+        w.insert_resource(ButtonInput::<Key>::default());
+        w.insert_resource(Time::<()>::default());
+        w.insert_resource(Client {
+            session: crate::game::Session {
+                game: Some(g),
+                ..Default::default()
+            },
+            net: None,
+        });
+        w.spawn((Window::default(), PrimaryWindow));
+        w.run_system_once(play).unwrap();
+        w.resource_mut::<Client>().session.game.take().unwrap()
+    }
+
+    #[test]
+    fn typing_in_dialog_does_not_move_the_hero() {
+        let keys = [KeyCode::KeyD, KeyCode::KeyC, KeyCode::Digit3, KeyCode::KeyE];
+        // Témoin : sans dialogue, D fait bien marcher le héros.
+        let g = play_frame(crate::game::tests::game(), &[KeyCode::KeyD]);
+        assert_ne!(g.hero.pos, crate::game::tests::game().hero.pos);
+        let mut g = crate::game::tests::game();
+        let start = g.hero.pos;
+        g.dialog.open = true;
+        let g = play_frame(g, &keys);
+        assert_eq!(g.hero.pos, start);
+        assert!(!g.status && !g.build_menu && g.browse_z.is_none());
+        assert!(g.dialog.open);
+    }
+
+    #[test]
+    fn e_next_to_the_king_opens_the_dialog() {
+        let mut g = crate::game::tests::game();
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        let g = play_frame(g, &[KeyCode::KeyE]);
+        assert!(g.dialog.open && g.browse_z.is_none());
+    }
+
+    /// Question posée dans le dialogue, Échap via `play`, puis la réponse arrive.
+    fn asked_closed_then_answered(king: moria_core::TilePos) -> crate::game::Game {
+        use crate::game::{Session, Who};
+        use moria_core::king::{Lang, QuestId};
+        use moria_core::protocol::ServerMsg;
+        let mut g = crate::game::tests::game();
+        g.king = king;
+        g.dialog.open = true;
+        g.dialog.input = "Une tâche ?".into();
+        g.send_talk(std::time::Instant::now(), Lang::Fr).unwrap();
+        let g = play_frame(g, &[KeyCode::Escape]);
+        assert!(!g.dialog.open);
+        let mut s = Session {
+            game: Some(g),
+            ..Default::default()
+        };
+        s.handle(crate::net::NetEvent::Msg(ServerMsg::KingSay {
+            text: "Rapporte des vivres.".into(),
+            offer: Some(QuestId::Food),
+        }));
+        let g = s.game.take().unwrap();
+        assert_eq!(
+            g.dialog.log.last(),
+            Some(&(Who::King, "Rapporte des vivres.".to_string()))
+        );
+        g
+    }
+
+    #[test]
+    fn hero_moves_normally_after_escape_even_if_a_reply_arrives_later() {
+        let g = asked_closed_then_answered(moria_core::TilePos::new(0, 0, 0));
+        let start = g.hero.pos;
+        let g = play_frame(g, &[KeyCode::KeyD]);
+        assert!(!g.dialog.open);
+        assert_ne!(g.hero.pos, start);
+    }
+
+    #[test]
+    fn reopening_with_e_shows_the_late_reply_and_its_offer() {
+        use moria_core::king::QuestId;
+        let g = asked_closed_then_answered(moria_core::TilePos::new(1, 0, 0));
+        let g = play_frame(g, &[KeyCode::KeyE]);
+        assert!(g.dialog.open);
+        assert_eq!(g.dialog.log.len(), 2);
+        assert_eq!(g.can_accept(), Some(QuestId::Food));
     }
 }

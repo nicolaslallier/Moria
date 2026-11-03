@@ -1,24 +1,31 @@
 //! Authoritative, pure, synchronous simulation. No I/O, no async: the main loop calls
 //! `apply_command` / `apply_assignments` between ticks and `step` once per tick.
 
+use crate::quest;
 use moria_core::ai::Assignments;
 use moria_core::food::FoodAction;
-use moria_core::light::DAY_TICKS;
+use moria_core::king::{Lang, MAX_TALK_CHARS, QuestId, king_in_reach};
 use moria_core::path::{find_path, work_spot_goal};
-use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
+use moria_core::protocol::{
+    ClientMsg, DwarfJob, DwarfState, InspectTarget, Inspection, TickDelta, Vitals,
+};
 use moria_core::srd::hero_dig_ticks;
-use moria_core::world::{DigJob, Dwarf, DwarfTask, Fortress, Hero, World};
+use moria_core::world::{DigJob, Dwarf, DwarfTask, FOOD_MAX, Fortress, HEALTH_MAX, Hero, World};
 use moria_core::{
-    DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, Resources, Tile,
-    TilePos,
+    DesignationKind, Dir, GROUND_Z, MAX_DESIGNATIONS, Mountain, MountainId, PlayerId, Resources,
+    Tile, TilePos,
 };
 use std::collections::{BTreeMap, HashSet};
 
 const MOVE_COOLDOWN: u8 = 2;
 const STAIRS_EXTRA_TICKS: u16 = 10;
 const WALL_BUILD_TICKS: u16 = 15;
-/// Each dwarf eats one food four times a game day.
-const EAT_EVERY: u64 = DAY_TICKS / 4;
+/// Each dwarf eats one food four times a game day: a full food gauge.
+const EAT_EVERY: u64 = FOOD_MAX as u64;
+/// A hungry dwarf loses 1 health this often (starves from full health in 9000 ticks).
+const HUNGER_DAMAGE_EVERY: u64 = 90;
+/// A fed dwarf regains 1 health this often.
+const REGEN_EVERY: u64 = 30;
 const ALL_DIRS: [Dir; 6] = [Dir::N, Dir::S, Dir::E, Dir::W, Dir::Up, Dir::Down];
 
 /// The dwarf as clients see it: an empty path means it is at its work spot.
@@ -51,6 +58,14 @@ pub enum Command {
         dir: Dir,
         add: u8,
     },
+    AcceptQuest(QuestId),
+    /// Remise de la nourriture au roi.
+    TurnIn,
+    /// Parole au roi : traitée par `State` (bus et cadence), sans effet sur le monde.
+    Talk {
+        text: String,
+        lang: Lang,
+    },
 }
 
 impl Command {
@@ -65,9 +80,37 @@ impl Command {
             ClientMsg::CancelDesignation { a, b } => Command::Cancel { a, b },
             ClientMsg::Use(d) => Command::Use(d),
             ClientMsg::Order { dir, add } => Command::Order { dir, add },
-            ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
+            // Handshake, or a query answered outside the tick.
+            ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } | ClientMsg::Inspect(_) => {
+                return None;
+            }
+            ClientMsg::AcceptQuest(id) => Command::AcceptQuest(id),
+            ClientMsg::TurnIn => Command::TurnIn,
+            // Une trame fait jusqu'à 1 Mo et la file d'un joueur 256 commandes : on ne garde
+            // qu'un caractère de plus que le maximum (assez pour que `Talks::ask` refuse « trop long »).
+            ClientMsg::Talk { text, lang } => Command::Talk {
+                text: text.chars().take(MAX_TALK_CHARS + 1).collect(),
+                lang,
+            },
         })
     }
+}
+
+/// `t`'s vitals, looked up only in `owner`'s fortress; `None` if not found there.
+pub fn inspect(w: &World, owner: PlayerId, t: InspectTarget) -> Option<Inspection> {
+    let f = w.fortresses.values().find(|f| f.owner == owner)?;
+    let vitals = match t {
+        InspectTarget::Hero => f.hero.as_ref().map(|_| None)?,
+        InspectTarget::Dwarf(id) => f.dwarves.iter().find(|d| d.id == id).map(|d| {
+            Some(Vitals {
+                food: d.food,
+                health: d.health,
+                ticks_alive: d.ticks_alive,
+                jobs_done: d.jobs_done,
+            })
+        })?,
+    };
+    Some(Inspection { target: t, vitals })
 }
 
 /// Changes caused by commands, folded into that tick's delta. Designations per tile:
@@ -180,6 +223,15 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
             }
         }
         Command::Use(_) | Command::Order { .. } => {}
+        Command::AcceptQuest(id) if king_in_reach(f.king, h.pos) => {
+            let _ = quest::accept(f, id); // un refus ne change rien
+        }
+        Command::AcceptQuest(_) => {}
+        Command::TurnIn => {
+            let pos = h.pos;
+            quest::turn_in(f, pos);
+        }
+        Command::Talk { .. } => {}
         Command::Cancel { a, b } => {
             ch.designations = mt
                 .cancel_designations(a, b)
@@ -427,17 +479,20 @@ pub(crate) fn on_ground(m: &Mountain, t: Tile) -> Vec<TilePos> {
 }
 
 /// Advances every fortress by one tick, owner connected or not. Returns a delta for each
-/// fortress that has a hero, and the food actions of every mountain that has some.
+/// fortress that has a hero, and the food actions of every mountain that has some. Adds to
+/// `done` the mountains whose quest was just completed (no allocation while none is).
 pub fn step_with_food(
     w: &mut World,
+    done: &mut Vec<MountainId>,
 ) -> (
     BTreeMap<MountainId, TickDelta>,
     BTreeMap<MountainId, Vec<FoodAction>>,
 ) {
     let tick = w.tick;
     w.tick += 1;
-    // The food container is down: its meals are skipped, not owed.
-    let meal = !w.food_paused && tick != 0 && tick.is_multiple_of(EAT_EVERY); // new world: fed
+    // The food container is down: its meals are skipped, not owed, and hunger does no harm.
+    let paused = w.food_paused;
+    let meal = !paused && tick != 0 && tick.is_multiple_of(EAT_EVERY); // new world: fed
     let no_block = HashSet::new();
     let (mut out, mut food) = (BTreeMap::new(), BTreeMap::new());
     for (&id, f) in w.fortresses.iter_mut() {
@@ -450,6 +505,7 @@ pub fn step_with_food(
         // Meals: each dwarf needs one every EAT_EVERY ticks. A hungry dwarf drops its work
         // and eats as soon as there is food.
         for d in f.dwarves.iter_mut() {
+            d.ticks_alive += 1;
             d.hungry |= meal;
             if d.hungry && f.resources.food > 0 {
                 f.resources.food -= 1;
@@ -462,10 +518,37 @@ pub fn step_with_food(
             {
                 d.task = None; // a hungry dwarf only goes after food
             }
+            if d.hungry {
+                if !paused && tick.is_multiple_of(HUNGER_DAMAGE_EVERY) {
+                    d.health = d.health.saturating_sub(1);
+                }
+            } else if tick.is_multiple_of(REGEN_EVERY) {
+                d.health = (d.health + 1).min(HEALTH_MAX);
+            }
+            // The gauge is the time left before the next meal, the same for every dwarf
+            // (full right after a meal), and empty while hungry. `hungry` drives the game.
+            d.food = if d.hungry {
+                0
+            } else {
+                (EAT_EVERY - tick % EAT_EVERY) as u16
+            };
         }
+        // Death: the dwarf and its task go. Claims are read from tasks, so its designation is
+        // free again; the AI drops unknown ids (`apply_assignments`); ids are never reused.
+        let died: Vec<_> = f
+            .dwarves
+            .iter()
+            .filter(|d| d.health == 0)
+            .map(|d| d.id)
+            .collect();
+        f.dwarves.retain(|d| d.health > 0);
 
         let hero_spare = hero_spare(f);
         if let Some(h) = f.hero.as_mut() {
+            // z croît vers le bas ; au-dessus du sol la profondeur vaut 0.
+            let depth = u32::from(h.pos.z.saturating_sub(GROUND_Z));
+            // Plus utilisé par la quête `Depth` (profondeur actuelle), seulement par le roi.
+            f.max_depth = f.max_depth.max(depth);
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
             // A Move that arrived during the cooldown (network jitter) is not lost.
             if h.move_cooldown == 0
@@ -580,8 +663,12 @@ pub fn step_with_food(
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked && task.kind.is_work() {
+                        let made = task.kind.product();
                         f.resources.take(&task.kind.cost());
-                        f.resources.add(task.kind.product());
+                        f.resources.add(made);
+                        // Production brute pour les quêtes de forge, jamais décrémentée.
+                        f.made.ingots = f.made.ingots.saturating_add(made.iron);
+                        f.made.doors = f.made.doors.saturating_add(made.iron_door);
                         let n = m
                             .orders
                             .get(&task.target)
@@ -592,11 +679,13 @@ pub fn step_with_food(
                             m.orders.insert(task.target, n);
                         }
                         ch.orders.insert(task.target, n);
+                        f.dwarves[i].jobs_done += 1;
                     } else if !blocked
                         && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
                         f.resources.take(&task.kind.cost());
+                        f.dwarves[i].jobs_done += 1;
                     }
                     continue;
                 }
@@ -607,6 +696,10 @@ pub fn step_with_food(
         if !ch.food.is_empty() {
             food.insert(id, std::mem::take(&mut ch.food));
         }
+        if quest::complete_if_ready(f) {
+            done.push(id);
+        }
+
         if let Some(h) = &f.hero {
             let mut d = TickDelta {
                 tick: w.tick,
@@ -623,6 +716,7 @@ pub fn step_with_food(
                     .filter(|d| d.hungry)
                     .map(|d| d.id)
                     .collect(),
+                died,
             };
             ch.merge_into(&mut d);
             out.insert(id, d);
@@ -634,12 +728,19 @@ pub fn step_with_food(
 /// `step_with_food` without the food actions.
 #[cfg(test)]
 pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
-    step_with_food(w).0
+    step_quests(w, &mut vec![])
+}
+
+/// `step_with_food` without the food actions.
+#[cfg(test)]
+pub fn step_quests(w: &mut World, done: &mut Vec<MountainId>) -> BTreeMap<MountainId, TickDelta> {
+    step_with_food(w, done).0
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use moria_core::king::{QuestId, quest_def};
     use moria_core::srd::{Class, Race, roll_abilities};
     use moria_core::world::{Hero, claim_mountain, generate};
     use moria_core::{DwarfId, PlayerId};
@@ -666,6 +767,8 @@ pub(crate) mod tests {
             move_cooldown: 0,
             pending_move: None,
             pending_dig: None,
+            food: FOOD_MAX,
+            health: HEALTH_MAX,
         });
         // No starting food: these tests count resources from zero; meals have their own tests.
         w.fortresses.get_mut(&M).unwrap().resources = Resources::default();
@@ -1122,10 +1225,8 @@ pub(crate) mod tests {
             progress: 0,
         };
         let d = |task| Dwarf {
-            id: DwarfId(7),
-            pos: p(1, 1, 0),
             task,
-            hungry: false,
+            ..Dwarf::new(DwarfId(7), p(1, 1, 0))
         };
         let job = |working| {
             Some(DwarfJob {
@@ -1594,6 +1695,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hunger_does_no_harm_while_food_paused() {
+        let mut w = setup();
+        let id = starve(&mut w, 0);
+        w.food_paused = true;
+        step(&mut w);
+        assert!(ids(&w).contains(&id), "an outage does not kill");
+        w.food_paused = false;
+        w.tick = HUNGER_DAMAGE_EVERY;
+        step(&mut w);
+        assert!(!ids(&w).contains(&id));
+    }
+
+    #[test]
     fn a_hungry_dwarf_stops_working_until_it_has_eaten() {
         let mut w = setup();
         let rock = p(6, 1, 0);
@@ -1944,6 +2058,8 @@ pub(crate) mod tests {
                 move_cooldown: 0,
                 pending_move: None,
                 pending_dig: None,
+                food: FOOD_MAX,
+                health: HEALTH_MAX,
             });
             let m = w.mountains.get_mut(&id).unwrap();
             for k in 0..50 {
@@ -2209,5 +2325,428 @@ pub(crate) mod tests {
         assert!(w.mountains[&M].orders.is_empty());
         assert_eq!(w.fortresses[&M].resources.stone, stone + 6);
         assert!(reported);
+    }
+
+    // --- Quêtes du roi ---
+
+    fn fort(w: &mut World) -> &mut Fortress {
+        w.fortresses.get_mut(&M).unwrap()
+    }
+    /// Place le héros sur le trône du roi (à portée) et accepte la quête.
+    fn accept_at_king(w: &mut World, id: QuestId) {
+        let king = fort(w).king;
+        fort(w).hero.as_mut().unwrap().pos = king;
+        let c = Command::from_client(ClientMsg::AcceptQuest(id)).unwrap();
+        apply_command(w, M, c);
+        assert_eq!(fort(w).quest.map(|q| q.id), Some(id));
+    }
+
+    #[test]
+    fn oversized_talk_is_cut_to_one_char_over_the_limit() {
+        let big = ClientMsg::Talk {
+            text: "é".repeat(100_000),
+            lang: Lang::Fr,
+        };
+        let Some(Command::Talk { text, .. }) = Command::from_client(big) else {
+            panic!("pas de Talk");
+        };
+        assert_eq!(text.chars().count(), MAX_TALK_CHARS + 1);
+    }
+
+    #[test]
+    fn accept_quest_needs_the_king_in_reach() {
+        let mut w = setup();
+        apply_command(&mut w, M, Command::AcceptQuest(QuestId::Food));
+        assert!(fort(&mut w).quest.is_none(), "héros loin du roi");
+        accept_at_king(&mut w, QuestId::Food);
+    }
+
+    #[test]
+    fn forge_ingots_counts_gross_production_even_if_ingots_are_spent() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeIngots);
+        fort(&mut w).hero.as_mut().unwrap().pos = p(2, 1, 0);
+        let forge = ordered_forge(&mut w, 5);
+        *res(&mut w) = ore(10, 5);
+        for _ in 0..1000 {
+            if w.mountains[&M].orders.is_empty() {
+                break;
+            }
+            if w.fortresses[&M].dwarves[0].task.is_none() && in_view(&w, forge) {
+                assign(&mut w, 0, forge);
+            }
+            step(&mut w);
+            res(&mut w).iron = 0; // les lingots sont dépensés aussitôt forgés
+        }
+        let f = fort(&mut w);
+        assert_eq!(f.made.ingots, 5);
+        assert!(f.quest.is_none());
+        assert_eq!(f.done, vec![QuestId::ForgeIngots]);
+        let r = quest_def(QuestId::ForgeIngots).reward;
+        assert_eq!((f.resources.stone, f.resources.gold), (r.stone, r.gold));
+    }
+
+    #[test]
+    fn depth_quest_uses_current_depth() {
+        let mut w = setup();
+        let king = fort(&mut w).king;
+        let deep = |n: u8| TilePos::new(king.x, king.y, GROUND_Z + n);
+        // Déjà descendu à 4 avant d'accepter : ça ne compte pas, il faut redescendre.
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
+        step(&mut w);
+        accept_at_king(&mut w, QuestId::Depth);
+        step(&mut w);
+        assert!(fort(&mut w).quest.is_some(), "profondeur passée oubliée");
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(2);
+        step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((2, 4)));
+        // Remonter fait retomber l'avancement : pas de validation.
+        fort(&mut w).hero.as_mut().unwrap().pos = king;
+        step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((0, 4)));
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
+        step(&mut w);
+        let f = fort(&mut w);
+        assert_eq!(f.done, vec![QuestId::Depth]);
+        assert_eq!(
+            f.resources.mithril,
+            quest_def(QuestId::Depth).reward.mithril
+        );
+    }
+
+    #[test]
+    fn step_reports_the_mountains_that_completed_a_quest() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeDoors);
+        let mut done = vec![];
+        step_quests(&mut w, &mut done);
+        assert!(done.is_empty());
+        fort(&mut w).made.doors = 2;
+        step_quests(&mut w, &mut done);
+        assert_eq!(done, vec![M]);
+    }
+
+    #[test]
+    fn reward_is_paid_exactly_once_over_many_ticks() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeDoors);
+        fort(&mut w).made.doors = 2;
+        for _ in 0..50 {
+            step(&mut w);
+        }
+        let f = fort(&mut w);
+        assert_eq!(f.resources.gold, quest_def(QuestId::ForgeDoors).reward.gold);
+        assert_eq!(f.done, vec![QuestId::ForgeDoors]);
+    }
+
+    #[test]
+    fn reward_goes_through_inventory_batch() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::Food);
+        res(&mut w).food = 20;
+        let mut inv = crate::inventory::InvSync::new("s", 1);
+        inv.begin_tick(&mut w);
+        assert_eq!(inv.end_tick(&w).len(), 1); // le lot initial
+        inv.begin_tick(&mut w);
+        let c = Command::from_client(ClientMsg::TurnIn).unwrap();
+        apply_command(&mut w, M, c);
+        step(&mut w);
+        let bs = inv.end_tick(&w);
+        assert_eq!(bs.len(), 1);
+        let food = Resources {
+            food: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            (bs[0].add, bs[0].take),
+            (quest_def(QuestId::Food).reward, food)
+        );
+    }
+
+    fn dwarf0(w: &mut World) -> &mut Dwarf {
+        &mut w.fortresses.get_mut(&M).unwrap().dwarves[0]
+    }
+
+    #[test]
+    fn vitals_food_gauge_drains_and_refills_on_meal() {
+        let mut w = setup();
+        w.tick = 1;
+        for _ in 0..10 {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).food, FOOD_MAX - 10);
+        w.tick = EAT_EVERY;
+        res(&mut w).food = 5;
+        step(&mut w);
+        assert_eq!(dwarf0(&mut w).food, FOOD_MAX, "a meal refills the gauge");
+        res(&mut w).food = 0;
+        w.tick = EAT_EVERY * 2;
+        step(&mut w);
+        assert!(dwarf0(&mut w).hungry);
+        assert_eq!(
+            dwarf0(&mut w).food,
+            0,
+            "a hungry dwarf shows an empty gauge"
+        );
+    }
+
+    #[test]
+    fn vitals_food_gauge_follows_the_global_meal_clock() {
+        // A dwarf recruited (or migrated) with a full gauge 5 ticks before the meal shows
+        // those 5 ticks, not a full day: the meal comes at the same time for everyone.
+        let mut w = setup();
+        w.tick = EAT_EVERY * 3 - 5;
+        dwarf0(&mut w).food = FOOD_MAX;
+        step(&mut w);
+        assert_eq!(dwarf0(&mut w).food, 5);
+    }
+
+    #[test]
+    fn vitals_hungry_dwarf_loses_health_over_time() {
+        let mut w = setup();
+        w.tick = 1;
+        res(&mut w).food = 0;
+        dwarf0(&mut w).hungry = true;
+        for _ in 0..HUNGER_DAMAGE_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX - 1);
+        // Reaching zero is death: see the `dies` tests.
+    }
+
+    #[test]
+    fn vitals_fed_dwarf_regenerates_health() {
+        let mut w = setup();
+        w.tick = 1;
+        dwarf0(&mut w).health = HEALTH_MAX - 5;
+        for _ in 0..REGEN_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX - 4);
+        dwarf0(&mut w).health = HEALTH_MAX;
+        for _ in 0..REGEN_EVERY {
+            step(&mut w);
+        }
+        assert_eq!(dwarf0(&mut w).health, HEALTH_MAX, "capped");
+    }
+
+    #[test]
+    fn vitals_ticks_alive_and_jobs_done_count() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = p(5, 1, 0);
+        assign(&mut w, 1, rock);
+        w.tick = 1;
+        for _ in 0..500 {
+            step(&mut w);
+        }
+        let d = &w.fortresses[&M].dwarves[1];
+        assert_eq!(d.ticks_alive, 500);
+        assert_eq!(d.jobs_done, 1);
+        assert_eq!(w.fortresses[&M].dwarves[0].jobs_done, 0);
+    }
+
+    #[test]
+    fn vitals_jobs_done_ignores_a_dig_with_no_effect() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = p(5, 1, 0);
+        assign(&mut w, 1, rock);
+        // Already dug (by the hero, say) before the dwarf finishes: nothing to do.
+        w.mountains.get_mut(&M).unwrap().set(rock, Tile::Floor);
+        w.tick = 1;
+        for _ in 0..500 {
+            step(&mut w);
+        }
+        let d = &w.fortresses[&M].dwarves[1];
+        assert!(d.task.is_none());
+        assert_eq!(d.jobs_done, 0);
+    }
+
+    #[test]
+    fn vitals_hero_stays_fed_and_healthy() {
+        let mut w = setup();
+        w.tick = 1;
+        res(&mut w).food = 0;
+        for d in &mut w.fortresses.get_mut(&M).unwrap().dwarves {
+            d.hungry = true;
+        }
+        for _ in 0..HUNGER_DAMAGE_EVERY * 3 {
+            step(&mut w);
+        }
+        let h = w.fortresses[&M].hero.as_ref().unwrap();
+        assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));
+    }
+
+    /// Dwarf `i` is one hunger hit from death, and the next step deals it. Returns its id.
+    fn starve(w: &mut World, i: usize) -> DwarfId {
+        res(w).food = 0;
+        w.tick = HUNGER_DAMAGE_EVERY;
+        let d = &mut w.fortresses.get_mut(&M).unwrap().dwarves[i];
+        d.hungry = true;
+        d.health = 1;
+        d.id
+    }
+    fn ids(w: &World) -> Vec<DwarfId> {
+        w.fortresses[&M].dwarves.iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn dwarf_dies_at_zero_health() {
+        let mut w = setup();
+        let id = starve(&mut w, 0);
+        step(&mut w);
+        assert_eq!(w.fortresses[&M].dwarves.len(), 2);
+        assert!(!ids(&w).contains(&id));
+    }
+
+    #[test]
+    fn dies_reported_in_tick_delta() {
+        let mut w = setup();
+        let id = starve(&mut w, 0);
+        let d = step(&mut w).remove(&M).unwrap();
+        assert_eq!(d.died, vec![id]);
+        assert!(d.dwarves.iter().all(|s| s.0 != id));
+        assert!(!d.hungry.contains(&id));
+        assert!(step(&mut w)[&M].died.is_empty(), "reported once");
+    }
+
+    #[test]
+    fn dies_dead_dwarf_releases_its_designation() {
+        let mut w = setup();
+        let c = p(-3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(c, Tile::Crop);
+        w.mountains
+            .get_mut(&M)
+            .unwrap()
+            .set(c.step(Dir::E), Tile::Grass);
+        designate(&mut w, c, DesignationKind::Chop);
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = c.step(Dir::E);
+        starve(&mut w, 0);
+        assign(&mut w, 0, c);
+        assert!(w.fortresses[&M].dwarves[0].task.is_some(), "harvesting");
+        step(&mut w); // dies mid-task
+        assert!(!claimed(&w, M).contains(&c));
+        w.fortresses.get_mut(&M).unwrap().dwarves[0].pos = c.step(Dir::E);
+        assign(&mut w, 0, c);
+        assert_eq!(
+            w.fortresses[&M].dwarves[0].task.as_ref().map(|t| t.target),
+            Some(c),
+            "another dwarf takes the harvest"
+        );
+    }
+
+    #[test]
+    fn famine_ends_when_last_hungry_dwarf_dies() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        starve(&mut w, 0);
+        let seen = |w: &World| {
+            view_mountain(&w.mountains[&M], &w.fortresses[&M])
+                .designations
+                .contains_key(&rock)
+        };
+        assert!(!seen(&w), "famine hides the dig");
+        step(&mut w);
+        assert!(seen(&w), "the famine died with the last hungry dwarf");
+    }
+
+    #[test]
+    fn last_dwarf_dies_without_panic() {
+        let mut w = setup();
+        let dead: Vec<_> = (0..3).map(|i| starve(&mut w, i)).collect();
+        let d = step(&mut w).remove(&M).unwrap();
+        assert!(w.fortresses[&M].dwarves.is_empty());
+        assert_eq!(d.died, dead);
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        apply_assignments(
+            &mut w,
+            &Assignments {
+                mountain: M,
+                tick: 0,
+                list: vec![(dead[0], rock)],
+            },
+        );
+        view_mountain(&w.mountains[&M], &w.fortresses[&M]);
+        assert!(claimed(&w, M).is_empty());
+        assert_eq!(occupied(&w, M), vec![hero(&w).pos]);
+        for _ in 0..HUNGER_DAMAGE_EVERY * 2 {
+            step(&mut w);
+        }
+        assert!(hero(&w).health > 0, "the hero never dies");
+    }
+
+    #[test]
+    fn dies_dead_dwarf_id_not_reused() {
+        let mut w = setup();
+        let next = w.next_dwarf;
+        let id = starve(&mut w, 2);
+        step(&mut w);
+        assert!(!ids(&w).contains(&id));
+        assert_eq!(w.next_dwarf, next, "never goes back");
+        assert!(id.0 < w.next_dwarf);
+    }
+
+    #[test]
+    fn inspect_returns_dwarf_vitals() {
+        use moria_core::protocol::{InspectTarget as T, Inspection, Vitals};
+        let mut w = setup();
+        let d = &mut w.fortresses.get_mut(&M).unwrap().dwarves[1];
+        (d.food, d.health, d.ticks_alive, d.jobs_done) = (40, 55, 1234, 7);
+        let id = d.id;
+        assert_eq!(
+            inspect(&w, PlayerId(1), T::Dwarf(id)),
+            Some(Inspection {
+                target: T::Dwarf(id),
+                vitals: Some(Vitals {
+                    food: 40,
+                    health: 55,
+                    ticks_alive: 1234,
+                    jobs_done: 7,
+                }),
+            })
+        );
+        // The hero has no hunger or health mechanics: found, but no vitals.
+        assert_eq!(
+            inspect(&w, PlayerId(1), T::Hero),
+            Some(Inspection {
+                target: T::Hero,
+                vitals: None
+            })
+        );
+    }
+
+    #[test]
+    fn inspect_unknown_or_dead_dwarf_is_none() {
+        use moria_core::protocol::InspectTarget as T;
+        let mut w = setup();
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(DwarfId(9999))), None);
+        let id = starve(&mut w, 0);
+        step(&mut w);
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(id)), None);
+        assert_eq!(inspect(&w, PlayerId(42), T::Hero), None, "no fortress");
+        w.fortresses.get_mut(&M).unwrap().hero = None;
+        assert_eq!(inspect(&w, PlayerId(1), T::Hero), None, "no hero");
+    }
+
+    #[test]
+    fn inspect_cannot_read_another_players_dwarf() {
+        use moria_core::protocol::InspectTarget as T;
+        let mut w = setup();
+        let other = claim_mountain(&mut w, PlayerId(2)).unwrap();
+        let theirs = w.fortresses[&other].dwarves[0].id;
+        assert_eq!(inspect(&w, PlayerId(1), T::Dwarf(theirs)), None);
+        assert!(inspect(&w, PlayerId(2), T::Dwarf(theirs)).is_some());
+        assert_eq!(inspect(&w, PlayerId(2), T::Dwarf(ids(&w)[0])), None);
+    }
+
+    #[test]
+    fn inspect_is_not_a_command() {
+        use moria_core::protocol::InspectTarget as T;
+        assert_eq!(Command::from_client(ClientMsg::Inspect(T::Hero)), None);
     }
 }

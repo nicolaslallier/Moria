@@ -3,19 +3,23 @@
 use crate::Client;
 use crate::art::Art;
 use crate::game::{
-    ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, ability_rows,
-    available_text, build_text, clock_label, level_label, mode_label, recipe_label, resource_bar,
-    stock_text, workshop_label,
+    ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, Who, ability_rows,
+    available_text, build_text, clock_label, job_label, level_label, mode_label, quest_progress,
+    quest_text, recipe_label, resource_bar, stock_text, workshop_label,
 };
-use crate::lang::{en, set_en, tr, word};
+use crate::lang::{en, lang, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
 use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
-use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
+use moria_core::king::{MAX_TALK_CHARS, quest_def};
+use moria_core::light::DAY_TICKS;
+use moria_core::protocol::{ClientMsg, InspectTarget, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
+use moria_core::world::{FOOD_MAX, HEALTH_MAX};
 use std::path::PathBuf;
+use std::time::Instant;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
 
@@ -52,7 +56,16 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (
-                    top_bar, hud, action_bar, build_menu, order_menu, status, pause_menu,
+                    top_bar,
+                    hud,
+                    action_bar,
+                    build_menu,
+                    order_menu,
+                    king_dialog,
+                    status,
+                    inspect,
+                    toast,
+                    pause_menu,
                 )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
@@ -396,6 +409,126 @@ fn order_window(ctx: &egui::Context, g: &mut Game) -> Option<ClientMsg> {
     g.pick_order(i)
 }
 
+fn king_dialog(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
+    let Some(g) = &mut client.session.game else {
+        return Ok(());
+    };
+    if let Some(m) = king_window(ctx.ctx_mut()?, g, Instant::now()) {
+        client.send(m);
+    }
+    Ok(())
+}
+
+/// Entrée pendant que le roi réfléchit : rien ne part, le texte attend.
+pub(crate) const WAIT_HINT: (&str, &str) = (
+    "Le roi n'a pas fini : votre texte partira après sa réponse.",
+    "The king is not done: your text can go after his answer.",
+);
+
+/// Id du champ de saisie : seul contrôle du dialogue qui garde le focus.
+const KING_INPUT: &str = "roi_saisie";
+
+/// Dialogue avec le roi : journal, saisie, Accepter, remise de la nourriture.
+fn king_window(ctx: &egui::Context, g: &mut Game, now: Instant) -> Option<ClientMsg> {
+    if !g.dialog.open {
+        return None;
+    }
+    let waiting = g.dialog_waiting(now);
+    let accept = g.can_accept();
+    let turn_in = g.can_turn_in();
+    let quest = quest_lines(g);
+    let d = &mut g.dialog;
+    let (mut out, mut send) = (None, false);
+    centered(tr("Le roi nain", "The dwarf king")).show(ctx, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for (who, text) in &d.log {
+                    let name = match who {
+                        Who::Player => tr("Vous : ", "You: "),
+                        Who::King => tr("Le roi : ", "The king: "),
+                    };
+                    ui.label(format!("{name}{text}"));
+                }
+            });
+        if waiting {
+            ui.weak(tr("Le roi réfléchit…", "The king is thinking…"));
+        }
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut d.input)
+                .id(egui::Id::new(KING_INPUT))
+                .char_limit(MAX_TALK_CHARS)
+                .hint_text(tr("Votre question au roi", "Your question to the king"))
+                .desired_width(f32::INFINITY),
+        );
+        // Entrée rend le focus au jeu : on l'envoie, puis le champ le reprend aussitôt.
+        send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        r.request_focus();
+        ui.small(format!("{} / {MAX_TALK_CHARS}", d.input.chars().count()));
+        if waiting && !d.input.trim().is_empty() {
+            ui.small(tr(WAIT_HINT.0, WAIT_HINT.1));
+        }
+        // Les boutons rendent le focus : Tab puis Espace ou Entrée ne doit rien accepter.
+        if let Some(id) = accept {
+            let title = quest_text(id, lang()).0;
+            let r = ui.button(format!("{}{title}", tr("Accepter : ", "Accept: ")));
+            r.surrender_focus();
+            if r.clicked() {
+                out = Some(ClientMsg::AcceptQuest(id));
+            }
+        }
+        if let Some(lines) = &quest {
+            ui.separator();
+            quest_panel(ui, lines);
+        }
+        if turn_in {
+            let r = ui.button(tr("Remettre la nourriture", "Hand in food"));
+            r.surrender_focus();
+            if r.clicked() {
+                out = Some(ClientMsg::TurnIn);
+            }
+        }
+        ui.small(tr(
+            "Entrée : parler · Échap : fermer",
+            "Enter: speak · Esc: close",
+        ));
+    });
+    if send {
+        out = out.or_else(|| g.send_talk(now, lang()));
+    }
+    out
+}
+
+/// Quête active : titre, description, avancement, récompense.
+fn quest_lines(g: &Game) -> Option<[String; 4]> {
+    let q = g.quest?;
+    let (title, desc) = quest_text(q.id, lang());
+    let reward = resource_bar(quest_def(q.id).reward)
+        .iter()
+        .filter(|r| r.0 > 0)
+        .map(|r| format!("{} {}", r.0, word(r.1)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Some([
+        format!("{}{title}", tr("Quête : ", "Quest: ")),
+        desc.into(),
+        format!(
+            "{}{}",
+            tr("Avancement : ", "Progress: "),
+            quest_progress(g, q)
+        ),
+        format!("{}{reward}", tr("Récompense : ", "Reward: ")),
+    ])
+}
+
+fn quest_panel(ui: &mut egui::Ui, [title, desc, progress, reward]: &[String; 4]) {
+    ui.strong(title);
+    ui.label(desc);
+    ui.label(progress);
+    ui.label(reward);
+}
+
 /// Bottom bar: one button per action, the current one highlighted.
 fn action_bar(mut ctx: EguiContexts, mut client: ResMut<Client>) -> Result {
     let Some(g) = &mut client.session.game else {
@@ -438,10 +571,14 @@ fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> R
 }
 
 /// No title bar: its collapse and close buttons could hold focus, and Space digs.
-fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
+fn status_window(
+    ctx: &egui::Context,
+    g: &mut Game,
+    portrait: egui::TextureId,
+) -> Option<egui::Rect> {
     let rows = g.dwarf_rows();
     let h = &g.hero;
-    egui::Window::new("Statut")
+    let rect = egui::Window::new("Statut")
         .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, below_bar(ctx)])
         .resizable(false)
@@ -484,8 +621,149 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
                 "C ou Échap : fermer · manette : Select ou B/○",
                 "C or Esc: close · gamepad: Select or B/○",
             ));
-        });
+        })
+        .map(|r| r.response.rect);
+    if let Some(r) = rect {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(STATUS_BOTTOM), r.bottom()));
+    }
+    rect
 }
+
+/// Middle-click panel: what is known about the inspected creature.
+fn inspect(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game {
+        inspect_window(ctx.ctx_mut()?, g);
+    }
+    Ok(())
+}
+
+/// (label, value) rows of the inspect panel; empty for an unknown creature.
+pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let row = |k: &str, v: String| (k.to_string(), v);
+    match t {
+        InspectTarget::Hero => {
+            let h = &g.hero;
+            let mut v = vec![
+                row(tr("Nom", "Name"), h.name.clone()),
+                row(
+                    tr("Race", "Race"),
+                    format!("{} {}", word(h.race.label_fr()), word(h.class.label_fr())),
+                ),
+            ];
+            for (name, score, m) in ability_rows(h.abilities) {
+                v.push(row(word(name), format!("{score} {m}")));
+            }
+            v.extend(vitals(g, t));
+            v
+        }
+        InspectTarget::Dwarf(id) => g
+            .dwarves
+            .iter()
+            .find(|d| d.0 == id)
+            .map(|&(id, _, job)| {
+                let state = if g.hungry.contains(&id) {
+                    tr("Affamé", "Hungry")
+                } else {
+                    tr("Rassasié", "Fed")
+                };
+                let mut v = vec![
+                    row(tr("Nain", "Dwarf"), format!("n°{}", id.0)),
+                    row(tr("Activité", "Activity"), job_label(job)),
+                    row(tr("État", "State"), state.into()),
+                ];
+                v.extend(vitals(g, t));
+                v
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Food, health, age and jobs from the server's latest reply for `t`.
+fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let Some(i) = g
+        .inspection
+        .filter(|i| i.target == t)
+        .and_then(|i| i.vitals)
+    else {
+        return vec![];
+    };
+    vec![
+        (
+            tr("Satiété", "Food").to_string(),
+            format!("{} %", u32::from(i.food) * 100 / u32::from(FOOD_MAX)),
+        ),
+        (
+            tr("Santé", "Health").to_string(),
+            format!("{} / {HEALTH_MAX}", i.health),
+        ),
+        (
+            tr("Âge", "Age").to_string(),
+            format!(
+                "{:.1} {}",
+                i.ticks_alive as f64 / DAY_TICKS as f64,
+                tr("j", "d")
+            ),
+        ),
+        (tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()),
+    ]
+}
+
+/// Transient one-line notice (a death, a vanished creature), top center.
+fn toast(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game
+        && let Some((text, at)) = &g.toast
+        && g.ticks.wrapping_sub(*at) < TOAST_TICKS
+    {
+        egui::Area::new("toast".into())
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                [0.0, below_bar(ctx.ctx_mut()?) + 8.0],
+            )
+            .show(ctx.ctx_mut()?, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(text.as_str()));
+            });
+    }
+    Ok(())
+}
+
+/// How long a notice stays, in server ticks (10 s at 100 ms/tick).
+const TOAST_TICKS: u64 = 100;
+
+/// No title bar (Space digs); sits under the status page when both are open.
+fn inspect_window(ctx: &egui::Context, g: &Game) -> Option<egui::Rect> {
+    let t = g.inspect?;
+    let lines = inspect_lines(g, t);
+    if lines.is_empty() {
+        return None;
+    }
+    // The status page is drawn first in the frame (`status` runs before `inspect`).
+    let status_bottom = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(STATUS_BOTTOM)));
+    let dy = match status_bottom {
+        Some(b) if g.status => b + 8.0,
+        _ => below_bar(ctx),
+    };
+    egui::Window::new("Inspection")
+        .title_bar(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, dy])
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("inspect").show(ui, |ui| {
+                for (k, v) in lines {
+                    ui.label(k);
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+            ui.small(tr(
+                "Clic du milieu ou Échap : fermer",
+                "Middle click or Esc: close",
+            ));
+        })
+        .map(|r| r.response.rect)
+}
+
+/// Where `status_window` leaves the status page's bottom edge, in egui's temp memory.
+const STATUS_BOTTOM: &str = "statut_bas";
 
 /// Where `bar_window` leaves the bar's bottom edge, in egui's temp memory.
 const BAR_BOTTOM: &str = "barre_bas";
@@ -582,11 +860,16 @@ fn hud(mut ctx: EguiContexts, client: Res<Client>) -> Result {
                 word(g.hero.class.label_fr())
             ));
             ui.label(mode_label(g.mode));
+            if let Some(lines) = quest_lines(g) {
+                ui.separator();
+                quest_panel(ui, &lines);
+                ui.separator();
+            }
             ui.small(tr(
                 "WASD (ZQSD en AZERTY)/flèches : marcher · Espace : creuser ou couper (en mode construction : construire) · < > ou Q/E (A/E en AZERTY) : escalier ou niveau \
-                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · glisser clic gauche : désigner · clic droit : annuler · Échap : menu",
+                 · X : mode suivant · 1, 2, 3, 4 ou barre du bas : creuser, escalier, construire, couper · C : statut · F : utiliser (porte, atelier) · E à côté du roi : lui parler · glisser clic gauche : désigner · clic droit : annuler · Échap : menu",
                 "WASD (ZQSD on AZERTY)/arrows: walk · Space: dig or chop (in build mode: build) · < > or Q/E (A/E on AZERTY): stairs or level \
-                 · X: next mode · 1, 2, 3, 4 or bottom bar: dig, stairs, build, chop · C: status · F: use (door, workshop) · left-drag: designate · right-click: cancel · Esc: menu",
+                 · X: next mode · 1, 2, 3, 4 or bottom bar: dig, stairs, build, chop · C: status · F: use (door, workshop) · E next to the king: talk · left-drag: designate · right-click: cancel · Esc: menu",
             ));
             ui.small(tr(
                 "Manette : stick/croix : marcher · bouton du bas (A/✕) : creuser/construire \
@@ -722,6 +1005,8 @@ fn pause_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::Dialog;
+    use moria_core::king::{Quest, QuestId, quest_def};
     use moria_core::{DesignationKind, Resources};
 
     #[test]
@@ -821,13 +1106,121 @@ mod tests {
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                status_window(ui.ctx(), &mut g, egui::TextureId::default())
+                status_window(ui.ctx(), &mut g, egui::TextureId::default());
             })
             .textures_delta
             .clear();
             assert_eq!(ctx.memory(|m| m.focused()), None);
         }
         assert!(g.status);
+    }
+
+    #[test]
+    fn inspect_lines_for_hero_has_abilities_and_no_hunger_state() {
+        let g = crate::game::tests::game();
+        let l = inspect_lines(&g, InspectTarget::Hero);
+        assert!(l.iter().any(|(k, _)| k == "Force"));
+        assert!(!l.iter().any(|(k, _)| k == "État"));
+    }
+
+    #[test]
+    fn inspect_lines_for_dwarf_shows_activity_and_hungry_state() {
+        use moria_core::DwarfId;
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let state = |g: &Game| {
+            let l = inspect_lines(g, InspectTarget::Dwarf(DwarfId(3)));
+            assert!(l.contains(&("Activité".into(), "Inactif".into())));
+            l.into_iter().find(|(k, _)| k == "État").unwrap().1
+        };
+        assert_eq!(state(&g), "Rassasié");
+        g.hungry = vec![DwarfId(3)];
+        assert_eq!(state(&g), "Affamé");
+        assert!(inspect_lines(&g, InspectTarget::Dwarf(DwarfId(9))).is_empty());
+    }
+
+    #[test]
+    fn inspect_lines_show_gauges_and_stats() {
+        use moria_core::DwarfId;
+        use moria_core::protocol::{Inspection, Vitals};
+        use moria_core::world::{FOOD_MAX, HEALTH_MAX};
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let t = InspectTarget::Dwarf(DwarfId(3));
+        let known = inspect_lines(&g, t).len();
+        g.inspection = Some(Inspection {
+            target: t,
+            vitals: Some(Vitals {
+                food: FOOD_MAX / 2,
+                health: HEALTH_MAX,
+                ticks_alive: moria_core::light::DAY_TICKS * 3 / 2,
+                jobs_done: 12,
+            }),
+        });
+        let l = inspect_lines(&g, t);
+        assert_eq!(l.len(), known + 4);
+        assert!(l.contains(&("Satiété".into(), "50 %".into())));
+        assert!(l.contains(&("Santé".into(), "100 / 100".into())));
+        assert!(l.contains(&("Âge".into(), "1.5 j".into())));
+        assert!(l.contains(&("Tâches".into(), "12".into())));
+        // Hero: no vitals at all (no hunger or health mechanics).
+        let hero = InspectTarget::Hero;
+        let known_hero = inspect_lines(&g, hero).len();
+        g.inspection = Some(Inspection {
+            target: hero,
+            vitals: None,
+        });
+        let l = inspect_lines(&g, hero);
+        assert_eq!(l.len(), known_hero);
+        assert!(!l.iter().any(|(k, _)| k == "Satiété" || k == "Santé"));
+        // A reply for another target adds nothing.
+        assert_eq!(inspect_lines(&g, t).len(), known);
+    }
+
+    #[test]
+    fn status_page_with_zero_dwarves_does_not_panic() {
+        let mut g = crate::game::tests::game();
+        g.status = true;
+        g.dwarves.clear();
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |ui| {
+            status_window(ui.ctx(), &mut g, egui::TextureId::default());
+            g.inspect = Some(InspectTarget::Dwarf(moria_core::DwarfId(1)));
+            inspect_window(ui.ctx(), &g);
+        })
+        .textures_delta
+        .clear();
+    }
+
+    #[test]
+    fn inspect_panel_sits_just_under_the_status_page() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1500.0));
+        for status in [true, true, false, false] {
+            g.status = status;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let (mut page, mut panel) = (None, None);
+            ctx.run_ui(input, |ui| {
+                if g.status {
+                    page = status_window(ui.ctx(), &mut g, egui::TextureId::default());
+                }
+                panel = inspect_window(ui.ctx(), &g);
+            })
+            .textures_delta
+            .clear();
+            let top = panel.unwrap().top();
+            match page {
+                Some(page) => assert_eq!(top, page.bottom() + 8.0),
+                None => assert_eq!(top, below_bar(&ctx)),
+            }
+        }
     }
 
     /// A painted text: its string, screen rect and number of rows.
@@ -927,12 +1320,16 @@ mod tests {
         let e = g.hero.pos.step(Dir::E);
         g.mountain.set(e, workshop);
         g.order_menu = Some(Dir::E);
-        let ctx = egui::Context::default();
+        order_frames(&egui::Context::default(), &mut g)
+    }
+
+    /// All text painted by `order_window` on `g`, after two frames of `ctx`.
+    fn order_frames(ctx: &egui::Context, g: &mut Game) -> String {
         // Two frames: a new window is laid out hidden on its first.
         let mut text = String::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                order_window(ui.ctx(), &mut g);
+                order_window(ui.ctx(), g);
             });
             out.textures_delta.clear();
             text = out
@@ -983,6 +1380,22 @@ mod tests {
     }
 
     #[test]
+    fn order_window_closes_when_the_workshop_is_gone() {
+        use moria_core::{Dir, Tile};
+        let mut g = crate::game::tests::game();
+        let e = g.hero.pos.step(Dir::E);
+        g.mountain.set(e, Tile::Forge);
+        g.order_menu = Some(Dir::E);
+        let ctx = egui::Context::default();
+        assert!(order_frames(&ctx, &mut g).contains("Forge"));
+        assert_eq!(g.order_menu, Some(Dir::E));
+        // Dismantled while the window was shown: the tile is plain floor again.
+        g.mountain.set(e, Tile::Floor);
+        order_frames(&ctx, &mut g);
+        assert_eq!(g.order_menu, None);
+    }
+
+    #[test]
     fn prefs_never_store_secrets() {
         let f = LoginForm {
             addr: "1.2.3.4:7777".into(),
@@ -1000,5 +1413,188 @@ mod tests {
         assert!(!parse_prefs("a\nb\nfr\n").1);
         assert!(!parse_prefs("a\nb\nmellon\n").1); // older file: 3rd line was the invite
         assert!(!parse_prefs("").1);
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Une frame de `king_window` : textes peints (avec leur rect) et message éventuel.
+    fn king_frame(
+        ctx: &egui::Context,
+        g: &mut Game,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, egui::Rect)>, Option<ClientMsg>) {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut msg = None;
+        let mut out = ctx.run_ui(input, |ui| msg = king_window(ui.ctx(), g, Instant::now()));
+        out.textures_delta.clear();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => {
+                    Some((t.galley.text().to_owned(), s.shape.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .collect();
+        (texts, msg)
+    }
+
+    /// Les textes du dialogue après deux frames (une fenêtre neuve est cachée à la première).
+    fn king_texts(g: &mut Game) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        king_frame(&ctx, g, vec![]);
+        king_frame(&ctx, g, vec![]).0
+    }
+
+    fn shows(texts: &[(String, egui::Rect)], prefix: &str) -> bool {
+        texts.iter().any(|t| t.0.starts_with(prefix))
+    }
+
+    /// Clique sur le texte commençant par `prefix` ; renvoie le message envoyé.
+    fn click(g: &mut Game, prefix: &str) -> Option<ClientMsg> {
+        let ctx = egui::Context::default();
+        king_frame(&ctx, g, vec![]);
+        let (texts, _) = king_frame(&ctx, g, vec![]);
+        let at = texts
+            .iter()
+            .find(|t| t.0.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {texts:?}"))
+            .1
+            .center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        king_frame(&ctx, g, vec![egui::Event::PointerMoved(at), button(true)]);
+        king_frame(&ctx, g, vec![button(false)]).1
+    }
+
+    fn with_dialog(offer: Option<QuestId>) -> Game {
+        let mut g = crate::game::tests::game();
+        g.dialog = Dialog {
+            open: true,
+            offer,
+            ..Default::default()
+        };
+        g
+    }
+
+    #[test]
+    fn accept_button_appears_only_with_an_offer() {
+        assert!(!shows(&king_texts(&mut with_dialog(None)), "Accepter"));
+        let mut g = with_dialog(Some(QuestId::Food));
+        assert!(shows(&king_texts(&mut g), "Accepter"));
+        // Déjà une quête en cours, ou celle-ci déjà faite : pas de bouton.
+        g.quest = Some(Quest {
+            id: QuestId::Depth,
+            baseline: 0,
+        });
+        assert!(!shows(&king_texts(&mut g), "Accepter"));
+        g.quest = None;
+        g.done = vec![QuestId::Food];
+        assert!(!shows(&king_texts(&mut g), "Accepter"));
+    }
+
+    #[test]
+    fn accept_sends_accept_quest_with_the_offered_id() {
+        let mut g = with_dialog(Some(QuestId::ForgeDoors));
+        assert_eq!(
+            click(&mut g, "Accepter"),
+            Some(ClientMsg::AcceptQuest(QuestId::ForgeDoors))
+        );
+    }
+
+    #[test]
+    fn turn_in_button_only_for_active_food_quest_in_reach() {
+        let label = "Remettre la nourriture";
+        let mut g = with_dialog(None);
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        g.resources.food = quest_def(QuestId::Food).target;
+        assert!(!shows(&king_texts(&mut g), label));
+        g.quest = Some(Quest {
+            id: QuestId::Food,
+            baseline: 0,
+        });
+        assert!(shows(&king_texts(&mut g), label));
+        assert_eq!(click(&mut g, label), Some(ClientMsg::TurnIn));
+        g.king = moria_core::TilePos::new(0, 0, 0);
+        assert!(!shows(&king_texts(&mut g), label));
+    }
+
+    #[test]
+    fn enter_sends_the_question_and_shows_the_king_thinking() {
+        let mut g = with_dialog(None);
+        let ctx = egui::Context::default();
+        king_frame(&ctx, &mut g, vec![]);
+        // Entrée sur un champ vide : rien ne part.
+        assert_eq!(
+            king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]).1,
+            None
+        );
+        king_frame(&ctx, &mut g, vec![egui::Event::Text("Salut".into())]);
+        let (_, msg) = king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Talk {
+                text: "Salut".into(),
+                lang: crate::lang::lang(),
+            })
+        );
+        let (texts, _) = king_frame(&ctx, &mut g, vec![]);
+        assert!(shows(&texts, "Le roi réfléchit"), "{texts:?}");
+    }
+
+    #[test]
+    fn enter_while_the_king_thinks_keeps_the_text_and_says_why() {
+        let mut g = with_dialog(None);
+        g.dialog.waiting_since = Some(Instant::now());
+        let ctx = egui::Context::default();
+        king_frame(&ctx, &mut g, vec![]);
+        king_frame(&ctx, &mut g, vec![egui::Event::Text("Alors ?".into())]);
+        let (_, msg) = king_frame(&ctx, &mut g, vec![key(egui::Key::Enter)]);
+        assert_eq!(msg, None);
+        assert_eq!(g.dialog.input, "Alors ?");
+        let (texts, _) = king_frame(&ctx, &mut g, vec![]);
+        assert!(shows(&texts, WAIT_HINT.0), "{texts:?}");
+    }
+
+    /// Tab puis Espace ou Entrée ne doivent jamais presser Accepter ni la remise.
+    #[test]
+    fn king_dialog_never_takes_focus_by_accident() {
+        let mut g = with_dialog(Some(QuestId::Food));
+        g.king = moria_core::TilePos::new(1, 0, 0);
+        g.resources.food = 100;
+        g.quest = None;
+        let ctx = egui::Context::default();
+        let input = egui::Id::new(KING_INPUT);
+        for k in [
+            egui::Key::Tab,
+            egui::Key::Space,
+            egui::Key::Tab,
+            egui::Key::Enter,
+            egui::Key::Tab,
+            egui::Key::Tab,
+            egui::Key::Space,
+        ] {
+            let (_, msg) = king_frame(&ctx, &mut g, vec![key(k)]);
+            assert_eq!(msg, None, "{k:?}");
+            let f = ctx.memory(|m| m.focused());
+            assert!(f.is_none() || f == Some(input), "{k:?}: {f:?}");
+        }
+        assert!(g.dialog.open);
     }
 }

@@ -1,0 +1,17 @@
+Règles de Moria (ce que le roi sait du monde) :
+- Chaque joueur dirige une forteresse dans sa montagne : un héros et des nains autonomes.
+- Le monde a plusieurs niveaux. La surface (forêt, rivière, herbe) est le niveau du sol ;
+  la profondeur se compte en niveaux creusés sous la surface. On descend par des escaliers et des pentes.
+- Creuser la roche rapporte de la pierre ; les filons donnent de l'or, du mithril,
+  du minerai de fer et du charbon. Couper un arbre donne du bois.
+- Le joueur désigne le travail (creuser, escalier, couper, construire) ; les nains l'exécutent.
+- Constructions : mur, lit, table et chaise en pierre ; mobilier en bois ; bougie, torche,
+  lampe, feu de camp, âtre, poêle ; portes en bois, en pierre ou en fer.
+- Forge (coût : 6 pierres) : un nain y fond 2 minerais de fer et 1 charbon en 1 lingot de fer.
+- Enclume (coût : 3 lingots de fer) : un nain y forge 2 lingots en 1 porte de fer.
+- Nourriture : on sème des champs sur l'herbe de la surface ; les récoltes mûres se ramassent.
+  On peut aussi abattre une vache. Chaque nain mange quatre fois par jour de jeu.
+- Sans nourriture, les nains ont faim : ils abandonnent leur travail pour chercher à manger.
+- Quêtes du roi : une seule active à la fois, chacune une seule fois par montagne.
+  Le joueur l'accepte lui-même ; le jeu vérifie l'objectif et verse la récompense.
+- La quête de nourriture se termine en remettant la nourriture au roi, à côté de lui.

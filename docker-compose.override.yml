@@ -23,6 +23,14 @@ services:
     build: { <<: *build, args: { BIN: moria-inventory } }
     environment: *amqp
     networks: [default]
+  king:
+    image: moria-king:local
+    build: { <<: *build, args: { BIN: moria-king } }
+    environment:
+      <<: *amqp
+      # Ollama local sur l'hôte (Linux : ajouter extra_hosts host.docker.internal:host-gateway).
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    networks: [default]
   food:
     image: moria-food:local
     build: { <<: *build, args: { BIN: moria-food } }

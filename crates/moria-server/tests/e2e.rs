@@ -57,6 +57,10 @@ fn start_ai() -> Task {
 }
 
 async fn start_server(data: &Path) -> (Task, SocketAddr) {
+    start_server_with(data, moria_server::king::KING_TIMEOUT).await
+}
+
+async fn start_server_with(data: &Path, king_timeout: Duration) -> (Task, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, rx) = oneshot::channel();
@@ -66,6 +70,7 @@ async fn start_server(data: &Path) -> (Task, SocketAddr) {
         amqp_url: Some(amqp_url()),
         invite: None,
         max_per_ip: 1000,
+        king_timeout,
     };
     let done = tokio::spawn(run_with_listener(cfg, listener, async {
         let _ = rx.await;
@@ -746,6 +751,82 @@ impl Client {
     }
 }
 
+// ---- Le roi nain : question sur le bus, réponse ou repli ----------------------------------
+
+use moria_core::king::{Ask, KEY_ASK, KEY_REPLY, Lang, Reply};
+
+fn king_queue() -> Queue<'static> {
+    Queue::Shared {
+        name: "king",
+        latest_only: false,
+    }
+}
+
+/// Vide la file `king` (questions laissées par d'autres tests, qui expirent en 70 s).
+async fn purge_king(bus: &Bus) {
+    bus.declare(KEY_ASK, king_queue()).await.unwrap();
+    bus.purge("king").await.unwrap();
+}
+
+/// Faux `moria-king` : répond « Bienvenue » à chaque question.
+async fn fake_king(bus: &Bus) -> JoinHandle<()> {
+    let mut asks = bus.subscribe_acked(KEY_ASK, king_queue()).await.unwrap();
+    let out = Bus::connect(&amqp_url()).await.unwrap();
+    tokio::spawn(async move {
+        while let Some(d) = asks.next().await {
+            if let Ok(a) = postcard::from_bytes::<Ask>(&d.body) {
+                let r = Reply {
+                    mountain: a.mountain,
+                    seq: a.seq,
+                    text: format!("Bienvenue ({})", a.text),
+                    offer: None,
+                };
+                let b = postcard::to_allocvec(&r).unwrap();
+                out.publish(KEY_REPLY, b, false).await.unwrap();
+            }
+            d.ack().await.unwrap();
+        }
+    })
+}
+
+/// Crée le compte et le héros, puis redémarre le serveur avec le héros posé sur le roi.
+async fn hero_at_king(data: &Path, king_timeout: Duration) -> (Task, Client) {
+    let (srv, addr) = start_server_with(data, king_timeout).await;
+    drop(Client::login(addr, "alice").await);
+    srv.stop().await; // sauvegarde finale
+    let mut w = moria_core::world::load(data).unwrap();
+    let f = w.fortresses.values_mut().next().unwrap();
+    f.hero.as_mut().unwrap().pos = f.king;
+    save(&w, data).unwrap();
+    let (srv, addr) = start_server_with(data, king_timeout).await;
+    (srv, Client::login(addr, "alice").await)
+}
+
+impl Client {
+    async fn talk(&mut self, text: &str) {
+        self.s
+            .write_all(&encode(&ClientMsg::Talk {
+                text: text.into(),
+                lang: Lang::Fr,
+            }))
+            .await
+            .unwrap();
+    }
+
+    /// Lit les ticks jusqu'à la parole du roi (borné) ; renvoie le texte et les ticks écoulés.
+    async fn king_says(&mut self, max_msgs: usize) -> (String, u64) {
+        let start = self.tick;
+        for _ in 0..max_msgs {
+            match recv(&mut self.s).await {
+                ServerMsg::KingSay { text, .. } => return (text, self.tick.saturating_sub(start)),
+                ServerMsg::Tick(d) => self.tick = d.tick,
+                _ => {}
+            }
+        }
+        panic!("le roi n'a rien dit en {max_msgs} messages");
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn cows_graze_through_the_container() {
@@ -763,6 +844,24 @@ async fn cows_graze_through_the_container() {
     assert_eq!(c.cows().len(), start.len(), "no cow lost or duplicated");
     srv.stop().await;
     food.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn king_answers_through_the_bus() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("king-answers");
+    let bus = Bus::connect(&amqp_url()).await.unwrap();
+    purge_king(&bus).await;
+    let king = fake_king(&bus).await;
+    let (srv, mut c) = hero_at_king(&data, moria_server::king::KING_TIMEOUT).await;
+    c.talk("Salut, roi").await;
+    let (text, _) = c.king_says(300).await;
+    assert_eq!(text, "Bienvenue (Salut, roi)");
+    srv.stop().await;
+    king.abort();
+    bus.close().await;
     rm(&data);
 }
 
@@ -1038,5 +1137,29 @@ async fn crop_ripens_and_stays_designated() {
         "harvest still asked for in a fresh snapshot"
     );
     srv.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn without_moria_king_the_game_goes_on_and_the_fallback_arrives() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("king-fallback");
+    let bus = Bus::connect(&amqp_url()).await.unwrap();
+    purge_king(&bus).await;
+    let (srv, mut c) = hero_at_king(&data, Duration::from_secs(2)).await;
+    c.ticks(1).await;
+    c.talk("Il y a quelqu'un ?").await;
+    let (text, ticks) = c.king_says(300).await;
+    assert_eq!(text, moria_core::king::FALLBACK_FR);
+    assert!(
+        ticks >= 10,
+        "la partie avance pendant l'attente ({ticks} ticks)"
+    );
+    // La question attend dans la file : personne ne l'a prise.
+    assert_eq!(bus.queue_len("king").await.unwrap(), 1);
+    srv.stop().await;
+    bus.purge("king").await.unwrap();
+    bus.close().await;
     rm(&data);
 }

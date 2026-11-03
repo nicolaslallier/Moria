@@ -176,6 +176,26 @@ impl Bus {
         Ok(())
     }
 
+    /// Transitoire, sans attente ; le broker jette le message s'il n'est pas consomme dans `ttl`.
+    pub async fn publish_expiring(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        ttl: Duration,
+    ) -> anyhow::Result<()> {
+        let props = BasicProperties::default().with_expiration(ttl.as_millis().to_string().into());
+        self.chan
+            .basic_publish(
+                EXCHANGE.into(),
+                key.into(),
+                BasicPublishOptions::default(),
+                &body,
+                props,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Declare et lie la file, puis consomme (acquittement automatique). Le flux se termine
     /// quand la connexion ou le canal meurt : a l'appelant de se reconnecter.
     pub async fn subscribe(

@@ -1,3 +1,4 @@
+use crate::king::{Lang, Quest, QuestId};
 use crate::srd::{Abilities, Class, Race};
 use crate::{DesignationKind, Dir, DwarfId, Mountain, PlayerId, Resources, Tile, TilePos};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -8,7 +9,7 @@ use std::io::{self, Read};
 /// field, `ServerMsg::Reject` stays variant 1 and `Reject::VersionMismatch` stays variant 0
 /// (`{ server: u32 }`). Postcard encodes a variant index as a varint u32, so a Hello
 /// starts with the bytes of `(0u32, version)` whatever follows.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -46,6 +47,15 @@ pub enum ClientMsg {
         dir: Dir,
         add: u8,
     },
+    /// Asks for one creature's vitals; answered by `ServerMsg::Inspected`.
+    Inspect(InspectTarget),
+    /// Parole au roi (à portée), dans la langue du joueur.
+    Talk {
+        text: String,
+        lang: Lang,
+    },
+    AcceptQuest(QuestId),
+    TurnIn,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -80,6 +90,13 @@ pub struct DwarfJob {
     pub working: bool,
 }
 
+/// What the status panel looks at.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectTarget {
+    Hero,
+    Dwarf(DwarfId),
+}
+
 /// A dwarf as clients see it; `None` is idle.
 pub type DwarfState = (DwarfId, TilePos, Option<DwarfJob>);
 
@@ -93,6 +110,9 @@ pub struct FortressView {
     pub hungry: Vec<DwarfId>,
     /// World tick, so the client knows the game hour on connect.
     pub tick: u64,
+    pub king: TilePos,
+    pub quest: Option<Quest>,
+    pub done: Vec<QuestId>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -108,14 +128,45 @@ pub struct TickDelta {
     pub orders: Vec<(TilePos, u8)>,
     /// Dwarves that missed a meal and do not work (the full list, every tick).
     pub hungry: Vec<DwarfId>,
+    /// Dwarves that died this tick (starved); their ids are never reused.
+    pub died: Vec<DwarfId>,
+}
+
+/// What the status panel learns from the server about one creature.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inspection {
+    pub target: InspectTarget,
+    /// `None` for a creature without hunger or health (the hero).
+    pub vitals: Option<Vitals>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vitals {
+    pub food: u16,
+    pub health: u16,
+    pub ticks_alive: u64,
+    pub jobs_done: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
-    Welcome { player: PlayerId, needs_hero: bool },
+    Welcome {
+        player: PlayerId,
+        needs_hero: bool,
+    },
     Reject(Reject),
     Snapshot(Box<FortressView>),
     Tick(TickDelta),
+    /// Answer to `ClientMsg::Inspect` about that target; `None` = not found (unknown, dead
+    /// or not yours).
+    Inspected(InspectTarget, Option<Inspection>),
+    /// Réponse du roi ; `offer` = quête proposée.
+    KingSay {
+        text: String,
+        offer: Option<QuestId>,
+    },
+    /// État de la quête active (acceptation, validation, snapshot).
+    Quest(Option<Quest>),
 }
 
 /// u32 big-endian length prefix, then the postcard body.
@@ -196,6 +247,86 @@ mod tests {
         let r = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch { server: 1 }))
             .unwrap();
         assert_eq!(r, [1, 0, 1]);
+        // Les nouvelles variantes sont les dernières ; `Hello` et `Reject` ne bougent pas.
+        let talk = ClientMsg::Talk {
+            text: String::new(),
+            lang: Lang::Fr,
+        };
+        let b = postcard::to_allocvec(&talk).unwrap();
+        assert_eq!(b[0], 10, "Talk suit Inspect (9), qui suit Order (8)");
+        assert_eq!(
+            postcard::to_allocvec(&ClientMsg::Inspect(InspectTarget::Hero)).unwrap()[0],
+            9
+        );
+        let n = |m: &ClientMsg| postcard::to_allocvec(m).unwrap()[0];
+        assert_eq!(n(&ClientMsg::AcceptQuest(QuestId::ALL[0])), n(&talk) + 1);
+        assert_eq!(n(&ClientMsg::TurnIn), n(&talk) + 2);
+        let s = |m: &ServerMsg| postcard::to_allocvec(m).unwrap()[0];
+        let say = ServerMsg::KingSay {
+            text: String::new(),
+            offer: None,
+        };
+        assert_eq!(s(&ServerMsg::Inspected(InspectTarget::Hero, None)), 4);
+        assert_eq!(s(&say), 5);
+        assert_eq!(s(&ServerMsg::Quest(None)), 6);
+    }
+    #[test]
+    fn talk_and_quest_messages_round_trip() {
+        let q = Quest {
+            id: QuestId::ALL[0],
+            baseline: 3,
+        };
+        for m in [
+            ClientMsg::Talk {
+                text: "salut".into(),
+                lang: Lang::En,
+            },
+            ClientMsg::AcceptQuest(q.id),
+            ClientMsg::TurnIn,
+        ] {
+            let b = encode(&m);
+            assert_eq!(read_frame::<ClientMsg>(&mut Cursor::new(b)).unwrap(), m);
+        }
+        for m in [
+            ServerMsg::KingSay {
+                text: "bonjour".into(),
+                offer: Some(q.id),
+            },
+            ServerMsg::Quest(Some(q)),
+            ServerMsg::Quest(None),
+        ] {
+            let b = encode(&m);
+            assert_eq!(read_frame::<ServerMsg>(&mut Cursor::new(b)).unwrap(), m);
+        }
+    }
+    #[test]
+    fn version_mismatch_reports_server_version_12() {
+        let b = postcard::to_allocvec(&ServerMsg::Reject(Reject::VersionMismatch {
+            server: PROTOCOL_VERSION,
+        }))
+        .unwrap();
+        assert_eq!(b, [1, 0, 12]);
+    }
+    #[test]
+    fn inspect_roundtrip() {
+        let q = ClientMsg::Inspect(InspectTarget::Dwarf(DwarfId(7)));
+        assert_eq!(decode::<ClientMsg>(&encode(&q)[4..]).unwrap(), q);
+        let t = InspectTarget::Dwarf(DwarfId(7));
+        let a = ServerMsg::Inspected(
+            t,
+            Some(Inspection {
+                target: t,
+                vitals: Some(Vitals {
+                    food: 3,
+                    health: 4,
+                    ticks_alive: 1 << 40,
+                    jobs_done: 9,
+                }),
+            }),
+        );
+        assert_eq!(decode::<ServerMsg>(&encode(&a)[4..]).unwrap(), a);
+        let none = ServerMsg::Inspected(InspectTarget::Hero, None);
+        assert_eq!(decode::<ServerMsg>(&encode(&none)[4..]).unwrap(), none);
     }
     #[test]
     fn oversized_frame_rejected() {
