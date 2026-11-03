@@ -212,6 +212,11 @@ async fn restart_keeps_hidden_state() {
         .expect("battement jamais recu")
         .unwrap();
     assert_eq!(postcard::from_bytes::<Status>(&b).unwrap().tick, 0);
+    // `food.bin` relu, pas remis a zero : la sonde d'ecriture du demarrage l'a reecrit tel quel.
+    assert_eq!(
+        FoodStore::load_or_default(&file).unwrap().mountains[&M],
+        before
+    );
     for k in 1..=10 {
         send(
             &bus,
@@ -235,11 +240,9 @@ async fn restart_keeps_hidden_state() {
     })
     .await;
     svc.stop().await;
+    // (L'etat cache garde a l'adoption, l'age des vaches, est couvert par les tests unitaires.)
     let mut kept = before;
     kept.adopt(&w.mountains[0].1, winter);
-    let mut fresh = moria_core::food::FoodSim::new(moria_food::seed(M));
-    fresh.adopt(&w.mountains[0].1, winter);
-    assert_ne!(kept, fresh, "aucun etat cache a garder");
     assert_eq!(
         FoodStore::load_or_default(&file).unwrap().mountains[&M],
         kept
