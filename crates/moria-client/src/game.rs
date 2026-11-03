@@ -546,16 +546,14 @@ impl Game {
         self.toast = Some((text.to_string(), self.ticks));
     }
 
-    /// Creature on this tile of level `z`: hero first, then the first dwarf.
-    pub fn inspect_at(&self, tile: (i16, i16), z: u8) -> Option<InspectTarget> {
+    /// Creatures on this tile of level `z`: the hero first, then the dwarves.
+    pub fn targets_at(&self, tile: (i16, i16), z: u8) -> Vec<InspectTarget> {
         let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
-        if at(self.hero.pos) {
-            return Some(InspectTarget::Hero);
-        }
-        self.dwarves
-            .iter()
-            .find(|(_, p, _)| at(*p))
-            .map(|(id, _, _)| InspectTarget::Dwarf(*id))
+        let hero = at(self.hero.pos).then_some(InspectTarget::Hero);
+        let dwarves = self.dwarves.iter().filter(|d| at(d.1));
+        hero.into_iter()
+            .chain(dwarves.map(|d| InspectTarget::Dwarf(d.0)))
+            .collect()
     }
 
     pub fn current_z(&self) -> u8 {
@@ -868,28 +866,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inspect_at_prefers_hero_over_dwarf() {
+    fn targets_at_lists_hero_then_dwarves() {
         let mut g = game();
-        g.dwarves = vec![(DwarfId(1), p(2, 1, 0), None)];
-        assert_eq!(g.inspect_at((2, 1), 0), Some(InspectTarget::Hero));
+        g.dwarves = vec![
+            (DwarfId(1), p(2, 1, 0), None),
+            (DwarfId(2), p(3, 1, 0), None),
+            (DwarfId(3), p(2, 1, 0), None),
+        ];
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        assert_eq!(g.targets_at((2, 1), 0), [InspectTarget::Hero, dw(1), dw(3)]);
+        assert_eq!(g.targets_at((3, 1), 0), [dw(2)]);
     }
 
     #[test]
-    fn inspect_at_finds_dwarf_on_current_level() {
+    fn targets_at_ignores_other_levels_and_empty_tiles() {
         let mut g = game();
         g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
-        assert_eq!(
-            g.inspect_at((3, 1), 0),
-            Some(InspectTarget::Dwarf(DwarfId(1)))
-        );
-    }
-
-    #[test]
-    fn inspect_at_ignores_other_levels_and_empty_tiles() {
-        let mut g = game();
-        g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
-        assert_eq!(g.inspect_at((3, 1), 1), None);
-        assert_eq!(g.inspect_at((4, 1), 0), None);
+        assert!(g.targets_at((3, 1), 1).is_empty());
+        assert!(g.targets_at((4, 1), 0).is_empty());
+        // Browsing another level: the hero is not under the cursor there.
+        assert!(g.targets_at((2, 1), 1).is_empty());
     }
 
     /// 6×6×3 rock; floor at (1..=3, 1, 0); stairs at (1,1,0)-(1,1,1).

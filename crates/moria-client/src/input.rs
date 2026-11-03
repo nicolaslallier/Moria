@@ -315,12 +315,16 @@ fn play(
     }
 }
 
-/// Middle click: opens the creature under the cursor, or closes it if already open.
+/// Middle click: opens the first creature under the cursor (the hero first); clicking the
+/// same tile again moves to the next one there, and closes after the last.
 pub fn middle_click(g: &mut Game, cursor: Option<(i16, i16)>) {
-    let Some(t) = cursor.and_then(|c| g.inspect_at(c, g.current_z())) else {
-        return;
+    let Some(c) = cursor else { return };
+    let all = g.targets_at(c, g.current_z());
+    let Some(&first) = all.first() else { return };
+    g.inspect = match all.iter().position(|&t| Some(t) == g.inspect) {
+        Some(i) => all.get(i + 1).copied(),
+        None => Some(first),
     };
-    g.inspect = (g.inspect != Some(t)).then_some(t);
 }
 
 fn mouse(
@@ -452,6 +456,20 @@ mod tests {
         assert_eq!(g.inspect, Some(InspectTarget::Hero));
         middle_click(&mut g, Some((2, 1)));
         assert_eq!(g.inspect, None);
+    }
+
+    #[test]
+    fn middle_click_cycles_creatures_on_one_tile() {
+        let mut g = crate::game::tests::game();
+        let here = TilePos { x: 2, y: 1, z: 0 };
+        g.dwarves = vec![(DwarfId(1), here, None), (DwarfId(2), here, None)];
+        let mut seen = vec![];
+        for _ in 0..4 {
+            middle_click(&mut g, Some((2, 1)));
+            seen.push(g.inspect);
+        }
+        let dw = |n| Some(InspectTarget::Dwarf(DwarfId(n)));
+        assert_eq!(seen, [Some(InspectTarget::Hero), dw(1), dw(2), None]);
     }
 
     #[test]
