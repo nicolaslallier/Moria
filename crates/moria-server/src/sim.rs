@@ -1,7 +1,9 @@
 //! Authoritative, pure, synchronous simulation. No I/O, no async: the main loop calls
 //! `apply_command` / `apply_assignments` between ticks and `step` once per tick.
 
+use crate::quest;
 use moria_core::ai::Assignments;
+use moria_core::king::{Lang, MAX_TALK_CHARS, QuestId, king_in_reach};
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{
     ClientMsg, DwarfJob, DwarfState, InspectTarget, Inspection, TickDelta, Vitals,
@@ -61,6 +63,14 @@ pub enum Command {
         dir: Dir,
         add: u8,
     },
+    AcceptQuest(QuestId),
+    /// Remise de la nourriture au roi.
+    TurnIn,
+    /// Parole au roi : traitée par `State` (bus et cadence), sans effet sur le monde.
+    Talk {
+        text: String,
+        lang: Lang,
+    },
 }
 
 impl Command {
@@ -79,6 +89,14 @@ impl Command {
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } | ClientMsg::Inspect(_) => {
                 return None;
             }
+            ClientMsg::AcceptQuest(id) => Command::AcceptQuest(id),
+            ClientMsg::TurnIn => Command::TurnIn,
+            // Une trame fait jusqu'à 1 Mo et la file d'un joueur 256 commandes : on ne garde
+            // qu'un caractère de plus que le maximum (assez pour que `Talks::ask` refuse « trop long »).
+            ClientMsg::Talk { text, lang } => Command::Talk {
+                text: text.chars().take(MAX_TALK_CHARS + 1).collect(),
+                lang,
+            },
         })
     }
 }
@@ -207,6 +225,15 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
             }
         }
         Command::Use(_) | Command::Order { .. } => {}
+        Command::AcceptQuest(id) if king_in_reach(f.king, h.pos) => {
+            let _ = quest::accept(f, id); // un refus ne change rien
+        }
+        Command::AcceptQuest(_) => {}
+        Command::TurnIn => {
+            let pos = h.pos;
+            quest::turn_in(f, pos);
+        }
+        Command::Talk { .. } => {}
         Command::Cancel { a, b } => {
             ch.designations = mt
                 .cancel_designations(a, b)
@@ -495,7 +522,14 @@ fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)
 
 /// Advances every fortress by one tick, owner connected or not. Returns a delta for each
 /// fortress that has a hero.
+#[cfg(test)]
 pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
+    step_quests(w, &mut vec![])
+}
+
+/// `step`, et ajoute à `done` les montagnes dont la quête vient d'être validée (pas
+/// d'allocation tant qu'aucune ne l'est).
+pub fn step_quests(w: &mut World, done: &mut Vec<MountainId>) -> BTreeMap<MountainId, TickDelta> {
     let tick = w.tick;
     w.tick += 1;
     let no_block = HashSet::new();
@@ -551,6 +585,10 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
 
         let hero_spare = hero_spare(f);
         if let Some(h) = f.hero.as_mut() {
+            // z croît vers le bas ; au-dessus du sol la profondeur vaut 0.
+            let depth = u32::from(h.pos.z.saturating_sub(GROUND_Z));
+            // Plus utilisé par la quête `Depth` (profondeur actuelle), seulement par le roi.
+            f.max_depth = f.max_depth.max(depth);
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
             // A Move that arrived during the cooldown (network jitter) is not lost.
             if h.move_cooldown == 0
@@ -672,8 +710,12 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                     // Done, or blocked by an occupant: either way the task ends. When blocked
                     // the designation stays and the AI reassigns it once the tile is free.
                     if !blocked && task.kind.is_work() {
+                        let made = task.kind.product();
                         f.resources.take(&task.kind.cost());
-                        f.resources.add(task.kind.product());
+                        f.resources.add(made);
+                        // Production brute pour les quêtes de forge, jamais décrémentée.
+                        f.made.ingots = f.made.ingots.saturating_add(made.iron);
+                        f.made.doors = f.made.doors.saturating_add(made.iron_door);
                         let n = m
                             .orders
                             .get(&task.target)
@@ -696,6 +738,10 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                 }
             }
             f.dwarves[i].task = Some(task);
+        }
+
+        if quest::complete_if_ready(f) {
+            done.push(id);
         }
 
         if let Some(h) = &f.hero {
@@ -726,6 +772,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moria_core::king::{QuestId, quest_def};
     use moria_core::srd::{Class, Race, roll_abilities};
     use moria_core::world::{Hero, claim_mountain, generate};
     use moria_core::{DwarfId, PlayerId};
@@ -2390,6 +2437,142 @@ mod tests {
         assert!(w.mountains[&M].orders.is_empty());
         assert_eq!(w.fortresses[&M].resources.stone, stone + 6);
         assert!(reported);
+    }
+
+    // --- Quêtes du roi ---
+
+    fn fort(w: &mut World) -> &mut Fortress {
+        w.fortresses.get_mut(&M).unwrap()
+    }
+    /// Place le héros sur le trône du roi (à portée) et accepte la quête.
+    fn accept_at_king(w: &mut World, id: QuestId) {
+        let king = fort(w).king;
+        fort(w).hero.as_mut().unwrap().pos = king;
+        let c = Command::from_client(ClientMsg::AcceptQuest(id)).unwrap();
+        apply_command(w, M, c);
+        assert_eq!(fort(w).quest.map(|q| q.id), Some(id));
+    }
+
+    #[test]
+    fn oversized_talk_is_cut_to_one_char_over_the_limit() {
+        let big = ClientMsg::Talk {
+            text: "é".repeat(100_000),
+            lang: Lang::Fr,
+        };
+        let Some(Command::Talk { text, .. }) = Command::from_client(big) else {
+            panic!("pas de Talk");
+        };
+        assert_eq!(text.chars().count(), MAX_TALK_CHARS + 1);
+    }
+
+    #[test]
+    fn accept_quest_needs_the_king_in_reach() {
+        let mut w = setup();
+        apply_command(&mut w, M, Command::AcceptQuest(QuestId::Food));
+        assert!(fort(&mut w).quest.is_none(), "héros loin du roi");
+        accept_at_king(&mut w, QuestId::Food);
+    }
+
+    #[test]
+    fn forge_ingots_counts_gross_production_even_if_ingots_are_spent() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeIngots);
+        fort(&mut w).hero.as_mut().unwrap().pos = p(2, 1, 0);
+        let forge = ordered_forge(&mut w, 5);
+        *res(&mut w) = ore(10, 5);
+        for _ in 0..1000 {
+            if w.mountains[&M].orders.is_empty() {
+                break;
+            }
+            if w.fortresses[&M].dwarves[0].task.is_none() && in_view(&w, forge) {
+                assign(&mut w, 0, forge);
+            }
+            step(&mut w);
+            res(&mut w).iron = 0; // les lingots sont dépensés aussitôt forgés
+        }
+        let f = fort(&mut w);
+        assert_eq!(f.made.ingots, 5);
+        assert!(f.quest.is_none());
+        assert_eq!(f.done, vec![QuestId::ForgeIngots]);
+        let r = quest_def(QuestId::ForgeIngots).reward;
+        assert_eq!((f.resources.stone, f.resources.gold), (r.stone, r.gold));
+    }
+
+    #[test]
+    fn depth_quest_uses_current_depth() {
+        let mut w = setup();
+        let king = fort(&mut w).king;
+        let deep = |n: u8| TilePos::new(king.x, king.y, GROUND_Z + n);
+        // Déjà descendu à 4 avant d'accepter : ça ne compte pas, il faut redescendre.
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
+        step(&mut w);
+        accept_at_king(&mut w, QuestId::Depth);
+        step(&mut w);
+        assert!(fort(&mut w).quest.is_some(), "profondeur passée oubliée");
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(2);
+        step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((2, 4)));
+        // Remonter fait retomber l'avancement : pas de validation.
+        fort(&mut w).hero.as_mut().unwrap().pos = king;
+        step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((0, 4)));
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
+        step(&mut w);
+        let f = fort(&mut w);
+        assert_eq!(f.done, vec![QuestId::Depth]);
+        assert_eq!(
+            f.resources.mithril,
+            quest_def(QuestId::Depth).reward.mithril
+        );
+    }
+
+    #[test]
+    fn step_reports_the_mountains_that_completed_a_quest() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeDoors);
+        let mut done = vec![];
+        step_quests(&mut w, &mut done);
+        assert!(done.is_empty());
+        fort(&mut w).made.doors = 2;
+        step_quests(&mut w, &mut done);
+        assert_eq!(done, vec![M]);
+    }
+
+    #[test]
+    fn reward_is_paid_exactly_once_over_many_ticks() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeDoors);
+        fort(&mut w).made.doors = 2;
+        for _ in 0..50 {
+            step(&mut w);
+        }
+        let f = fort(&mut w);
+        assert_eq!(f.resources.gold, quest_def(QuestId::ForgeDoors).reward.gold);
+        assert_eq!(f.done, vec![QuestId::ForgeDoors]);
+    }
+
+    #[test]
+    fn reward_goes_through_inventory_batch() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::Food);
+        res(&mut w).food = 20;
+        let mut inv = crate::inventory::InvSync::new("s", 1);
+        inv.begin_tick(&mut w);
+        assert_eq!(inv.end_tick(&w).len(), 1); // le lot initial
+        inv.begin_tick(&mut w);
+        let c = Command::from_client(ClientMsg::TurnIn).unwrap();
+        apply_command(&mut w, M, c);
+        step(&mut w);
+        let bs = inv.end_tick(&w);
+        assert_eq!(bs.len(), 1);
+        let food = Resources {
+            food: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            (bs[0].add, bs[0].take),
+            (quest_def(QuestId::Food).reward, food)
+        );
     }
 
     fn dwarf0(w: &mut World) -> &mut Dwarf {

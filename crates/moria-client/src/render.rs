@@ -8,6 +8,7 @@ use crate::light::shown;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use moria_core::light::{Area, LightMap, light_map};
+use moria_core::srd::Race;
 use moria_core::{DesignationKind, Tile, TilePos};
 use std::collections::BTreeMap;
 
@@ -55,7 +56,11 @@ fn cells(rx: i16, ry: i16) -> impl Iterator<Item = (i16, i16)> {
 enum Mark {
     Hero,
     Dwarf,
+    King,
 }
+
+/// Le roi : une tête de nain dorée en attendant son propre sprite.
+const KING_TINT: Color = Color::srgb(1.0, 0.82, 0.25);
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<Built>()
@@ -87,10 +92,11 @@ pub fn plugin(app: &mut App) {
 }
 
 /// Heads have a dark square background; drawn smaller so the tile underneath shows.
-fn head(image: Handle<Image>) -> impl Bundle {
+fn head(image: Handle<Image>, color: Color) -> impl Bundle {
     (
         Sprite {
             image,
+            color,
             custom_size: Some(Vec2::splat(TILE * 0.64)),
             ..default()
         },
@@ -141,7 +147,8 @@ fn spawn_map(
             MapPart,
         ));
     }
-    commands.spawn((head(art.head(g.hero.race)), Mark::Hero));
+    commands.spawn((head(art.head(g.hero.race), Color::WHITE), Mark::Hero));
+    commands.spawn((head(art.head(Race::Dwarf), KING_TINT), Mark::King));
 }
 
 /// Light of the viewed level around the hero; only `compute_light` writes it.
@@ -276,9 +283,12 @@ fn sync_marks(
         let (pos, depth) = match mark {
             Mark::Hero => (Some(g.hero.pos), HERO_DEPTH),
             Mark::Dwarf => (ds.next().map(|&(_, p, _)| p), DWARF_DEPTH),
+            // Ne trahit pas la salle du trône avant que le héros l'ait vue.
+            Mark::King => (Some(g.king).filter(|&k| g.explored.seen(k)), DWARF_DEPTH),
         };
         match pos {
             Some(p) => place(&mut t, &mut v, p, z, depth),
+            None if *mark == Mark::King => *v = Visibility::Hidden,
             None => commands.entity(e).despawn(),
         }
     }
@@ -286,7 +296,12 @@ fn sync_marks(
         let mut t = Transform::default();
         let mut v = Visibility::default();
         place(&mut t, &mut v, p, z, DWARF_DEPTH);
-        commands.spawn((head(art.worker_head.clone()), Mark::Dwarf, t, v));
+        commands.spawn((
+            head(art.worker_head.clone(), Color::WHITE),
+            Mark::Dwarf,
+            t,
+            v,
+        ));
     }
 }
 

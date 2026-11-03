@@ -63,6 +63,17 @@ services:
     networks: [infra-net]
     restart: unless-stopped
 
+  # Le roi des nains : répond aux questions des joueurs via Ollama (LAN). Sans état, aucun volume.
+  # Optionnel : s'il ou Ollama est arrêté, le jeu continue. Même épinglage provisoire que inventory.
+  king:
+    image: ghcr.io/nicolaslallier/moria-king:sha-1d205a97793f926267747744f55cb1cfd45939bc
+    environment:
+      AMQP_URL: *amqp
+      OLLAMA_URL: ${OLLAMA_URL:-http://192.168.2.35:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:26b-a4b-it-qat}
+    networks: [infra-net]
+    restart: unless-stopped
+
 networks:
   infra-net:
     external: true

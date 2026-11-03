@@ -16,7 +16,7 @@ help: ## Affiche cette aide
 	@echo "MORIA_AMQP_PASSWORD=dev" >> $@
 	@echo "Créé .env avec un code d'invitation aléatoire : $$(cut -d= -f2 $@)"
 
-up: .env ## Construit et démarre la stack (rabbitmq local, worldgen, server, dwarf-ai, inventory)
+up: .env ## Construit et démarre la stack (rabbitmq local, worldgen, server, dwarf-ai, inventory, king)
 	docker compose up -d --build
 	@echo "Attendre « serveur prêt » : make logs"
 

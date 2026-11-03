@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 6;
+pub const SAVE_VERSION: u32 = 7;
 /// A full food gauge: one meal interval (`DAY_TICKS / 4`), as the server's `EAT_EVERY`.
 pub const FOOD_MAX: u16 = (crate::light::DAY_TICKS / 4) as u16;
 pub const HEALTH_MAX: u16 = 100;
@@ -107,6 +107,21 @@ pub struct Fortress {
     pub hero: Option<Hero>,
     pub dwarves: Vec<Dwarf>,
     pub resources: Resources,
+    /// Le roi nain, immobile sur son trône ; il n'est pas dans `dwarves`.
+    pub king: TilePos,
+    pub quest: Option<crate::king::Quest>,
+    pub done: Vec<crate::king::QuestId>,
+    /// Production brute de la forteresse, jamais décrémentée (contrairement aux ressources).
+    pub made: Production,
+    /// Plus grande profondeur atteinte (niveaux sous le sol) ; contexte du roi seulement,
+    /// la quête `Depth` mesure la profondeur actuelle du héros.
+    pub max_depth: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Production {
+    pub ingots: u32,
+    pub doors: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -316,7 +331,37 @@ fn generate_base(seed: u64) -> World {
 pub fn generate(seed: u64) -> World {
     let mut w = generate_base(seed);
     add_iron_and_coal(&mut w);
+    add_throne_room(&mut w);
     w
+}
+
+/// Salle du trône : 9×7 dans la roche, sur le niveau de l'entrée ; le roi trône au fond.
+const ROOM_X: std::ops::RangeInclusive<i16> = 140..=148;
+const ROOM_Y: std::ops::RangeInclusive<i16> = 45..=51;
+
+pub fn throne_pos() -> TilePos {
+    TilePos::new(146, 48, GROUND_Z)
+}
+
+/// Salle du trône et couloir vers l'entrée. Disposition fixe (donc identique dans chaque
+/// montagne) : elle n'utilise pas de hasard, le monde existant reste intact.
+fn add_throne_room(w: &mut World) {
+    for m in w.mountains.values_mut() {
+        let at = |x, y| TilePos::new(x, y, GROUND_Z);
+        for x in ENTRANCE_X.end..=*ROOM_X.start() {
+            m.set(at(x, 49), Tile::Floor);
+        }
+        for x in ROOM_X {
+            for y in ROOM_Y {
+                m.set(at(x, y), Tile::Floor);
+            }
+        }
+        m.set(throne_pos(), Tile::Throne);
+        for (x, y) in [(144, 45), (148, 45), (144, 51), (148, 51)] {
+            m.set(at(x, y), Tile::Torch);
+        }
+        m.set(at(143, 48), Tile::Table);
+    }
 }
 
 /// Iron and coal veins, from their own RNG so the base generation stays untouched.
@@ -411,6 +456,11 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
                 food: 12,
                 ..Default::default()
             },
+            king: throne_pos(),
+            quest: None,
+            done: vec![],
+            made: Production::default(),
+            max_depth: 0,
         },
     );
     Some(id)
@@ -526,10 +576,15 @@ mod v5 {
                     hero,
                     dwarves,
                     resources: f.resources,
+                    king: super::throne_pos(),
+                    quest: None,
+                    done: vec![],
+                    made: super::Production::default(),
+                    max_depth: 0,
                 };
                 (id, f)
             });
-            super::World {
+            let mut world = super::World {
                 seed: w.seed,
                 regions: w.regions,
                 mountains: w.mountains,
@@ -537,7 +592,10 @@ mod v5 {
                 accounts: w.accounts,
                 next_dwarf: w.next_dwarf,
                 tick: w.tick,
-            }
+            };
+            // A v5 mountain predates the throne room: carve it (fixed layout).
+            super::add_throne_room(&mut world);
+            world
         }
     }
 }
@@ -580,6 +638,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&view).len();
         assert!(n < MAX_FRAME, "{n} >= {MAX_FRAME}");
@@ -597,6 +658,9 @@ mod tests {
         for (id, m) in &w.mountains {
             let mut n = (0, 0);
             for ((p, t), (_, b)) in tiles(m).zip(tiles(&base.mountains[id])) {
+                if room_area(p) {
+                    continue;
+                }
                 match t {
                     Tile::IronOre => n.0 += 1,
                     Tile::Coal => n.1 += 1,
@@ -660,6 +724,81 @@ mod tests {
         let w = load(&p).unwrap();
         assert_eq!(w.seed, 42);
         assert_eq!(encode(&w), encode(&generate(42)));
+    }
+
+    fn room_area(p: TilePos) -> bool {
+        p.z == GROUND_Z
+            && (ENTRANCE_X.end..=*ROOM_X.end()).contains(&p.x)
+            && (ROOM_Y.start() - 1..=ROOM_Y.end() + 1).contains(&p.y)
+    }
+
+    #[test]
+    fn throne_room_is_walkable_from_the_entrance() {
+        for seed in 1..=8 {
+            let w = generate(seed);
+            let k = throne_pos();
+            for m in w.mountains.values() {
+                let start = entrance_tiles().next().unwrap();
+                let near_king = |p: TilePos| {
+                    p != k && p.z == k.z && (p.x - k.x).abs() <= 1 && (p.y - k.y).abs() <= 1
+                };
+                let path = crate::path::find_path(m, start, near_king, &Default::default());
+                assert!(path.is_some(), "seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn throne_room_leaves_the_rest_of_the_world_untouched() {
+        let mut base = generate_base(1);
+        add_iron_and_coal(&mut base);
+        let w = generate(1);
+        for (id, m) in &w.mountains {
+            let (bw, bh, bd) = m.size();
+            for z in 0..bd {
+                for y in 0..bh {
+                    for x in 0..bw {
+                        let p = TilePos::new(x, y, z);
+                        if !room_area(p) {
+                            assert_eq!(m.get(p), base.mountains[id].get(p), "{p:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn king_stands_on_the_throne_tile() {
+        let mut w = generate(1);
+        let me = PlayerId(1);
+        let id = claim_mountain(&mut w, me).unwrap();
+        let f = &w.fortresses[&id];
+        assert_eq!(w.mountains[&id].get(f.king), Some(Tile::Throne));
+        assert!(f.quest.is_none() && f.done.is_empty() && f.max_depth == 0);
+        assert!(!f.dwarves.iter().any(|d| d.pos == f.king));
+    }
+
+    #[test]
+    fn fortress_with_quest_state_survives_save_and_load() {
+        use crate::king::{Quest, QuestId};
+        let mut w = generate(1);
+        let id = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        let f = w.fortresses.get_mut(&id).unwrap();
+        f.quest = Some(Quest {
+            id: QuestId::Food,
+            baseline: 7,
+        });
+        f.done = vec![QuestId::Depth];
+        f.made = Production {
+            ingots: 3,
+            doors: 2,
+        };
+        f.max_depth = 5;
+        let d = tmpdir("quest-save");
+        let p = d.join("w.bin");
+        save(&w, &p).unwrap();
+        assert_eq!(load(&p).unwrap(), w);
     }
 
     #[test]
@@ -846,6 +985,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&v).len();
         assert!(n < MAX_FRAME / 2, "{n}");

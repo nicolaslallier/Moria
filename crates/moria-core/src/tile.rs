@@ -60,6 +60,8 @@ tiles! {
     Field,
     /// A ripe field: harvested (`Chop`) for food, which leaves it sown again.
     Crop,
+    /// Le trône du roi nain : décor, praticable.
+    Throne,
 }
 
 #[derive(
@@ -301,6 +303,7 @@ impl Tile {
                 | Tile::Stove
                 | Tile::Forge
                 | Tile::Anvil
+                | Tile::Throne
         ) || self.is_door()
     }
 
@@ -357,6 +360,7 @@ impl Tile {
             | Tile::Stove
             | Tile::Forge
             | Tile::Anvil
+            | Tile::Throne
             | Tile::WoodDoor
             | Tile::StoneDoor
             | Tile::IronDoor
@@ -490,6 +494,7 @@ mod tests {
             Cow,
             Field,
             Crop,
+            Throne,
         ];
         assert_eq!(Tile::ALL, expected);
         for (i, t) in expected.iter().enumerate() {
