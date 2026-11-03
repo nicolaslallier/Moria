@@ -87,7 +87,8 @@ pub fn quest_def(id: QuestId) -> QuestDef {
     QuestDef { id, target, reward }
 }
 
-/// Quête acceptée ; `baseline` = compteur de production ou profondeur à l'acceptation.
+/// Quête acceptée ; `baseline` = compteur de production à l'acceptation, utilisé par les
+/// seules quêtes de forge (0 pour les autres).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quest {
     pub id: QuestId,

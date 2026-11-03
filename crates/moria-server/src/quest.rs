@@ -1,7 +1,7 @@
 //! Règles des quêtes du roi : pures, appelées par `sim` (entre `begin_tick` et `end_tick`,
 //! pour que la récompense parte dans le lot normal de l'inventaire).
 
-use moria_core::TilePos;
+use moria_core::{GROUND_Z, TilePos};
 use moria_core::king::{Quest, QuestId, king_in_reach, quest_def};
 use moria_core::world::Fortress;
 
@@ -22,13 +22,17 @@ pub fn offered(f: &Fortress) -> Vec<QuestId> {
         .collect()
 }
 
-/// Valeur suivie par la quête : production brute, profondeur max ou stock de nourriture.
+/// Valeur suivie par la quête : production brute, profondeur actuelle du héros (comme
+/// l'affiche le client) ou stock de nourriture.
 fn measure(f: &Fortress, id: QuestId) -> u32 {
     match id {
         QuestId::ForgeIngots => f.made.ingots,
         QuestId::ForgeDoors => f.made.doors,
         QuestId::Food => f.resources.food,
-        QuestId::Depth => f.max_depth,
+        QuestId::Depth => f
+            .hero
+            .as_ref()
+            .map_or(0, |h| u32::from(h.pos.z.saturating_sub(GROUND_Z))),
     }
 }
 
@@ -42,11 +46,10 @@ pub fn accept(f: &mut Fortress, id: QuestId, offered: &[QuestId]) -> Result<(), 
     if !offered.contains(&id) {
         return Err(QuestError::NotOffered);
     }
-    // Seules les quêtes de forge soustraient la baseline ; celle de `Depth` est notée pour
-    // information, celle de `Food` est inutilisée.
+    // Seules les quêtes de forge ont une baseline.
     let baseline = match id {
-        QuestId::ForgeIngots | QuestId::ForgeDoors | QuestId::Depth => measure(f, id),
-        QuestId::Food => 0,
+        QuestId::ForgeIngots | QuestId::ForgeDoors => measure(f, id),
+        QuestId::Food | QuestId::Depth => 0,
     };
     f.quest = Some(Quest { id, baseline });
     Ok(())
@@ -58,7 +61,7 @@ pub fn progress(f: &Fortress) -> Option<(u32, u32)> {
     let now = measure(f, q.id);
     let done = match q.id {
         QuestId::ForgeIngots | QuestId::ForgeDoors => now.saturating_sub(q.baseline),
-        // Profondeur absolue (« z ≥ Z ») : le monde n'a que quelques niveaux sous le sol.
+        // Profondeur actuelle absolue (« z ≥ Z ») : remonter fait retomber l'avancement.
         QuestId::Food | QuestId::Depth => now,
     };
     let target = quest_def(q.id).target;

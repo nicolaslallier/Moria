@@ -3,7 +3,7 @@
 
 use crate::quest;
 use moria_core::ai::Assignments;
-use moria_core::king::{Lang, QuestId, king_in_reach};
+use moria_core::king::{Lang, MAX_TALK_CHARS, QuestId, king_in_reach};
 use moria_core::light::DAY_TICKS;
 use moria_core::path::{find_path, work_spot_goal};
 use moria_core::protocol::{ClientMsg, DwarfJob, DwarfState, TickDelta};
@@ -83,7 +83,12 @@ impl Command {
             ClientMsg::Hello { .. } | ClientMsg::CreateHero { .. } => return None,
             ClientMsg::AcceptQuest(id) => Command::AcceptQuest(id),
             ClientMsg::TurnIn => Command::TurnIn,
-            ClientMsg::Talk { text, lang } => Command::Talk { text, lang },
+            // Une trame fait jusqu'à 1 Mo et la file d'un joueur 256 commandes : on ne garde
+            // qu'un caractère de plus que le maximum (assez pour que `Talks::ask` refuse « trop long »).
+            ClientMsg::Talk { text, lang } => Command::Talk {
+                text: text.chars().take(MAX_TALK_CHARS + 1).collect(),
+                lang,
+            },
         })
     }
 }
@@ -527,6 +532,7 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         if let Some(h) = f.hero.as_mut() {
             // z croît vers le bas ; au-dessus du sol la profondeur vaut 0.
             let depth = u32::from(h.pos.z.saturating_sub(GROUND_Z));
+            // Plus utilisé par la quête `Depth` (profondeur actuelle), seulement par le roi.
             f.max_depth = f.max_depth.max(depth);
             h.move_cooldown = h.move_cooldown.saturating_sub(1);
             // A Move that arrived during the cooldown (network jitter) is not lost.
@@ -2386,6 +2392,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_talk_is_cut_to_one_char_over_the_limit() {
+        let big = ClientMsg::Talk {
+            text: "é".repeat(100_000),
+            lang: Lang::Fr,
+        };
+        let Some(Command::Talk { text, .. }) = Command::from_client(big) else {
+            panic!("pas de Talk");
+        };
+        assert_eq!(text.chars().count(), MAX_TALK_CHARS + 1);
+    }
+
+    #[test]
     fn accept_quest_needs_the_king_in_reach() {
         let mut w = setup();
         apply_command(&mut w, M, Command::AcceptQuest(QuestId::Food));
@@ -2419,23 +2437,26 @@ mod tests {
     }
 
     #[test]
-    fn depth_quest_uses_max_depth_not_current_depth() {
+    fn depth_quest_uses_current_depth() {
         let mut w = setup();
-        accept_at_king(&mut w, QuestId::Depth);
         let king = fort(&mut w).king;
         let deep = |n: u8| TilePos::new(king.x, king.y, GROUND_Z + n);
-        fort(&mut w).hero.as_mut().unwrap().pos = deep(2);
-        step(&mut w);
-        fort(&mut w).hero.as_mut().unwrap().pos = king;
-        step(&mut w);
-        assert_eq!(fort(&mut w).max_depth, 2);
-        assert_eq!(crate::quest::progress(fort(&mut w)), Some((2, 4)));
+        // Déjà descendu à 4 avant d'accepter : ça ne compte pas, il faut redescendre.
         fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
         step(&mut w);
+        accept_at_king(&mut w, QuestId::Depth);
+        step(&mut w);
+        assert!(fort(&mut w).quest.is_some(), "profondeur passée oubliée");
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(2);
+        step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((2, 4)));
+        // Remonter fait retomber l'avancement : pas de validation.
         fort(&mut w).hero.as_mut().unwrap().pos = king;
         step(&mut w);
+        assert_eq!(crate::quest::progress(fort(&mut w)), Some((0, 4)));
+        fort(&mut w).hero.as_mut().unwrap().pos = deep(4);
+        step(&mut w);
         let f = fort(&mut w);
-        assert_eq!(f.max_depth, 4);
         assert_eq!(f.done, vec![QuestId::Depth]);
         assert_eq!(
             f.resources.mithril,

@@ -88,7 +88,8 @@ pub struct Fortress {
     pub done: Vec<crate::king::QuestId>,
     /// Production brute de la forteresse, jamais décrémentée (contrairement aux ressources).
     pub made: Production,
-    /// Plus grande profondeur atteinte (niveaux sous le sol).
+    /// Plus grande profondeur atteinte (niveaux sous le sol) ; contexte du roi seulement,
+    /// la quête `Depth` mesure la profondeur actuelle du héros.
     pub max_depth: u32,
 }
 
