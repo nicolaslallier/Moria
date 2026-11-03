@@ -6,10 +6,10 @@ use anyhow::Context;
 use futures::{Stream, StreamExt};
 use moria_bus::{Bus, Queue, redact_url};
 use moria_core::MountainId;
-use moria_core::food::{FoodSim, FoodStore};
+use moria_core::food::{COW_EVERY, FoodSim, FoodStore};
 use moria_core::food_msg::{
     Actions, Events, KEY_ACTION, KEY_EVENTS, KEY_REJECT, KEY_STATE, KEY_TICK, KEY_WORLD,
-    MAX_EVENT_AGE, MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
+    MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::future::Future;
@@ -46,14 +46,16 @@ pub fn handle_world(store: &mut FoodStore, w: &World) {
 const EVENTS_PER_MSG: usize = 1000;
 
 /// Des `Events` (decoupes) par montagne connue et par tick qui propose quelque chose.
-/// `food.tick` ne garde que le dernier message : les ticks sautes depuis `last` sont rattrapes,
-/// mais pas plus loin que `MAX_EVENT_AGE` (le serveur refuserait ces propositions en entier),
-/// donc 5 pas de vaches au plus par message. Un tick qui recule (serveur redemarre) n'avance
-/// que ce tick-la. Jamais le tick d'un instantane adopte ni avant : il le contient deja, et un
-/// refus portant ce tick vient d'une proposition anterieure (voir `handle_reject`).
+/// `food.tick` ne garde que le dernier message : un saut depuis `last` rattrape les ticks des
+/// `COW_EVERY` derniers seulement, soit au plus un pas de vaches et une verification de
+/// croissance (les plus recents). Enchainer plusieurs pas a l'aveugle avant le retour des
+/// refus ferait oublier au conteneur une vache bloquee ; un pas manque de temps en temps est
+/// sans consequence. Un tick qui recule (serveur redemarre) n'avance que ce tick-la. Jamais le
+/// tick d'un instantane adopte ni avant : il le contient deja, et un refus portant ce tick
+/// vient d'une proposition anterieure (voir `handle_reject`).
 pub fn handle_tick(store: &mut FoodStore, last: u64, t: &Tick) -> Vec<Events> {
     let from = if t.tick > last {
-        last.max(t.tick.saturating_sub(MAX_EVENT_AGE))
+        last.max(t.tick.saturating_sub(COW_EVERY))
     } else {
         t.tick.saturating_sub(1)
     };
@@ -475,16 +477,25 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_stops_at_the_age_the_server_still_accepts() {
-        use moria_core::food_msg::MAX_EVENT_AGE;
+    fn a_big_gap_catches_up_one_cow_step_only() {
+        // Chained blind steps before any reject returns would make the container forget a
+        // penned cow: one step per mountain, the newest, never older than COW_EVERY.
+        use moria_core::food::COW_EVERY;
         let mut s = FoodStore::default();
         let mut last = None;
-        let w = world(0, vec![(A, vec![cow(5, 5), crop(1, 1)])]);
+        let w = world(
+            0,
+            vec![(A, vec![cow(5, 5), crop(1, 1)]), (B, vec![cow(9, 9)])],
+        );
         handle(&mut s, &mut last, KEY_WORLD, &enc_world(&w));
-        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(100_000));
-        let st = stamps(&evs);
-        assert_eq!(st.last(), Some(&100_000));
-        assert!(st.iter().all(|&t| t + MAX_EVENT_AGE >= 100_000), "{st:?}");
+        handle(&mut s, &mut last, KEY_TICK, &enc_tick(95));
+        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(160));
+        let per: Vec<_> = evs.iter().map(|e| (e.mountain, e.tick)).collect();
+        assert_eq!(per, [(A, 160), (B, 160)]);
+        assert!(evs.iter().all(|e| e.tick + COW_EVERY > 160));
+        // far gap: the newest step, nothing older
+        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(100_005));
+        assert_eq!(stamps(&evs), [100_000]);
         // going back (the server restarted from an older save): that tick only
         let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(50_000));
         assert_eq!(stamps(&evs), [50_000]);
