@@ -142,7 +142,12 @@ pub fn handle(
             }
         }
         KEY_REJECT => {
-            if let Some(r) = read(key, bytes, MAX_FOOD_MSG_BYTES) {
+            // Jamais de proposition apres le dernier tick : un refus plus recent vient d'un
+            // serveur reparti d'une sauvegarde plus ancienne. (Les actions, elles, portent le
+            // tick du serveur et peuvent devancer son `food.tick` sur une autre file.)
+            if let Some(r) = read::<Rejects>(key, bytes, MAX_FOOD_MSG_BYTES)
+                && last_tick.is_none_or(|l| r.tick <= l)
+            {
                 handle_reject(store, &r);
             }
         }
@@ -474,6 +479,45 @@ mod tests {
                 .iter()
                 .any(|e| !matches!(e, FoodEvent::CropRipe { .. }))
         );
+    }
+
+    #[test]
+    fn a_reject_past_the_last_tick_is_ignored() {
+        // The container never proposes past its last tick: such a reject comes from a server
+        // restarted from an older save, about a proposal it never saw.
+        let mut s = FoodStore::default();
+        let mut last = None;
+        let w = world(100, vec![(A, vec![cow(1, 1), cow(3, 3), field(5, 5)])]);
+        handle(&mut s, &mut last, KEY_WORLD, &enc_world(&w));
+        handle(&mut s, &mut last, KEY_TICK, &enc_tick(105));
+        let born = |tick, x| {
+            postcard::to_allocvec(&Rejects {
+                tick,
+                mountain: A,
+                list: vec![FoodEvent::CowBorn { at: p(x, x) }],
+            })
+            .unwrap()
+        };
+        handle(&mut s, &mut last, KEY_REJECT, &born(106, 1));
+        assert!(
+            s.mountains[&A].has_cow(p(1, 1)),
+            "reject from the future applied"
+        );
+        handle(&mut s, &mut last, KEY_REJECT, &born(105, 3));
+        assert!(!s.mountains[&A].has_cow(p(3, 3)));
+        // Actions are stamped by the server and may outrun its Tick (another queue): kept.
+        let a = Actions {
+            tick: 106,
+            mountain: A,
+            list: vec![FoodAction::FieldRemoved(p(5, 5))],
+        };
+        handle(
+            &mut s,
+            &mut last,
+            KEY_ACTION,
+            &postcard::to_allocvec(&a).unwrap(),
+        );
+        assert_eq!(s.mountains[&A].field_count(), 0);
     }
 
     #[test]
