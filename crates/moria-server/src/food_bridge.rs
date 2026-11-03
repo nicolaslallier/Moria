@@ -4,7 +4,7 @@
 //! only checks its proposals against the grid.
 
 use crate::food::{apply_bus_events, designate_harvest, snapshot};
-use crate::metrics::{M, inc};
+use crate::metrics::{M, inc as inc_metric};
 use crate::sim::Changes;
 use futures::StreamExt;
 use moria_bus::{Bus, Queue, redact_url};
@@ -17,6 +17,8 @@ use moria_core::inventory::STOPPED_AFTER;
 use moria_core::world::World as GameWorld;
 use moria_core::{MountainId, Tile, TilePos};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -28,8 +30,10 @@ pub const WORLD_RETRY: Duration = Duration::from_secs(5);
 // ponytail: tick-based staleness per tile, no entity ids; ids if two lives of one tile within
 // 5 s ever matter.
 pub use moria_core::food_msg::MAX_EVENT_AGE;
-/// Most incoming messages taken per tick (and the incoming channel's capacity).
+/// Most incoming messages taken per tick.
 pub const MAX_IN_PER_TICK: usize = 64;
+/// Incoming channel capacity: a backlog of many ticks before anything is dropped.
+pub const IN_CHANNEL: usize = 1024;
 /// Outgoing channel capacity: a tick, a few actions and rejects per tick.
 pub const OUT_CHANNEL: usize = 256;
 /// Actions per message: a `FoodAction` encodes in at most 8 bytes, so this stays far under
@@ -80,6 +84,8 @@ pub struct Link {
     inbox: Vec<Events>,
     /// Server tick of the last harvest or sowing per tile, younger than `MAX_EVENT_AGE`.
     touched: HashMap<(MountainId, TilePos), u64>,
+    /// Set by the bus side when it dropped events: the container is out of step.
+    dropped: Arc<AtomicBool>,
 }
 
 /// The food freezes, and meals are skipped, while a configured container is silent.
@@ -98,7 +104,13 @@ impl Link {
             status_tick: 0,
             inbox: vec![],
             touched: HashMap::new(),
+            dropped: Arc::default(),
         }
+    }
+
+    /// For `run`: raised when incoming events are dropped.
+    pub fn drop_flag(&self) -> Arc<AtomicBool> {
+        self.dropped.clone()
     }
 
     pub fn up(&self, now: Instant) -> bool {
@@ -108,6 +120,9 @@ impl Link {
 
     /// Start of a tick: takes the heartbeats and keeps the events for `step`.
     pub fn poll(&mut self, now: Instant) {
+        if self.dropped.swap(false, Relaxed) {
+            self.world_at = None; // its unanswered proposals stay in its state: resync it
+        }
         for _ in 0..MAX_IN_PER_TICK {
             match self.rx.try_recv() {
                 Ok(Incoming::Status(s)) => {
@@ -265,7 +280,7 @@ fn encode(o: &Outgoing) -> Option<(&'static str, Vec<u8>)> {
         Ok(b) if b.len() <= max => Some((key, b)),
         Ok(b) => {
             if key == KEY_WORLD {
-                inc(&M.food_world_dropped);
+                inc_metric(&M.food_world_dropped);
             }
             tracing::error!("message {key} trop gros ({} octets), perdu", b.len());
             None
@@ -283,8 +298,24 @@ async fn closed(out: &mut mpsc::Receiver<Outgoing>) {
     while out.recv().await.is_some() {}
 }
 
+/// Hands an incoming message to the world task. Events dropped on a full channel are never
+/// answered, so the container's optimistic state drifts: `dropped` asks for a fresh `World`.
+/// A dropped heartbeat is harmless.
+fn forward(inc: &mpsc::Sender<Incoming>, i: Incoming, dropped: &AtomicBool) {
+    if let Err(mpsc::error::TrySendError::Full(Incoming::Events(_))) = inc.try_send(i) {
+        dropped.store(true, Relaxed);
+        inc_metric(&M.food_events_dropped);
+        tracing::warn!("evenements nourriture perdus: le monde est en retard");
+    }
+}
+
 /// Runs until `out` closes. Own connection, reconnects 2 s after the link breaks.
-pub async fn run(url: String, mut out: mpsc::Receiver<Outgoing>, inc: mpsc::Sender<Incoming>) {
+pub async fn run(
+    url: String,
+    mut out: mpsc::Receiver<Outgoing>,
+    inc: mpsc::Sender<Incoming>,
+    dropped: Arc<AtomicBool>,
+) {
     loop {
         let bus = tokio::select! {
             b = Bus::connect_forever(&url) => b,
@@ -312,13 +343,13 @@ pub async fn run(url: String, mut out: mpsc::Receiver<Outgoing>, inc: mpsc::Send
                         m = events.next() => {
                             let Some(m) = m else { break };
                             if let Some(i) = decode_incoming(KEY_EVENTS, &m) {
-                                let _ = inc.try_send(i); // full: the world task is behind
+                                forward(&inc, i, &dropped);
                             }
                         }
                         m = states.next() => {
                             let Some(m) = m else { break };
                             if let Some(i) = decode_incoming(KEY_STATE, &m) {
-                                let _ = inc.try_send(i);
+                                forward(&inc, i, &dropped);
                             }
                         }
                     }
@@ -345,7 +376,7 @@ mod tests {
 
     fn link() -> (Link, Ends) {
         let (tx, out) = mpsc::channel(OUT_CHANNEL);
-        let (inc, rx) = mpsc::channel(MAX_IN_PER_TICK);
+        let (inc, rx) = mpsc::channel(IN_CHANNEL);
         (Link::new(tx, rx), (out, inc))
     }
     /// Heartbeat of a container that has adopted a `World`.
@@ -500,6 +531,39 @@ mod tests {
         assert_eq!(at(&mut l, &mut w, 7, 40), 0);
         // a restart faster than STOPPED_AFTER: tick 0 again
         assert_eq!(at(&mut l, &mut w, 0, 41), 1, "restarted");
+    }
+
+    #[test]
+    fn dropped_events_force_a_fresh_world() {
+        use crate::metrics::M as METRICS;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut l, (mut out, inc)) = link();
+        let mut w = setup();
+        let t0 = Instant::now();
+        beat(&inc);
+        tick(&mut l, &mut w, &[], t0);
+        assert_eq!(worlds(&sent(&mut out)).len(), 1);
+        // the bus side finds the world task's channel full: the events are lost
+        let (full, _rx) = mpsc::channel(1);
+        full.try_send(Incoming::Status(Status { tick: 1 })).unwrap();
+        let ev = Events {
+            tick: 1,
+            mountain: M,
+            list: vec![],
+        };
+        let before = METRICS.food_events_dropped.load(Relaxed);
+        forward(&full, Incoming::Events(ev), &l.drop_flag());
+        assert!(METRICS.food_events_dropped.load(Relaxed) > before);
+        beat(&inc);
+        tick(&mut l, &mut w, &[], secs(t0, 1));
+        assert_eq!(
+            worlds(&sent(&mut out)).len(),
+            1,
+            "container left out of step"
+        );
+        beat(&inc);
+        tick(&mut l, &mut w, &[], secs(t0, 2));
+        assert!(worlds(&sent(&mut out)).is_empty(), "once");
     }
 
     #[test]

@@ -185,9 +185,10 @@ pub async fn run_with_listener(
     // The food container gets its own connection: a slow inventory flush never holds it up.
     let food_link = cfg.amqp_url.clone().map(|url| {
         let (tx, out) = mpsc::channel(food_bridge::OUT_CHANNEL);
-        let (inc, rx) = mpsc::channel(food_bridge::MAX_IN_PER_TICK);
-        tokio::spawn(food_bridge::run(url, out, inc));
-        food_bridge::Link::new(tx, rx)
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
+        let link = food_bridge::Link::new(tx, rx);
+        tokio::spawn(food_bridge::run(url, out, inc, link.drop_flag()));
+        link
     });
 
     // An empty (or blank) code means open registration, whatever the caller passed.
@@ -768,7 +769,7 @@ mod tests {
         s.step_at(t0);
         assert!(!s.w.food_paused, "no bus: never paused");
         let (tx, mut out) = mpsc::channel(food_bridge::OUT_CHANNEL);
-        let (inc, rx) = mpsc::channel(food_bridge::MAX_IN_PER_TICK);
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
         s.food_link = Some(food_bridge::Link::new(tx, rx));
         s.food_sim = None;
         s.step_at(t0);
