@@ -268,8 +268,8 @@ pub struct Game {
     pub inspect: Option<InspectTarget>,
     /// Latest vitals the server sent for `inspect`.
     pub inspection: Option<Inspection>,
-    /// Last `Inspect` request: target and time (s), to ask at most once per second.
-    pub inspect_asked: Option<(InspectTarget, f64)>,
+    /// Last `Inspect` request: target (`None` once the panel closed) and time (s).
+    pub inspect_asked: (Option<InspectTarget>, f64),
     /// One-line notice and the `ticks` value it was raised at.
     pub toast: Option<(String, u64)>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
@@ -440,7 +440,7 @@ impl Game {
             status: false,
             inspect: None,
             inspection: None,
-            inspect_asked: None,
+            inspect_asked: (None, f64::NEG_INFINITY),
             toast: None,
             pause: false,
             pause_sel: 0,
@@ -509,15 +509,15 @@ impl Game {
     /// The `Inspect` request to send now, if the panel needs one.
     pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
         if self.inspect.is_none() {
-            // Closed: reopening the same target asks at once. Relies on this running every
+            // Closed: reopening the same target asks soon. Relies on this running every
             // frame (the `inspect_poll` system), so a close is always seen here.
-            self.inspect_asked = None;
+            self.inspect_asked.0 = None;
         }
         if !inspect_due(self.inspect, self.inspect_asked, now) {
             return None;
         }
         let t = self.inspect?;
-        self.inspect_asked = Some((t, now));
+        self.inspect_asked = (Some(t), now);
         Some(ClientMsg::Inspect(t))
     }
 
@@ -704,18 +704,20 @@ impl Game {
     }
 }
 
-/// Whether to send `Inspect` for `open` now: on opening or changing target, then once a second.
+/// Whether to send `Inspect` for `open` now, given the last request `asked`: once a second
+/// for the same target, soon after opening or changing target, never two within
+/// `INSPECT_GAP` (the server drops an Inspect under 100 ms after the previous one).
 pub fn inspect_due(
     open: Option<InspectTarget>,
-    asked: Option<(InspectTarget, f64)>,
+    asked: (Option<InspectTarget>, f64),
     now: f64,
 ) -> bool {
-    match (open, asked) {
-        (None, _) => false,
-        (Some(t), Some((a, at))) if a == t => now - at >= 1.0,
-        _ => true,
-    }
+    let (last, at) = asked;
+    open.is_some_and(|t| now - at >= if last == Some(t) { 1.0 } else { INSPECT_GAP })
 }
+
+/// Shortest gap between two `Inspect`, in seconds: above the server's 100 ms limit.
+const INSPECT_GAP: f64 = 0.15;
 
 /// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
 pub fn outlined(
@@ -1075,12 +1077,20 @@ pub(crate) mod tests {
     fn inspect_requested_on_open_then_at_most_once_per_second() {
         let hero = Some(InspectTarget::Hero);
         let dw = Some(InspectTarget::Dwarf(DwarfId(1)));
-        assert!(!inspect_due(None, None, 0.0));
-        assert!(inspect_due(hero, None, 0.0));
-        assert!(!inspect_due(hero, Some((InspectTarget::Hero, 0.0)), 0.9));
-        assert!(inspect_due(hero, Some((InspectTarget::Hero, 0.0)), 1.0));
-        // Another target asks at once, even within the second (server limit is 100 ms).
-        assert!(inspect_due(dw, Some((InspectTarget::Hero, 0.0)), 0.5));
+        let never = (None, f64::NEG_INFINITY);
+        assert!(!inspect_due(None, never, 0.0));
+        assert!(inspect_due(hero, never, 0.0));
+        assert!(!inspect_due(hero, (hero, 0.0), 0.9));
+        assert!(inspect_due(hero, (hero, 0.0), 1.0));
+        // Another target asks within the second, but never within 150 ms of the last
+        // request: the server drops an Inspect under 100 ms after the previous one.
+        assert!(inspect_due(dw, (hero, 0.0), 0.5));
+        assert!(!inspect_due(dw, (hero, 0.0), 0.05));
+        assert!(inspect_due(dw, (hero, 0.0), 0.15));
+        assert!(
+            !inspect_due(hero, (None, 0.0), 0.05),
+            "closed then reopened"
+        );
         let mut g = game();
         g.inspect = hero;
         assert_eq!(
@@ -1107,6 +1117,10 @@ pub(crate) mod tests {
         assert_eq!(g.poll_inspect(5.2), None);
         g.inspect = Some(InspectTarget::Hero);
         assert!(g.poll_inspect(5.3).is_some());
+        // Switching target at once is delayed, not lost.
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        assert_eq!(g.poll_inspect(5.35), None);
+        assert!(g.poll_inspect(5.45).is_some());
     }
 
     #[test]
