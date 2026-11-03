@@ -1,8 +1,4 @@
-use std::time::Duration;
 use tracing_subscriber::EnvFilter;
-
-/// Plafond, pas objectif : le serveur abandonne à 70 s.
-const OLLAMA_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +12,6 @@ async fn main() -> anyhow::Result<()> {
     let llm = moria_king::Ollama {
         url: env("OLLAMA_URL", "http://192.168.2.35:11434"),
         model: env("OLLAMA_MODEL", "gemma4:26b-a4b-it-qat"),
-        timeout: OLLAMA_TIMEOUT,
     };
     tracing::info!("roi : modèle {} sur {}", llm.model, llm.url);
     moria_king::run(url, llm, shutdown_signal()).await

@@ -14,12 +14,17 @@ use std::{
 };
 
 pub trait Llm {
-    fn chat(&self, msgs: &[ChatMessage]) -> impl Future<Output = anyhow::Result<String>> + Send;
+    /// `timeout` : délai maximal de l'appel, au plus `OLLAMA_TIMEOUT`.
+    fn chat(
+        &self,
+        msgs: &[ChatMessage],
+        timeout: Duration,
+    ) -> impl Future<Output = anyhow::Result<String>> + Send;
 }
 
 /// Une question, une réponse : même montagne et même `seq` ; toute erreur donne le repli.
-pub async fn answer(ask: &Ask, llm: &impl Llm) -> Reply {
-    let raw = match llm.chat(&build_messages(ask)).await {
+pub async fn answer(ask: &Ask, llm: &impl Llm, timeout: Duration) -> Reply {
+    let raw = match llm.chat(&build_messages(ask), timeout).await {
         Ok(raw) => raw,
         Err(e) => {
             tracing::warn!("LLM en échec ({e:#}), réponse de repli");
@@ -38,8 +43,12 @@ pub async fn answer(ask: &Ask, llm: &impl Llm) -> Reply {
 
 /// Taille maximale d'une question sur le bus, vérifiée avant décodage.
 pub const MAX_ASK_BYTES: usize = 64 * 1024;
-/// Au-delà, le serveur (70 s) a déjà envoyé son repli : inutile d'occuper Ollama.
-const STALE: Duration = Duration::from_secs(60);
+/// Plafond d'un appel à Ollama, pas objectif.
+pub const OLLAMA_TIMEOUT: Duration = Duration::from_secs(60);
+/// Le serveur envoie son repli 70 s après la question ; 2 s de marge pour la réponse.
+const SERVER_BUDGET: Duration = Duration::from_secs(70 - 2);
+/// En dessous, le LLM n'a pas le temps de répondre : inutile de l'occuper.
+const MIN_BUDGET: Duration = Duration::from_secs(3);
 
 fn decode_ask(payload: &[u8]) -> Option<Ask> {
     if payload.len() > MAX_ASK_BYTES {
@@ -51,13 +60,15 @@ fn decode_ask(payload: &[u8]) -> Option<Ask> {
         .ok()
 }
 
-/// `None` si la question a trop attendu : on l'abandonne sans appeler le LLM.
-async fn handle(ask: &Ask, received: Instant, llm: &impl Llm) -> Option<Reply> {
-    if received.elapsed() > STALE {
+/// Le LLM n'a que le temps restant avant le repli du serveur (`age` = attente depuis la
+/// livraison) ; `None` s'il en reste trop peu : on abandonne sans l'appeler.
+async fn handle(ask: &Ask, age: Duration, llm: &impl Llm) -> Option<Reply> {
+    let left = SERVER_BUDGET.saturating_sub(age);
+    if left < MIN_BUDGET {
         tracing::debug!(mountain = ask.mountain.0, seq = ask.seq, "question périmée");
         return None;
     }
-    Some(answer(ask, llm).await)
+    Some(answer(ask, llm, left.min(OLLAMA_TIMEOUT)).await)
 }
 
 /// Répond aux questions jusqu'à `shutdown` ; se reconnecte (2 s) quand le bus tombe.
@@ -114,7 +125,7 @@ pub async fn run(
                         bus.close().await;
                         return Ok(());
                     }
-                    r = handle(&ask, received, &llm) => r,
+                    r = handle(&ask, received.elapsed(), &llm) => r,
                 },
                 None => None,
             };
@@ -151,7 +162,7 @@ mod tests {
     struct Fake(anyhow::Result<String>);
 
     impl Llm for Fake {
-        async fn chat(&self, msgs: &[ChatMessage]) -> anyhow::Result<String> {
+        async fn chat(&self, msgs: &[ChatMessage], _: Duration) -> anyhow::Result<String> {
             assert!(msgs.len() >= 2);
             match &self.0 {
                 Ok(s) => Ok(s.clone()),
@@ -160,15 +171,17 @@ mod tests {
         }
     }
 
-    /// Compte les appels.
+    /// Compte les appels et note le délai reçu.
     #[derive(Default)]
     struct Counting {
         calls: AtomicUsize,
+        timeout: std::sync::Mutex<Option<Duration>>,
     }
 
     impl Llm for Counting {
-        async fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+        async fn chat(&self, _: &[ChatMessage], timeout: Duration) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.timeout.lock().unwrap() = Some(timeout);
             Ok(r#"{"say":"ok","offer":null}"#.into())
         }
     }
@@ -181,20 +194,41 @@ mod tests {
         assert_eq!(decode_ask(b"\xff\xff"), None);
     }
 
-    #[tokio::test]
-    async fn stale_ask_is_skipped_without_calling_the_llm() {
+    /// Délai passé au LLM pour une question livrée il y a `age` ; `None` = pas d'appel.
+    async fn budget(age: u64) -> Option<Duration> {
         let llm = Counting::default();
-        let old = Instant::now() - STALE - Duration::from_secs(1);
-        assert_eq!(handle(&ask(), old, &llm).await, None);
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
-        assert!(handle(&ask(), Instant::now(), &llm).await.is_some());
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+        let r = handle(&ask(), Duration::from_secs(age), &llm).await;
+        assert_eq!(r.is_some(), llm.calls.load(Ordering::SeqCst) == 1);
+        *llm.timeout.lock().unwrap()
+    }
+
+    #[tokio::test]
+    async fn fresh_ask_gets_the_full_ollama_timeout() {
+        assert_eq!(budget(0).await, Some(OLLAMA_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn llm_budget_shrinks_with_age() {
+        // 70 s du serveur - 20 s d'attente - 2 s de marge.
+        assert_eq!(budget(20).await, Some(Duration::from_secs(48)));
+        assert_eq!(budget(65).await, Some(Duration::from_secs(3)));
+    }
+
+    #[tokio::test]
+    async fn ask_delivered_68s_ago_is_skipped_without_calling_the_llm() {
+        assert_eq!(budget(68).await, None);
+        assert_eq!(budget(66).await, None);
     }
 
     #[tokio::test]
     async fn answer_replies_with_same_mountain_and_seq() {
         let a = ask();
-        let r = answer(&a, &Fake(Ok(r#"{"say":"Creuse.","offer":"depth"}"#.into()))).await;
+        let r = answer(
+            &a,
+            &Fake(Ok(r#"{"say":"Creuse.","offer":"depth"}"#.into())),
+            OLLAMA_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             r,
             Reply {
@@ -209,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn llm_error_gives_fallback_reply() {
         let a = ask();
-        let r = answer(&a, &Fake(Err(anyhow::anyhow!("panne")))).await;
+        let r = answer(&a, &Fake(Err(anyhow::anyhow!("panne"))), OLLAMA_TIMEOUT).await;
         assert_eq!((r.seq, r.text.as_str(), r.offer), (42, FALLBACK_FR, None));
     }
 
@@ -225,12 +259,14 @@ mod tests {
         let o = Ollama {
             url,
             model: "m".into(),
-            timeout: Duration::from_millis(300),
         };
         let a = ask();
-        let r = tokio::time::timeout(Duration::from_secs(5), answer(&a, &o))
-            .await
-            .expect("le délai d'Ollama n'a pas été appliqué");
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer(&a, &o, Duration::from_millis(300)),
+        )
+        .await
+        .expect("le délai d'Ollama n'a pas été appliqué");
         assert_eq!((r.mountain, r.seq), (a.mountain, a.seq));
         assert_eq!((r.text.as_str(), r.offer), (FALLBACK_FR, None));
     }

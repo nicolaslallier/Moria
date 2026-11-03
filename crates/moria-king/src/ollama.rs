@@ -7,11 +7,10 @@ use std::time::Duration;
 pub struct Ollama {
     pub url: String,
     pub model: String,
-    pub timeout: Duration,
 }
 
 impl Llm for Ollama {
-    async fn chat(&self, msgs: &[ChatMessage]) -> anyhow::Result<String> {
+    async fn chat(&self, msgs: &[ChatMessage], timeout: Duration) -> anyhow::Result<String> {
         let keys: Vec<serde_json::Value> = QuestId::ALL
             .iter()
             .map(|q| q.key().into())
@@ -33,7 +32,6 @@ impl Llm for Ollama {
             "options": { "temperature": 0.7 },
         });
         let url = format!("{}/api/chat", self.url.trim_end_matches('/'));
-        let timeout = self.timeout;
         // ureq est bloquant : hors des threads du runtime.
         let v: serde_json::Value = tokio::task::spawn_blocking(move || {
             let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -111,13 +109,15 @@ pub(crate) mod tests {
         let o = Ollama {
             url,
             model: "gemma-test".into(),
-            timeout: Duration::from_secs(5),
         };
         let msgs = vec![ChatMessage {
             role: "user",
             content: "bonjour".into(),
         }];
-        assert_eq!(o.chat(&msgs).await.unwrap(), r#"{"say":"ok"}"#);
+        assert_eq!(
+            o.chat(&msgs, Duration::from_secs(5)).await.unwrap(),
+            r#"{"say":"ok"}"#
+        );
         let (head, body) = server.await.unwrap();
         assert!(head.starts_with("POST /api/chat "), "{head}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -151,8 +151,7 @@ pub(crate) mod tests {
         let o = Ollama {
             url,
             model: "m".into(),
-            timeout: Duration::from_secs(5),
         };
-        assert!(o.chat(&[]).await.is_err());
+        assert!(o.chat(&[], Duration::from_secs(5)).await.is_err());
     }
 }

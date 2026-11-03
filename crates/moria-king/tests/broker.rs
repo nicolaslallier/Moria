@@ -20,7 +20,7 @@ fn url() -> String {
 struct Fake;
 
 impl Llm for Fake {
-    async fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+    async fn chat(&self, _: &[ChatMessage], _: Duration) -> anyhow::Result<String> {
         Ok(r#"{"say":"Bienvenue.","offer":"food"}"#.into())
     }
 }
@@ -44,7 +44,7 @@ fn gated() -> Gated {
 }
 
 impl Llm for Gated {
-    async fn chat(&self, _: &[ChatMessage]) -> anyhow::Result<String> {
+    async fn chat(&self, _: &[ChatMessage], _: Duration) -> anyhow::Result<String> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
         self.max.fetch_max(n, Ordering::SeqCst);

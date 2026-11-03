@@ -4,7 +4,7 @@
 use moria_core::king::{Ask, Exchange, FALLBACK_FR, KingState, Lang, MAX_REPLY_CHARS, QuestId};
 use moria_core::{MountainId, Resources};
 use moria_king::{Llm, Ollama, build_messages, parse_reply};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[tokio::test]
 #[ignore]
@@ -13,7 +13,6 @@ async fn real_ollama_answers_in_json() {
     let o = Ollama {
         url: env("OLLAMA_URL", "http://192.168.2.35:11434"),
         model: env("OLLAMA_MODEL", "gemma4:26b-a4b-it-qat"),
-        timeout: Duration::from_secs(60),
     };
     let ask = Ask {
         mountain: MountainId(0),
@@ -39,7 +38,10 @@ async fn real_ollama_answers_in_json() {
         offered: vec![QuestId::ForgeIngots, QuestId::Food, QuestId::Depth],
     };
     let t = Instant::now();
-    let raw = o.chat(&build_messages(&ask)).await.expect("appel Ollama");
+    let raw = o
+        .chat(&build_messages(&ask), moria_king::OLLAMA_TIMEOUT)
+        .await
+        .expect("appel Ollama");
     println!("latence {:?}\nbrut: {raw}", t.elapsed());
     let (say, offer) = parse_reply(&raw, &ask);
     println!("say: {say}\noffer: {offer:?}");
