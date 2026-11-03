@@ -79,7 +79,7 @@ pub fn handle_action(store: &mut FoodStore, a: &Actions) {
 
 pub fn handle_reject(store: &mut FoodStore, r: &Rejects) {
     if let Some(sim) = current(store, r.mountain, r.tick) {
-        r.list.iter().for_each(|x| sim.reject(x));
+        sim.reject(&r.list);
     }
 }
 

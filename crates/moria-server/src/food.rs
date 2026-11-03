@@ -176,9 +176,8 @@ pub fn step(
                 sim.adopt(&snapshot(m), tick);
             }
             // Same checks as the bus (cap, birth next to a cow); no stale ripe in process.
-            for ev in apply_bus_events(m, f, &sim.step(tick), |_| false, &mut ch.tiles) {
-                sim.reject(&ev);
-            }
+            let evs = sim.step(tick);
+            sim.reject(&apply_bus_events(m, f, &evs, |_| false, &mut ch.tiles));
         }
         if tick.is_multiple_of(GROW_EVERY) {
             keep_harvest_designated(m, &mut ch);
@@ -530,9 +529,7 @@ mod tests {
         for n in 1..=300 {
             let evs = sim.step(WINTER + 20 * n);
             let rejected = apply_events(&mut m, &f, &evs, &mut vec![]);
-            for ev in &rejected {
-                sim.reject(ev);
-            }
+            sim.reject(&rejected);
             if let Some(FoodEvent::CowMoved { to, .. }) =
                 evs.first().filter(|e| !rejected.contains(e))
             {

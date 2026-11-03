@@ -226,8 +226,13 @@ impl FoodSim {
         }
     }
 
-    /// The server refused `ev`: undo its optimistic effect.
-    pub fn reject(&mut self, ev: &FoodEvent) {
+    /// The server refused `evs` (in proposal order): undo their optimistic effects, last
+    /// first, so a cow that moved into a tile another one left finds that tile free again.
+    pub fn reject(&mut self, evs: &[FoodEvent]) {
+        evs.iter().rev().for_each(|ev| self.reject_one(ev));
+    }
+
+    fn reject_one(&mut self, ev: &FoodEvent) {
         match *ev {
             FoodEvent::CowMoved { from, to } => {
                 if let Some(st) = self.cows.remove(&to) {
@@ -236,7 +241,23 @@ impl FoodSim {
                 }
             }
             FoodEvent::CowBorn { at } => {
-                self.cows.remove(&at);
+                // The parent stood next to the calf and got its cooldown on the same tick
+                // (it does not move on a birth step): fertile again from that tick.
+                // ponytail: a parent that moved away before the reject keeps its cooldown.
+                let Some(calf) = self.cows.remove(&at) else {
+                    return;
+                };
+                let t0 = calf.born;
+                let cooled = t0.saturating_add(BIRTH_COOLDOWN);
+                let parent = [(1, 0), (-1, 0), (0, 1), (0, -1)].map(|(dx, dy)| {
+                    TilePos::new(at.x.saturating_add(dx), at.y.saturating_add(dy), at.z)
+                });
+                if let Some(q) = parent
+                    .into_iter()
+                    .find(|q| self.cows.get(q).is_some_and(|c| c.fertile_at == cooled))
+                {
+                    self.cows.get_mut(&q).unwrap().fertile_at = t0;
+                }
             }
             FoodEvent::CropRipe { at } => {
                 if let Some(f) = self.fields.get_mut(&at) {
@@ -333,7 +354,7 @@ mod tests {
         for t in u64::MAX - 3 * DAY_TICKS..=u64::MAX {
             for ev in s.step(t) {
                 if t % 3 == 0 {
-                    s.reject(&ev);
+                    s.reject(&[ev]);
                 }
             }
         }
@@ -617,7 +638,7 @@ mod tests {
                 for ev in s.step(t) {
                     n += 1;
                     if refuse_half && n.is_multiple_of(2) {
-                        s.reject(&ev);
+                        s.reject(&[ev]);
                     }
                     assert!(s.cow_count() <= COW_CAP);
                 }
@@ -705,10 +726,10 @@ mod tests {
     fn reject_of_a_move_puts_the_cow_back() {
         let mut s = FoodSim::new(1);
         s.adopt(&[cell(p(6, 5), CellKind::Cow)], 0); // already moved there
-        s.reject(&FoodEvent::CowMoved {
+        s.reject(&[FoodEvent::CowMoved {
             from: p(5, 5),
             to: p(6, 5),
-        });
+        }]);
         assert!(s.has_cow(p(5, 5)) && !s.has_cow(p(6, 5)));
     }
 
@@ -720,17 +741,17 @@ mod tests {
             &[cell(p(5, 5), CellKind::Cow), cell(p(6, 5), CellKind::Cow)],
             0,
         );
-        s.reject(&FoodEvent::CowMoved {
+        s.reject(&[FoodEvent::CowMoved {
             from: p(5, 5),
             to: p(6, 5),
-        });
+        }]);
         assert_eq!(s.cow_count(), 1);
         assert!(s.has_cow(p(5, 5)));
         // the cow is not at the destination any more: nothing to put back
-        s.reject(&FoodEvent::CowMoved {
+        s.reject(&[FoodEvent::CowMoved {
             from: p(1, 1),
             to: p(2, 1),
-        });
+        }]);
         assert_eq!(s.cow_count(), 1);
         assert!(!s.has_cow(p(1, 1)));
     }
@@ -739,15 +760,69 @@ mod tests {
     fn reject_of_a_birth_removes_it() {
         let mut s = FoodSim::new(1);
         s.adopt(&[cell(p(5, 5), CellKind::Cow)], 0);
-        s.reject(&FoodEvent::CowBorn { at: p(5, 5) });
+        s.reject(&[FoodEvent::CowBorn { at: p(5, 5) }]);
         assert_eq!(s.cow_count(), 0);
+    }
+
+    #[test]
+    fn reject_of_a_birth_gives_the_parent_its_fertility_back() {
+        let mut s = FoodSim::new(3);
+        s.adopt(&[cell(p(5, 5), CellKind::Cow)], SUMMER);
+        let (t0, at) = (SUMMER..SUMMER + 20_000)
+            .find_map(|t| {
+                s.step(t).into_iter().find_map(|e| match e {
+                    FoodEvent::CowBorn { at } => Some((t, at)),
+                    _ => None,
+                })
+            })
+            .expect("an adult cow breeds in summer");
+        // the server refuses the blind birth (a tree, the cap...)
+        s.reject(&[FoodEvent::CowBorn { at }]);
+        assert_eq!(s.cow_count(), 1);
+        let parent = s.cows.values().next().unwrap();
+        assert!(parent.fertile_at <= t0, "parent left barren");
+    }
+
+    #[test]
+    fn rejects_of_chained_moves_put_every_cow_back() {
+        let (x, y, z) = (p(5, 5), p(6, 5), p(4, 5));
+        let mut s = FoodSim::new(1);
+        // cow 1 went x -> y, then cow 2 z -> x, in that order of proposal
+        s.adopt(&[cell(y, CellKind::Cow), cell(x, CellKind::Cow)], 0);
+        s.reject(&[
+            FoodEvent::CowMoved { from: x, to: y },
+            FoodEvent::CowMoved { from: z, to: x },
+        ]);
+        assert!(s.has_cow(x) && s.has_cow(z) && !s.has_cow(y));
+        assert_eq!(s.cow_count(), 2);
+    }
+
+    #[test]
+    fn a_cow_killed_after_it_moved_leaves_no_ghost() {
+        let (a, b) = (p(5, 5), p(6, 5));
+        let mv = FoodEvent::CowMoved { from: a, to: b };
+        // the server's correction after a move refused for a missing origin, in both orders
+        let fix = [FoodAction::CowRemoved(a), FoodAction::CowRemoved(b)];
+        for reject_first in [true, false] {
+            let mut s = FoodSim::new(1);
+            s.adopt(&[cell(b, CellKind::Cow)], 0); // the sim already moved it a -> b
+            s.apply_action(&FoodAction::CowRemoved(a)); // butchered at a: no-op here
+            if reject_first {
+                s.reject(&[mv]);
+            }
+            fix.iter().for_each(|f| s.apply_action(f));
+            if !reject_first {
+                s.reject(&[mv]);
+            }
+            assert_eq!(s.cow_count(), 0, "ghost cow (reject first: {reject_first})");
+        }
     }
 
     #[test]
     fn reject_of_ripe_marks_the_field_growing_again() {
         let mut s = FoodSim::new(1);
         s.adopt(&[cell(p(3, 3), CellKind::Crop)], 0);
-        s.reject(&FoodEvent::CropRipe { at: p(3, 3) });
+        s.reject(&[FoodEvent::CropRipe { at: p(3, 3) }]);
         assert!(!s.is_ripe(p(3, 3)));
     }
 
