@@ -497,7 +497,14 @@ fn graze(m: &mut Mountain, f: &Fortress, n: u64, tiles: &mut Vec<(TilePos, Tile)
 
 /// Advances every fortress by one tick, owner connected or not. Returns a delta for each
 /// fortress that has a hero.
+#[cfg(test)]
 pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
+    step_quests(w, &mut vec![])
+}
+
+/// `step`, et ajoute à `done` les montagnes dont la quête vient d'être validée (pas
+/// d'allocation tant qu'aucune ne l'est).
+pub fn step_quests(w: &mut World, done: &mut Vec<MountainId>) -> BTreeMap<MountainId, TickDelta> {
     let tick = w.tick;
     w.tick += 1;
     let no_block = HashSet::new();
@@ -682,7 +689,9 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             f.dwarves[i].task = Some(task);
         }
 
-        quest::complete_if_ready(f);
+        if quest::complete_if_ready(f) {
+            done.push(id);
+        }
 
         if let Some(h) = &f.hero {
             let mut d = TickDelta {
@@ -2461,6 +2470,18 @@ mod tests {
             f.resources.mithril,
             quest_def(QuestId::Depth).reward.mithril
         );
+    }
+
+    #[test]
+    fn step_reports_the_mountains_that_completed_a_quest() {
+        let mut w = setup();
+        accept_at_king(&mut w, QuestId::ForgeDoors);
+        let mut done = vec![];
+        step_quests(&mut w, &mut done);
+        assert!(done.is_empty());
+        fort(&mut w).made.doors = 2;
+        step_quests(&mut w, &mut done);
+        assert_eq!(done, vec![M]);
     }
 
     #[test]

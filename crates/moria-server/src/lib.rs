@@ -380,17 +380,13 @@ impl State {
             sim::apply_assignments(&mut self.w, &a);
         }
         let mut changes = self.commands();
-        // Quêtes actives avant le tick : une validation par la sim est signalée au joueur.
-        let active: Vec<_> = (self.w.fortresses.iter())
-            .filter_map(|(&m, f)| f.quest.map(|q| (m, q)))
-            .collect();
-        let deltas = sim::step(&mut self.w);
-        for (m, q) in active {
+        // Une validation par la sim est signalée au joueur.
+        let mut done = Vec::new();
+        let deltas = sim::step_quests(&mut self.w, &mut done);
+        for m in done {
             let f = &self.w.fortresses[&m];
-            if f.quest != Some(q) {
-                let (owner, now) = (f.owner, f.quest);
-                self.send(owner, ServerMsg::Quest(now));
-            }
+            let (owner, now) = (f.owner, f.quest);
+            self.send(owner, ServerMsg::Quest(now));
         }
         self.king();
         for b in self.inv.end_tick(&self.w) {

@@ -1,9 +1,9 @@
 //! Règles des quêtes du roi : pures, appelées par `sim` (entre `begin_tick` et `end_tick`,
 //! pour que la récompense parte dans le lot normal de l'inventaire).
 
-use moria_core::{GROUND_Z, TilePos};
 use moria_core::king::{Quest, QuestId, king_in_reach, quest_def};
 use moria_core::world::Fortress;
+use moria_core::{GROUND_Z, TilePos};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuestError {
@@ -191,9 +191,6 @@ mod tests {
         assert!(complete_if_ready(&mut f));
         assert!(!offered(&f).contains(&QuestId::ForgeDoors));
         assert_eq!(offered(&f).len(), 3);
-        assert_eq!(
-            accept(&mut f, QuestId::ForgeDoors),
-            Err(QuestError::Done)
-        );
+        assert_eq!(accept(&mut f, QuestId::ForgeDoors), Err(QuestError::Done));
     }
 }
