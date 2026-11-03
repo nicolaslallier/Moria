@@ -137,8 +137,6 @@ pub struct Vitals {
     pub jobs_done: u32,
 }
 
-// One Tick moved per tick per client: boxing it buys nothing.
-#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerMsg {
     Welcome {
