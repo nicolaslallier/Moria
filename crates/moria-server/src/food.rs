@@ -130,10 +130,15 @@ pub fn keep_harvest_designated(m: &mut Mountain, ch: &mut Changes) {
     // Past the designation cap: crops are bounded by the ground, and a famine hides every
     // other designation, so a capped harvest would never come.
     for q in on_ground(m, Tile::Crop) {
-        if let Entry::Vacant(e) = m.designations.entry(q) {
-            e.insert(DesignationKind::Chop);
-            ch.designations.insert(q, Some(DesignationKind::Chop));
-        }
+        designate_harvest(m, q, ch);
+    }
+}
+
+/// The harvest of the crop at `q`, past the designation cap (see `keep_harvest_designated`).
+pub fn designate_harvest(m: &mut Mountain, q: TilePos, ch: &mut Changes) {
+    if let Entry::Vacant(e) = m.designations.entry(q) {
+        e.insert(DesignationKind::Chop);
+        ch.designations.insert(q, Some(DesignationKind::Chop));
     }
 }
 

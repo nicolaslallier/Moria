@@ -3,7 +3,7 @@
 //! `run` is the bus side. With a bus, the container owns the food simulation and the server
 //! only checks its proposals against the grid.
 
-use crate::food::{apply_bus_events, snapshot};
+use crate::food::{apply_bus_events, designate_harvest, snapshot};
 use crate::metrics::{M, inc};
 use crate::sim::Changes;
 use futures::StreamExt;
@@ -163,7 +163,19 @@ impl Link {
                 let touched = &self.touched;
                 let stale = |q| touched.get(&(id, q)).is_some_and(|&t| ev.tick <= t);
                 let ch = out.entry(id).or_default();
-                apply_bus_events(m, f, &ev.list, stale, &mut ch.tiles)
+                let n = ch.tiles.len();
+                let rejected = apply_bus_events(m, f, &ev.list, stale, &mut ch.tiles);
+                // A crop just ripened asks for its harvest now, not at the next periodic
+                // check (`keep_harvest_designated` stays the backstop).
+                let ripe: Vec<_> = ch.tiles[n..]
+                    .iter()
+                    .filter(|&&(_, t)| t == Tile::Crop)
+                    .map(|&(q, _)| q)
+                    .collect();
+                for q in ripe {
+                    designate_harvest(m, q, ch);
+                }
+                rejected
             };
             // A move refused because its cow is gone (butchered after the container moved
             // it): the reject would put a ghost back at `from`, and the earlier CowRemoved
@@ -638,6 +650,32 @@ mod tests {
         let v = sent(&mut out);
         assert_eq!(rejects(&v)[0].list, vec![kept]);
         assert!(!v.iter().any(|o| matches!(o, Outgoing::Actions(_))));
+    }
+
+    #[test]
+    fn a_ripe_event_asks_for_its_harvest_at_once() {
+        use moria_core::DesignationKind;
+        let (mut l, (_out, inc)) = link();
+        let mut w = setup();
+        w.tick = 1_000; // the next tick (1_001) is no periodic check
+        let q = p(-3, 1, 0);
+        w.mountains.get_mut(&M).unwrap().set(q, Tile::Field);
+        inc.try_send(Incoming::Events(Events {
+            tick: 1_000,
+            mountain: M,
+            list: vec![FoodEvent::CropRipe { at: q }],
+        }))
+        .unwrap();
+        let ch = tick(&mut l, &mut w, &[], Instant::now());
+        assert_eq!(w.mountains[&M].get(q), Some(Tile::Crop));
+        assert_eq!(
+            w.mountains[&M].designations.get(&q),
+            Some(&DesignationKind::Chop)
+        );
+        assert_eq!(
+            ch[&M].designations.get(&q),
+            Some(&Some(DesignationKind::Chop))
+        );
     }
 
     #[test]
