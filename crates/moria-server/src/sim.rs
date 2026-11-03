@@ -685,13 +685,12 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
                             m.orders.insert(task.target, n);
                         }
                         ch.orders.insert(task.target, n);
+                        f.dwarves[i].jobs_done += 1;
                     } else if !blocked
                         && let Some(r) = dig_at(m, task.target, task.kind, &mut tiles, &mut ch)
                     {
                         f.resources.add(r);
                         f.resources.take(&task.kind.cost());
-                    }
-                    if !blocked {
                         f.dwarves[i].jobs_done += 1;
                     }
                     continue;
@@ -2476,6 +2475,24 @@ mod tests {
         assert_eq!(d.ticks_alive, 500);
         assert_eq!(d.jobs_done, 1);
         assert_eq!(w.fortresses[&M].dwarves[0].jobs_done, 0);
+    }
+
+    #[test]
+    fn vitals_jobs_done_ignores_a_dig_with_no_effect() {
+        let mut w = setup();
+        let rock = p(6, 1, 0);
+        designate(&mut w, rock, DesignationKind::Dig);
+        w.fortresses.get_mut(&M).unwrap().dwarves[1].pos = p(5, 1, 0);
+        assign(&mut w, 1, rock);
+        // Already dug (by the hero, say) before the dwarf finishes: nothing to do.
+        w.mountains.get_mut(&M).unwrap().set(rock, Tile::Floor);
+        w.tick = 1;
+        for _ in 0..500 {
+            step(&mut w);
+        }
+        let d = &w.fortresses[&M].dwarves[1];
+        assert!(d.task.is_none());
+        assert_eq!(d.jobs_done, 0);
     }
 
     #[test]
