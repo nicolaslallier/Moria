@@ -371,7 +371,7 @@ impl FoodSim {
 }
 
 /// On-disk format version of `food.bin`.
-/// 2: animals carry a species, a sex and a captured flag (1 was cows only; never deployed).
+/// 2: animals carry a species, a sex and a captured flag (1 was cows only; loads as empty).
 const FOOD_VERSION: u32 = 2;
 
 /// Hidden food state of every mountain, persisted as `food.bin`.
@@ -420,6 +420,8 @@ impl FoodStore {
         };
         match u32::from_le_bytes(*v) {
             FOOD_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+            // v1 (cows only) was deployed; its hidden state is rebuilt from the World.
+            1 => Ok(FoodStore::default()),
             n => Err(bad(format!("nourriture v{n} non supportée"))),
         }
     }
@@ -1160,6 +1162,26 @@ mod tests {
         bytes[..4].copy_from_slice(&(FOOD_VERSION + 1).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         assert!(FoodStore::load_or_default(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_v1_file_loads_as_an_empty_store() {
+        // v1 (cows only) is deployed: the hidden state is rebuilt from the server's World.
+        let path = tmp("v1");
+        std::fs::write(
+            &path,
+            1u32.to_le_bytes()
+                .iter()
+                .chain(&[9u8; 7])
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            FoodStore::load_or_default(&path).unwrap(),
+            FoodStore::default()
+        );
         std::fs::remove_file(&path).unwrap();
     }
 }
