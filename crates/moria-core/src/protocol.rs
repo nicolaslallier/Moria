@@ -142,8 +142,9 @@ pub enum ServerMsg {
     Reject(Reject),
     Snapshot(Box<FortressView>),
     Tick(TickDelta),
-    /// Answer to `ClientMsg::Inspect`; `None` = not found (unknown, dead or not yours).
-    Inspected(Option<Inspection>),
+    /// Answer to `ClientMsg::Inspect` about that target; `None` = not found (unknown, dead
+    /// or not yours).
+    Inspected(InspectTarget, Option<Inspection>),
 }
 
 /// u32 big-endian length prefix, then the postcard body.
@@ -229,15 +230,18 @@ mod tests {
     fn inspect_roundtrip() {
         let q = ClientMsg::Inspect(InspectTarget::Dwarf(DwarfId(7)));
         assert_eq!(decode::<ClientMsg>(&encode(&q)[4..]).unwrap(), q);
-        let a = ServerMsg::Inspected(Some(Inspection {
-            target: InspectTarget::Hero,
-            food: 3,
-            health: 4,
-            ticks_alive: 1 << 40,
-            jobs_done: 9,
-        }));
+        let a = ServerMsg::Inspected(
+            InspectTarget::Hero,
+            Some(Inspection {
+                target: InspectTarget::Hero,
+                food: 3,
+                health: 4,
+                ticks_alive: 1 << 40,
+                jobs_done: 9,
+            }),
+        );
         assert_eq!(decode::<ServerMsg>(&encode(&a)[4..]).unwrap(), a);
-        let none = ServerMsg::Inspected(None);
+        let none = ServerMsg::Inspected(InspectTarget::Hero, None);
         assert_eq!(decode::<ServerMsg>(&encode(&none)[4..]).unwrap(), none);
     }
     #[test]

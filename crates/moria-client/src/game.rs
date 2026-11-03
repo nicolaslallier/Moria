@@ -521,13 +521,14 @@ impl Game {
         Some(ClientMsg::Inspect(t))
     }
 
-    /// Server reply for the open panel: keep it for that target; `None` means it is gone.
-    pub fn on_inspected(&mut self, i: Option<Inspection>) {
+    /// Server reply about `t`: kept if `t` is the open panel's target (a late reply for a
+    /// closed or previous panel is dropped); `None` means it is gone.
+    pub fn on_inspected(&mut self, t: InspectTarget, i: Option<Inspection>) {
+        if self.inspect != Some(t) {
+            return;
+        }
         match i {
-            Some(i) if Some(i.target) == self.inspect => self.inspection = Some(i),
-            Some(_) => {}
-            // No panel open (closed while the request was in flight): nothing to report.
-            None if self.inspect.is_none() => {}
+            Some(i) => self.inspection = Some(i),
             None => {
                 self.close_menus_inspect();
                 self.say(tr("Disparu", "Gone"));
@@ -787,9 +788,9 @@ impl Session {
                 }
                 false
             }
-            NetEvent::Msg(ServerMsg::Inspected(i)) => {
+            NetEvent::Msg(ServerMsg::Inspected(t, i)) => {
                 if let Some(g) = &mut self.game {
-                    g.on_inspected(i);
+                    g.on_inspected(t, i);
                 }
                 false
             }
@@ -1040,7 +1041,13 @@ pub(crate) mod tests {
         let mut g = game();
         g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
         let mut s = playing(g);
-        s.handle(NetEvent::Msg(ServerMsg::Inspected(None)));
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        // A late "not found" for a previously inspected dwarf leaves this panel alone.
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(2), None)));
+        let g = s.game.as_ref().unwrap();
+        assert_eq!(g.inspect, Some(dw(1)));
+        assert_eq!(g.toast, None);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(1), None)));
         let g = s.game.unwrap();
         assert_eq!(g.inspect, None);
         assert_eq!(g.inspection, None);
@@ -1052,11 +1059,15 @@ pub(crate) mod tests {
         let mut g = game();
         g.inspect = Some(InspectTarget::Hero);
         let mut s = playing(g);
-        let other = inspection(InspectTarget::Dwarf(DwarfId(1)));
-        s.handle(NetEvent::Msg(ServerMsg::Inspected(Some(other))));
+        let dw = InspectTarget::Dwarf(DwarfId(1));
+        let other = inspection(dw);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw, Some(other))));
         assert_eq!(s.game.as_ref().unwrap().inspection, None);
         let mine = inspection(InspectTarget::Hero);
-        s.handle(NetEvent::Msg(ServerMsg::Inspected(Some(mine))));
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(
+            InspectTarget::Hero,
+            Some(mine),
+        )));
         assert_eq!(s.game.unwrap().inspection, Some(mine));
     }
 
@@ -1083,7 +1094,7 @@ pub(crate) mod tests {
     #[test]
     fn inspected_none_with_no_open_panel_shows_no_toast() {
         let mut g = game();
-        g.on_inspected(None);
+        g.on_inspected(InspectTarget::Hero, None);
         assert_eq!(g.toast, None);
     }
 

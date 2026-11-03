@@ -511,7 +511,7 @@ impl State {
                     .is_some_and(|m| self.w.fortresses[&m].hero.is_some());
                 if has_hero {
                     let r = sim::inspect(&self.w, player, target);
-                    self.send(player, ServerMsg::Inspected(r));
+                    self.send(player, ServerMsg::Inspected(target, r));
                 }
             }
         }
@@ -772,16 +772,22 @@ mod tests {
             player: PlayerId(0),
             target: InspectTarget::Dwarf(id),
         });
-        let Ok(ServerMsg::Inspected(Some(i))) = a.try_recv() else {
+        let Ok(ServerMsg::Inspected(t, Some(i))) = a.try_recv() else {
             panic!("asker gets Inspected")
         };
-        assert_eq!(i.target, InspectTarget::Dwarf(id));
+        assert_eq!(
+            (t, i.target),
+            (InspectTarget::Dwarf(id), InspectTarget::Dwarf(id))
+        );
         assert!(b.try_recv().is_err(), "nothing for the other player");
         s.request(Request::Inspect {
             player: PlayerId(1),
             target: InspectTarget::Dwarf(id),
         });
-        assert_eq!(b.try_recv().unwrap(), ServerMsg::Inspected(None));
+        assert_eq!(
+            b.try_recv().unwrap(),
+            ServerMsg::Inspected(InspectTarget::Dwarf(id), None)
+        );
         assert!(a.try_recv().is_err());
     }
 
