@@ -9,7 +9,7 @@ use moria_core::MountainId;
 use moria_core::food::{FoodSim, FoodStore};
 use moria_core::food_msg::{
     Actions, Events, KEY_ACTION, KEY_EVENTS, KEY_REJECT, KEY_STATE, KEY_TICK, KEY_WORLD,
-    MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
+    MAX_EVENT_AGE, MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::future::Future;
@@ -45,22 +45,30 @@ pub fn handle_world(store: &mut FoodStore, w: &World) {
 /// donc sous `MAX_FOOD_MSG_BYTES` (le serveur jette un message trop gros en entier).
 const EVENTS_PER_MSG: usize = 1000;
 
-/// Des `Events` (decoupes) par montagne connue qui propose quelque chose.
-pub fn handle_tick(store: &mut FoodStore, t: &Tick) -> Vec<Events> {
-    store
-        .mountains
-        .iter_mut()
-        .flat_map(|(&mountain, sim)| {
-            sim.step(t.tick)
-                .chunks(EVENTS_PER_MSG)
-                .map(|c| Events {
-                    tick: t.tick,
-                    mountain,
-                    list: c.to_vec(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// Des `Events` (decoupes) par montagne connue et par tick qui propose quelque chose.
+/// `food.tick` ne garde que le dernier message : les ticks sautes depuis `last` sont rattrapes,
+/// mais pas plus loin que `MAX_EVENT_AGE` (le serveur refuserait ces propositions en entier),
+/// donc 5 pas de vaches au plus par message. Un tick qui recule (serveur redemarre) n'avance
+/// que ce tick-la. Jamais le tick d'un instantane adopte ni avant : il le contient deja, et un
+/// refus portant ce tick vient d'une proposition anterieure (voir `handle_reject`).
+pub fn handle_tick(store: &mut FoodStore, last: u64, t: &Tick) -> Vec<Events> {
+    let from = if t.tick > last {
+        last.max(t.tick.saturating_sub(MAX_EVENT_AGE))
+    } else {
+        t.tick.saturating_sub(1)
+    };
+    let mut out = vec![];
+    for (&mountain, sim) in store.mountains.iter_mut() {
+        let start = from.max(sim.adopted_at()).saturating_add(1);
+        for k in start..=t.tick {
+            out.extend(sim.step(k).chunks(EVENTS_PER_MSG).map(|c| Events {
+                tick: k,
+                mountain,
+                list: c.to_vec(),
+            }));
+        }
+    }
+    out
 }
 
 /// Montagne connue et message pas plus ancien que son dernier instantane (qui le contient deja).
@@ -77,8 +85,10 @@ pub fn handle_action(store: &mut FoodStore, a: &Actions) {
     }
 }
 
+/// Strictement apres l'instantane : un refus portant son tick vise une proposition faite avant
+/// son adoption (aucun pas n'est fait a ce tick ensuite), deja effacee par l'adoption.
 pub fn handle_reject(store: &mut FoodStore, r: &Rejects) {
-    if let Some(sim) = current(store, r.mountain, r.tick) {
+    if let Some(sim) = current(store, r.mountain, r.tick).filter(|s| r.tick > s.adopted_at()) {
         sim.reject(&r.list);
     }
 }
@@ -114,8 +124,8 @@ pub fn handle(
             // Avant le premier `World` : `food.bin` peut dater d'une minute, ne rien proposer.
             if let (Some(t), Some(last)) = (read::<Tick>(key, bytes, MAX_FOOD_MSG_BYTES), last_tick)
             {
-                *last = t.tick;
-                return handle_tick(store, &t);
+                let prev = std::mem::replace(last, t.tick);
+                return handle_tick(store, prev, &t);
             }
         }
         KEY_WORLD => {
@@ -172,7 +182,8 @@ async fn subscribe_all(
     Ok(futures::stream::select_all(subs))
 }
 
-/// Etat cache en memoire, `food.bin` sauvegarde toutes les `SAVE_EVERY` et a l'arret.
+/// Etat cache en memoire, `food.bin` sauvegarde toutes les `SAVE_EVERY` (a cote de la boucle)
+/// et a l'arret (avant la fermeture du broker).
 pub async fn run(
     amqp_url: String,
     data: PathBuf,
@@ -203,10 +214,12 @@ pub async fn run(
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     autosave.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_tick = None;
+    // Sauvegarde periodique hors de la boucle (fsync) : un `food.tick` n'attend pas le disque.
+    let mut saving: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let bus = tokio::select! {
             b = Bus::connect_forever(&amqp_url) => b,
-            () = &mut shutdown => return save(&store, &data),
+            () = &mut shutdown => return save(&store, &data, &mut saving).await,
         };
         let mut stop = false;
         match subscribe_all(&bus).await {
@@ -222,8 +235,14 @@ pub async fn run(
                         publish(&bus, KEY_STATE, &status(last_tick)).await;
                     }
                     _ = autosave.tick() => {
-                        if let Err(e) = store.save(&data) {
-                            tracing::error!("sauvegarde de la nourriture impossible: {e}");
+                        // La precedente encore en cours : celle-ci attend le tour suivant.
+                        if saving.as_ref().is_none_or(|h| h.is_finished()) {
+                            let (st, path) = (store.clone(), data.clone());
+                            saving = Some(tokio::task::spawn_blocking(move || {
+                                if let Err(e) = st.save(&path) {
+                                    tracing::error!("sauvegarde de la nourriture impossible: {e}");
+                                }
+                            }));
                         }
                     }
                     m = inbox.next() => {
@@ -237,23 +256,31 @@ pub async fn run(
         }
         if stop {
             // Sauvegarde d'abord : la fermeture du broker ne doit pas pouvoir la retarder.
-            let r = save(&store, &data);
+            let r = save(&store, &data, &mut saving).await;
             let _ = tokio::time::timeout(Duration::from_secs(2), bus.close()).await;
             return r;
         }
         tokio::select! {
             () = bus.close() => {}
-            () = &mut shutdown => return save(&store, &data),
+            () = &mut shutdown => return save(&store, &data, &mut saving).await,
         }
         tracing::warn!("flux interrompu, reconnexion");
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(2)) => {}
-            () = &mut shutdown => return save(&store, &data),
+            () = &mut shutdown => return save(&store, &data, &mut saving).await,
         }
     }
 }
 
-fn save(store: &FoodStore, data: &Path) -> anyhow::Result<()> {
+/// Sauvegarde finale, synchrone, apres la periodique en cours (meme fichier temporaire).
+async fn save(
+    store: &FoodStore,
+    data: &Path,
+    saving: &mut Option<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    if let Some(h) = saving.take() {
+        let _ = h.await;
+    }
     store.save(data).context("sauvegarde finale impossible")
 }
 
@@ -292,17 +319,20 @@ mod tests {
     #[test]
     fn tick_steps_every_known_mountain() {
         let mut s = FoodStore::default();
-        assert!(handle_tick(&mut s, &Tick { tick: 10 }).is_empty(), "vide");
+        assert!(
+            handle_tick(&mut s, 9, &Tick { tick: 10 }).is_empty(),
+            "vide"
+        );
         handle_world(
             &mut s,
             &world(0, vec![(A, vec![cow(5, 5)]), (B, vec![cow(9, 9)])]),
         );
-        let evs = handle_tick(&mut s, &Tick { tick: 10 });
+        let evs = handle_tick(&mut s, 9, &Tick { tick: 10 });
         let ms: Vec<_> = evs.iter().map(|e| e.mountain).collect();
         assert_eq!(ms, vec![A, B]);
         assert!(evs.iter().all(|e| e.tick == 10 && !e.list.is_empty()));
         // Pas de pas de vache hors des multiples de COW_EVERY : rien a publier.
-        assert!(handle_tick(&mut s, &Tick { tick: 11 }).is_empty());
+        assert!(handle_tick(&mut s, 10, &Tick { tick: 11 }).is_empty());
     }
 
     #[test]
@@ -346,7 +376,7 @@ mod tests {
             },
         );
         assert_eq!(s, FoodStore::default());
-        assert!(handle_tick(&mut s, &Tick { tick: 100 }).is_empty());
+        assert!(handle_tick(&mut s, 99, &Tick { tick: 100 }).is_empty());
     }
 
     #[test]
@@ -375,8 +405,89 @@ mod tests {
         };
         handle_reject(&mut s, &born(99));
         assert!(s.mountains[&A].has_cow(p(1, 1)), "refus perime applique");
+        // Stamped with the snapshot's own tick: proposed before it was adopted (the
+        // container never steps that tick once it holds the snapshot).
         handle_reject(&mut s, &born(100));
+        assert!(
+            s.mountains[&A].has_cow(p(1, 1)),
+            "refus d'avant l'instantane"
+        );
+        handle_reject(&mut s, &born(101));
         assert!(!s.mountains[&A].has_cow(p(1, 1)));
+    }
+
+    fn crop(x: i16, y: i16) -> Cell {
+        Cell {
+            pos: p(x, y),
+            kind: CellKind::Crop,
+        }
+    }
+    fn enc_tick(t: u64) -> Vec<u8> {
+        postcard::to_allocvec(&Tick { tick: t }).unwrap()
+    }
+    fn enc_world(w: &World) -> Vec<u8> {
+        postcard::to_allocvec(w).unwrap()
+    }
+    fn stamps(evs: &[Events]) -> Vec<u64> {
+        let mut v: Vec<u64> = evs.iter().map(|e| e.tick).collect();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn the_snapshot_tick_is_never_stepped() {
+        let mut s = FoodStore::default();
+        let mut last = None;
+        let w = world(100, vec![(A, vec![cow(5, 5), crop(1, 1)])]);
+        handle(&mut s, &mut last, KEY_WORLD, &enc_world(&w));
+        assert!(handle(&mut s, &mut last, KEY_TICK, &enc_tick(100)).is_empty());
+        assert_eq!(
+            stamps(&handle(&mut s, &mut last, KEY_TICK, &enc_tick(110))),
+            [110]
+        );
+        // a later snapshot of a tick already stepped: nothing is stepped up to it again
+        handle(
+            &mut s,
+            &mut last,
+            KEY_WORLD,
+            &enc_world(&world(110, w.mountains)),
+        );
+        assert!(handle(&mut s, &mut last, KEY_TICK, &enc_tick(110)).is_empty());
+    }
+
+    #[test]
+    fn coalesced_ticks_are_caught_up() {
+        let mut s = FoodStore::default();
+        let mut last = None;
+        let w = world(0, vec![(A, vec![cow(5, 5), crop(1, 1)])]);
+        handle(&mut s, &mut last, KEY_WORLD, &enc_world(&w));
+        handle(&mut s, &mut last, KEY_TICK, &enc_tick(95));
+        // 100 (cows and growth) was skipped by the latest-only queue
+        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(105));
+        assert_eq!(stamps(&evs), [100]);
+        assert!(evs[0].list.contains(&FoodEvent::CropRipe { at: p(1, 1) }));
+        assert!(
+            evs[0]
+                .list
+                .iter()
+                .any(|e| !matches!(e, FoodEvent::CropRipe { .. }))
+        );
+    }
+
+    #[test]
+    fn catch_up_stops_at_the_age_the_server_still_accepts() {
+        use moria_core::food_msg::MAX_EVENT_AGE;
+        let mut s = FoodStore::default();
+        let mut last = None;
+        let w = world(0, vec![(A, vec![cow(5, 5), crop(1, 1)])]);
+        handle(&mut s, &mut last, KEY_WORLD, &enc_world(&w));
+        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(100_000));
+        let st = stamps(&evs);
+        assert_eq!(st.last(), Some(&100_000));
+        assert!(st.iter().all(|&t| t + MAX_EVENT_AGE >= 100_000), "{st:?}");
+        // going back (the server restarted from an older save): that tick only
+        let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(50_000));
+        assert_eq!(stamps(&evs), [50_000]);
     }
 
     fn seeded() -> FoodStore {
@@ -470,7 +581,7 @@ mod tests {
         let tick = 100 * u64::from(u32::MAX); // multiple de COW_EVERY et GROW_EVERY
         let expected = s.mountains[&m].clone().step(tick);
         assert!(expected.len() > 6000);
-        let msgs = handle_tick(&mut s, &Tick { tick });
+        let msgs = handle_tick(&mut s, tick - 1, &Tick { tick });
         assert!(msgs.len() > 1);
         for e in &msgs {
             let b = postcard::to_allocvec(e).unwrap();

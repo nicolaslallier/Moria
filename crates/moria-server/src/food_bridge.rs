@@ -27,7 +27,7 @@ pub const WORLD_RETRY: Duration = Duration::from_secs(5);
 /// Events proposed for a tick older than this (5 s) are refused whole.
 // ponytail: tick-based staleness per tile, no entity ids; ids if two lives of one tile within
 // 5 s ever matter.
-pub const MAX_EVENT_AGE: u64 = 50;
+pub use moria_core::food_msg::MAX_EVENT_AGE;
 /// Most incoming messages taken per tick (and the incoming channel's capacity).
 pub const MAX_IN_PER_TICK: usize = 64;
 /// Outgoing channel capacity: a tick, a few actions and rejects per tick.

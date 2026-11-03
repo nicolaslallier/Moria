@@ -13,6 +13,8 @@ pub const KEY_STATE: &str = "food.state";
 /// broker's message size limit (RabbitMQ default: 16 MiB in 4.x, 128 MiB before).
 pub const MAX_FOOD_WORLD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_FOOD_MSG_BYTES: usize = 16_384;
+/// The server refuses whole the events proposed more than this many ticks (5 s) ago.
+pub const MAX_EVENT_AGE: u64 = 50;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Tick {
