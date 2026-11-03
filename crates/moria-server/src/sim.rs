@@ -201,8 +201,7 @@ pub fn apply_command(w: &mut World, m: MountainId, c: Command) -> Changes {
         }
         Command::Use(_) | Command::Order { .. } => {}
         Command::AcceptQuest(id) if king_in_reach(f.king, h.pos) => {
-            let o = quest::offered(f);
-            let _ = quest::accept(f, id, &o); // un refus ne change rien
+            let _ = quest::accept(f, id); // un refus ne change rien
         }
         Command::AcceptQuest(_) => {}
         Command::TurnIn => {

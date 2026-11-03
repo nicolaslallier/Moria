@@ -11,7 +11,6 @@ pub enum QuestError {
     Active,
     /// Quête déjà terminée : chacune ne se fait qu'une fois par montagne.
     Done,
-    NotOffered,
 }
 
 /// Les quêtes du catalogue pas encore terminées.
@@ -36,15 +35,13 @@ fn measure(f: &Fortress, id: QuestId) -> u32 {
     }
 }
 
-pub fn accept(f: &mut Fortress, id: QuestId, offered: &[QuestId]) -> Result<(), QuestError> {
+/// Le catalogue est fermé : une quête ni active ni terminée est forcément offerte.
+pub fn accept(f: &mut Fortress, id: QuestId) -> Result<(), QuestError> {
     if f.quest.is_some() {
         return Err(QuestError::Active);
     }
     if f.done.contains(&id) {
         return Err(QuestError::Done);
-    }
-    if !offered.contains(&id) {
-        return Err(QuestError::NotOffered);
     }
     // Seules les quêtes de forge ont une baseline.
     let baseline = match id {
@@ -120,9 +117,8 @@ mod tests {
     #[test]
     fn accept_refuses_a_second_active_quest() {
         let mut f = fortress();
-        let o = offered(&f);
-        assert_eq!(accept(&mut f, QuestId::Food, &o), Ok(()));
-        assert_eq!(accept(&mut f, QuestId::Depth, &o), Err(QuestError::Active));
+        assert_eq!(accept(&mut f, QuestId::Food), Ok(()));
+        assert_eq!(accept(&mut f, QuestId::Depth), Err(QuestError::Active));
         assert_eq!(f.quest.map(|q| q.id), Some(QuestId::Food));
     }
 
@@ -130,18 +126,7 @@ mod tests {
     fn accept_refuses_a_finished_quest() {
         let mut f = fortress();
         f.done.push(QuestId::Depth);
-        let all = QuestId::ALL;
-        assert_eq!(accept(&mut f, QuestId::Depth, &all), Err(QuestError::Done));
-        assert!(f.quest.is_none());
-    }
-
-    #[test]
-    fn accept_refuses_a_quest_not_offered() {
-        let mut f = fortress();
-        assert_eq!(
-            accept(&mut f, QuestId::Food, &[QuestId::Depth]),
-            Err(QuestError::NotOffered)
-        );
+        assert_eq!(accept(&mut f, QuestId::Depth), Err(QuestError::Done));
         assert!(f.quest.is_none());
     }
 
@@ -149,8 +134,7 @@ mod tests {
     fn baseline_is_the_production_counter_at_acceptance() {
         let mut f = fortress();
         f.made.ingots = 7;
-        let o = offered(&f);
-        accept(&mut f, QuestId::ForgeIngots, &o).unwrap();
+        accept(&mut f, QuestId::ForgeIngots).unwrap();
         assert_eq!(f.quest.unwrap().baseline, 7);
         assert_eq!(progress(&f), Some((0, 5)));
         f.made.ingots = 9;
@@ -165,8 +149,7 @@ mod tests {
         f.resources.food = 100;
         // Pas de quête de nourriture active.
         assert!(!turn_in(&mut f, king));
-        let o = offered(&f);
-        accept(&mut f, QuestId::Food, &o).unwrap();
+        accept(&mut f, QuestId::Food).unwrap();
         let far = far(&f);
         assert!(!turn_in(&mut f, far), "hors de portée");
         f.resources.food = 19;
@@ -182,8 +165,7 @@ mod tests {
     fn food_turn_in_removes_the_food_and_pays_once() {
         let mut f = fortress();
         let king = f.king;
-        let o = offered(&f);
-        accept(&mut f, QuestId::Food, &o).unwrap();
+        accept(&mut f, QuestId::Food).unwrap();
         f.resources.food = 25;
         assert!(turn_in(&mut f, king));
         let mut want = Resources {
@@ -204,15 +186,13 @@ mod tests {
     fn completed_quest_is_not_offered_again() {
         let mut f = fortress();
         assert_eq!(offered(&f), QuestId::ALL.to_vec());
-        let o = offered(&f);
-        accept(&mut f, QuestId::ForgeDoors, &o).unwrap();
+        accept(&mut f, QuestId::ForgeDoors).unwrap();
         f.made.doors = 2;
         assert!(complete_if_ready(&mut f));
         assert!(!offered(&f).contains(&QuestId::ForgeDoors));
         assert_eq!(offered(&f).len(), 3);
-        let o = offered(&f);
         assert_eq!(
-            accept(&mut f, QuestId::ForgeDoors, &o),
+            accept(&mut f, QuestId::ForgeDoors),
             Err(QuestError::Done)
         );
     }
