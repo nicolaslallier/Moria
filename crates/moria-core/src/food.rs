@@ -27,6 +27,8 @@ pub const BIRTH_ODDS: u64 = 20;
 pub const MATE_RANGE: i16 = 2;
 /// Flock ceiling per species and mountain.
 pub const HERD_CAP: usize = 24;
+/// Captures announced for tiles with no animal yet (a World still in flight), at most.
+const PENDING_CAP: usize = 4 * HERD_CAP;
 
 /// ponytail: a hash of a tile and a step number (splitmix64 finalizer) stands in for an RNG.
 /// Deterministic and stateless; a seeded RNG if it ever shows patterns.
@@ -175,8 +177,23 @@ impl FoodSim {
 
     /// Stopgap until the server tells which animals are penned: every adopted animal counts as
     /// penned, so herds breed as they did before species. Remove with the pen wiring.
+    /// A species left with a single sex gets one flipped (first by position) so it can breed.
     pub fn pen_all(&mut self) {
         self.animals.values_mut().for_each(|a| a.captured = true);
+        for sp in [Species::Cow, Species::Sheep, Species::Chicken] {
+            let mut of: Vec<&mut AnimalState> = self
+                .animals
+                .values_mut()
+                .filter(|a| a.species == sp)
+                .collect();
+            if of.len() > 1 && of.iter().all(|a| a.sex == of[0].sex) {
+                of[0].sex = if of[0].sex == Sex::Male {
+                    Sex::Female
+                } else {
+                    Sex::Male
+                };
+            }
+        }
     }
 
     /// Idempotent; the server's view wins.
@@ -187,9 +204,10 @@ impl FoodSim {
             }
             FoodAction::AnimalCaptured(p) => match self.animals.get_mut(&p) {
                 Some(a) => a.captured = true,
-                None => {
+                None if self.pending_captures.len() < PENDING_CAP => {
                     self.pending_captures.insert(p);
                 }
+                None => {}
             },
             FoodAction::FieldSown(p) | FoodAction::FieldHarvested(p) => {
                 self.fields.insert(p, FieldState { ripe: false });
@@ -254,23 +272,23 @@ impl FoodSim {
                 TilePos::new(q.x.saturating_add(dx), q.y.saturating_add(dy), q.z)
             };
             let adult = |a: &AnimalState| a.captured && tick >= a.born.saturating_add(ADULT_TICKS);
-            let herd = self
-                .animals
-                .values()
-                .filter(|a| a.species == st.species)
-                .count();
             if breeds
                 && st.sex == Sex::Female
                 && adult(&st)
                 && tick >= st.fertile_at
                 && (h >> 8).is_multiple_of(BIRTH_ODDS)
-                && herd < HERD_CAP
+                && self
+                    .animals
+                    .values()
+                    .filter(|a| a.species == st.species)
+                    .count()
+                    < HERD_CAP
                 && self.animals.iter().any(|(m, a)| {
                     a.species == st.species
                         && a.sex == Sex::Male
                         && adult(a)
                         && m.z == q.z
-                        && (m.x - q.x).abs().max((m.y - q.y).abs()) <= MATE_RANGE
+                        && m.x.abs_diff(q.x).max(m.y.abs_diff(q.y)) <= MATE_RANGE as u16
                 })
             {
                 let at = near(h >> 16);
@@ -707,6 +725,36 @@ mod tests {
             count(&mut s, SUMMER, SUMMER + 40_000, is_birth) > 0,
             "penned herd"
         );
+    }
+
+    #[test]
+    fn pen_all_gives_a_one_sex_herd_a_mate() {
+        let mut s = FoodSim::new(1);
+        s.adopt(&herd(6), SUMMER);
+        s.animals.values_mut().for_each(|a| a.sex = Sex::Female);
+        s.pen_all();
+        assert!(s.animals.values().any(|a| a.sex == Sex::Male));
+        assert!(s.animals.values().any(|a| a.sex == Sex::Female));
+        s.pen_all(); // stable: a second call changes nothing
+        assert_eq!(s.animals.values().filter(|a| a.sex == Sex::Male).count(), 1);
+    }
+
+    #[test]
+    fn mate_search_survives_extreme_coordinates() {
+        let mut s = FoodSim::new(1);
+        let far = |x| cell(TilePos::new(x, 0, 0), CellKind::Cow);
+        s.adopt(&[far(i16::MIN), far(i16::MAX), far(0)], SUMMER);
+        s.pen_all();
+        (SUMMER..SUMMER + 5_000).for_each(|t| drop(s.step(t)));
+    }
+
+    #[test]
+    fn forged_captures_of_empty_tiles_stay_bounded() {
+        let mut s = FoodSim::new(1);
+        for x in 0..5_000 {
+            s.apply_action(&FoodAction::AnimalCaptured(p(x, 0)));
+        }
+        assert!(s.pending_captures.len() <= HERD_CAP * 4);
     }
 
     #[test]

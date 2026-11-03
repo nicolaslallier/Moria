@@ -51,7 +51,7 @@ const EVENTS_PER_MSG: usize = 1000;
 /// `ANIMAL_EVERY` derniers seulement, soit au plus un pas de vaches et une verification de
 /// croissance (les plus recents). Enchainer plusieurs pas a l'aveugle avant le retour des
 /// refus ferait oublier au conteneur une vache bloquee ; un pas manque de temps en temps est
-/// sans consequence. Un tick qui recule (serveur redemarre) n'avance que ce tick-la. Jamais le
+/// sans consequence (l hiver les pas de bete tombent sur les multiples de 2 * `ANIMAL_EVERY` : la fenetre en rate alors un sur deux, sans gravite). Un tick qui recule (serveur redemarre) n'avance que ce tick-la. Jamais le
 /// tick d'un instantane adopte ni avant : il le contient deja, et un refus portant ce tick
 /// vient d'une proposition anterieure (voir `handle_reject`).
 pub fn handle_tick(store: &mut FoodStore, last: u64, t: &Tick) -> Vec<Events> {
