@@ -6,7 +6,7 @@ use anyhow::Context;
 use futures::{Stream, StreamExt};
 use moria_bus::{Bus, Queue, redact_url};
 use moria_core::MountainId;
-use moria_core::food::{COW_EVERY, FoodSim, FoodStore};
+use moria_core::food::{ANIMAL_EVERY, FoodSim, FoodStore};
 use moria_core::food_msg::{
     Actions, Events, KEY_ACTION, KEY_EVENTS, KEY_REJECT, KEY_STATE, KEY_TICK, KEY_WORLD,
     MAX_FOOD_MSG_BYTES, MAX_FOOD_WORLD_BYTES, Rejects, Status, Tick, World, decode,
@@ -33,11 +33,12 @@ pub fn handle_world(store: &mut FoodStore, w: &World) {
         .mountains
         .retain(|m, _| w.mountains.iter().any(|(l, _)| l == m));
     for (m, cells) in &w.mountains {
-        store
+        let sim = store
             .mountains
             .entry(*m)
-            .or_insert_with(|| FoodSim::new(seed(*m)))
-            .adopt(cells, w.tick);
+            .or_insert_with(|| FoodSim::new(seed(*m)));
+        sim.adopt(cells, w.tick);
+        sim.pen_all();
     }
 }
 
@@ -47,15 +48,15 @@ const EVENTS_PER_MSG: usize = 1000;
 
 /// Des `Events` (decoupes) par montagne connue et par tick qui propose quelque chose.
 /// `food.tick` ne garde que le dernier message : un saut depuis `last` rattrape les ticks des
-/// `COW_EVERY` derniers seulement, soit au plus un pas de vaches et une verification de
+/// `ANIMAL_EVERY` derniers seulement, soit au plus un pas de vaches et une verification de
 /// croissance (les plus recents). Enchainer plusieurs pas a l'aveugle avant le retour des
 /// refus ferait oublier au conteneur une vache bloquee ; un pas manque de temps en temps est
-/// sans consequence. Un tick qui recule (serveur redemarre) n'avance que ce tick-la. Jamais le
+/// sans consequence (l hiver les pas de bete tombent sur les multiples de 2 * `ANIMAL_EVERY` : la fenetre en rate alors un sur deux, sans gravite). Un tick qui recule (serveur redemarre) n'avance que ce tick-la. Jamais le
 /// tick d'un instantane adopte ni avant : il le contient deja, et un refus portant ce tick
 /// vient d'une proposition anterieure (voir `handle_reject`).
 pub fn handle_tick(store: &mut FoodStore, last: u64, t: &Tick) -> Vec<Events> {
     let from = if t.tick > last {
-        last.max(t.tick.saturating_sub(COW_EVERY))
+        last.max(t.tick.saturating_sub(ANIMAL_EVERY))
     } else {
         t.tick.saturating_sub(1)
     };
@@ -338,7 +339,7 @@ mod tests {
         let ms: Vec<_> = evs.iter().map(|e| e.mountain).collect();
         assert_eq!(ms, vec![A, B]);
         assert!(evs.iter().all(|e| e.tick == 10 && !e.list.is_empty()));
-        // Pas de pas de vache hors des multiples de COW_EVERY : rien a publier.
+        // Pas de pas de vache hors des multiples de ANIMAL_EVERY : rien a publier.
         assert!(handle_tick(&mut s, 10, &Tick { tick: 11 }).is_empty());
     }
 
@@ -379,7 +380,10 @@ mod tests {
             &Rejects {
                 tick: 5,
                 mountain: A,
-                list: vec![FoodEvent::CowBorn { at: p(1, 1) }],
+                list: vec![FoodEvent::AnimalBorn {
+                    species: moria_core::food::Species::Cow,
+                    at: p(1, 1),
+                }],
             },
         );
         assert_eq!(s, FoodStore::default());
@@ -408,19 +412,22 @@ mod tests {
         let born = |tick| Rejects {
             tick,
             mountain: A,
-            list: vec![FoodEvent::CowBorn { at: p(1, 1) }],
+            list: vec![FoodEvent::AnimalBorn {
+                species: moria_core::food::Species::Cow,
+                at: p(1, 1),
+            }],
         };
         handle_reject(&mut s, &born(99));
-        assert!(s.mountains[&A].has_cow(p(1, 1)), "refus perime applique");
+        assert!(s.mountains[&A].has_animal(p(1, 1)), "refus perime applique");
         // Stamped with the snapshot's own tick: proposed before it was adopted (the
         // container never steps that tick once it holds the snapshot).
         handle_reject(&mut s, &born(100));
         assert!(
-            s.mountains[&A].has_cow(p(1, 1)),
+            s.mountains[&A].has_animal(p(1, 1)),
             "refus d'avant l'instantane"
         );
         handle_reject(&mut s, &born(101));
-        assert!(!s.mountains[&A].has_cow(p(1, 1)));
+        assert!(!s.mountains[&A].has_animal(p(1, 1)));
     }
 
     fn crop(x: i16, y: i16) -> Cell {
@@ -494,17 +501,20 @@ mod tests {
             postcard::to_allocvec(&Rejects {
                 tick,
                 mountain: A,
-                list: vec![FoodEvent::CowBorn { at: p(x, x) }],
+                list: vec![FoodEvent::AnimalBorn {
+                    species: moria_core::food::Species::Cow,
+                    at: p(x, x),
+                }],
             })
             .unwrap()
         };
         handle(&mut s, &mut last, KEY_REJECT, &born(106, 1));
         assert!(
-            s.mountains[&A].has_cow(p(1, 1)),
+            s.mountains[&A].has_animal(p(1, 1)),
             "reject from the future applied"
         );
         handle(&mut s, &mut last, KEY_REJECT, &born(105, 3));
-        assert!(!s.mountains[&A].has_cow(p(3, 3)));
+        assert!(!s.mountains[&A].has_animal(p(3, 3)));
         // Actions are stamped by the server and may outrun its Tick (another queue): kept.
         let a = Actions {
             tick: 106,
@@ -521,10 +531,25 @@ mod tests {
     }
 
     #[test]
+    fn an_adopted_herd_breeds_in_summer() {
+        // stopgap: the server does not say which animals are penned yet, so all of them are
+        use moria_core::calendar::SEASON_TICKS;
+        let summer = SEASON_TICKS;
+        let mut s = FoodStore::default();
+        let herd: Vec<Cell> = (0..12).map(|i| cow(i * 2, 0)).collect();
+        handle_world(&mut s, &world(summer, vec![(A, herd)]));
+        let born = (summer..summer + 40_000)
+            .flat_map(|t| handle_tick(&mut s, t - 1, &Tick { tick: t }))
+            .flat_map(|e| e.list)
+            .any(|e| matches!(e, FoodEvent::AnimalBorn { .. }));
+        assert!(born, "no birth from an adopted herd");
+    }
+
+    #[test]
     fn a_big_gap_catches_up_one_cow_step_only() {
         // Chained blind steps before any reject returns would make the container forget a
-        // penned cow: one step per mountain, the newest, never older than COW_EVERY.
-        use moria_core::food::COW_EVERY;
+        // penned cow: one step per mountain, the newest, never older than ANIMAL_EVERY.
+        use moria_core::food::ANIMAL_EVERY;
         let mut s = FoodStore::default();
         let mut last = None;
         let w = world(
@@ -536,7 +561,7 @@ mod tests {
         let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(160));
         let per: Vec<_> = evs.iter().map(|e| (e.mountain, e.tick)).collect();
         assert_eq!(per, [(A, 160), (B, 160)]);
-        assert!(evs.iter().all(|e| e.tick + COW_EVERY > 160));
+        assert!(evs.iter().all(|e| e.tick + ANIMAL_EVERY > 160));
         // far gap: the newest step, nothing older
         let evs = handle(&mut s, &mut last, KEY_TICK, &enc_tick(100_005));
         assert_eq!(stamps(&evs), [100_000]);
@@ -633,7 +658,7 @@ mod tests {
         let m = MountainId(u16::MAX);
         let mut s = FoodStore::default();
         handle_world(&mut s, &world(0, vec![(m, cells)]));
-        let tick = 100 * u64::from(u32::MAX); // multiple de COW_EVERY et GROW_EVERY
+        let tick = 100 * u64::from(u32::MAX); // multiple de ANIMAL_EVERY et GROW_EVERY
         let expected = s.mountains[&m].clone().step(tick);
         assert!(expected.len() > 6000);
         let msgs = handle_tick(&mut s, tick - 1, &Tick { tick });

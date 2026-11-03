@@ -461,7 +461,7 @@ fn dig_at(
 fn food_action(q: TilePos, old: Option<Tile>, now: Tile) -> Option<FoodAction> {
     let farm = |t| matches!(t, Some(Tile::Field | Tile::Crop));
     match (old, now) {
-        (Some(Tile::Cow), _) => Some(FoodAction::CowRemoved(q)),
+        (Some(Tile::Cow), _) => Some(FoodAction::AnimalRemoved(q)),
         (Some(Tile::Crop), Tile::Field) => Some(FoodAction::FieldHarvested(q)),
         (o, Tile::Field) if !farm(o) => Some(FoodAction::FieldSown(q)),
         (o, n) if farm(o) && !farm(Some(n)) => Some(FoodAction::FieldRemoved(q)),

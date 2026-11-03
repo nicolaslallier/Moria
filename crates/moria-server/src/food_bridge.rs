@@ -196,14 +196,17 @@ impl Link {
                 rejected
             };
             // A move refused because its cow is gone (butchered after the container moved
-            // it): the reject would put a ghost back at `from`, and the earlier CowRemoved
+            // it): the reject would put a ghost back at `from`, and the earlier AnimalRemoved
             // missed it. Remove both ends; rejects and actions travel on separate queues, so
             // this holds in either order of arrival.
             let fix: Vec<FoodAction> = rejected
                 .iter()
                 .filter_map(|e| match *e {
-                    FoodEvent::CowMoved { from, to } if m.get(from) != Some(Tile::Cow) => {
-                        Some([FoodAction::CowRemoved(from), FoodAction::CowRemoved(to)])
+                    FoodEvent::AnimalMoved { from, to } if m.get(from) != Some(Tile::Cow) => {
+                        Some([
+                            FoodAction::AnimalRemoved(from),
+                            FoodAction::AnimalRemoved(to),
+                        ])
                     }
                     _ => None,
                 })
@@ -614,11 +617,11 @@ mod tests {
         w.tick = 1_000;
         let c = p(-6, 1, 0);
         cow_pen(&mut w, c, &[Dir::N]);
-        let good = FoodEvent::CowMoved {
+        let good = FoodEvent::AnimalMoved {
             from: c,
             to: c.step(Dir::N),
         };
-        let bad = FoodEvent::CowMoved {
+        let bad = FoodEvent::AnimalMoved {
             from: c,
             to: c.step(Dir::S), // a tree
         };
@@ -648,7 +651,7 @@ mod tests {
         assert_eq!(r[0].list, vec![bad]);
 
         // too old: refused whole, even a valid move
-        let back = FoodEvent::CowMoved {
+        let back = FoodEvent::AnimalMoved {
             from: c.step(Dir::N),
             to: c,
         };
@@ -688,12 +691,12 @@ mod tests {
         w.tick = 1_000;
         let c = p(-6, 1, 0);
         cow_pen(&mut w, c, &[Dir::N]);
-        let kept = FoodEvent::CowMoved {
+        let kept = FoodEvent::AnimalMoved {
             from: c,
             to: c.step(Dir::S), // a tree: refused, but the cow is still there
         };
         w.mountains.get_mut(&M).unwrap().set(c, Tile::Grass); // butchered meanwhile
-        let gone = FoodEvent::CowMoved {
+        let gone = FoodEvent::AnimalMoved {
             from: c,
             to: c.step(Dir::N),
         };
@@ -711,7 +714,7 @@ mod tests {
             .unwrap();
         let fix = v.iter().position(|o| {
             matches!(o, Outgoing::Actions(a) if a.mountain == M && a.tick == w.tick
-                && a.list == vec![FoodAction::CowRemoved(c), FoodAction::CowRemoved(c.step(Dir::N))])
+                && a.list == vec![FoodAction::AnimalRemoved(c), FoodAction::AnimalRemoved(c.step(Dir::N))])
         });
         assert!(
             fix.is_some_and(|f| f > r),
@@ -766,7 +769,7 @@ mod tests {
         w.tick = 1_000;
         let c = p(-6, 1, 0);
         cow_pen(&mut w, c, &[Dir::N]);
-        let good = FoodEvent::CowMoved {
+        let good = FoodEvent::AnimalMoved {
             from: c,
             to: c.step(Dir::N),
         };

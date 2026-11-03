@@ -130,7 +130,7 @@ async fn world_in_events_out() {
     assert!(!e.list.is_empty());
     svc.stop().await;
     // Sauvegarde a l'arret ; des naissances ont pu s'ajouter, aucune vache ne se perd.
-    assert!(FoodStore::load_or_default(&file).unwrap().mountains[&M].cow_count() >= 2);
+    assert!(FoodStore::load_or_default(&file).unwrap().mountains[&M].animal_count() >= 2);
 }
 
 #[tokio::test]

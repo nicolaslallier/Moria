@@ -3,7 +3,7 @@
 //! server also runs the `FoodSim`s itself (`InProcess`).
 
 use crate::sim::{Changes, on_ground};
-use moria_core::food::{COW_CAP, Cell, CellKind, FoodAction, FoodEvent, FoodSim, GROW_EVERY};
+use moria_core::food::{Cell, CellKind, FoodAction, FoodEvent, FoodSim, GROW_EVERY, HERD_CAP};
 use moria_core::protocol::TickDelta;
 use moria_core::world::{Fortress, World};
 use moria_core::{DesignationKind, Dir, GROUND_Z, Mountain, MountainId, Tile, TilePos};
@@ -27,13 +27,13 @@ pub fn validate(m: &Mountain, f: &Fortress, ev: &FoodEvent) -> bool {
     let free_grass =
         |q: TilePos| q.z == GROUND_Z && m.get(q) == Some(Tile::Grass) && !pinned(q) && !occupied(q);
     match *ev {
-        FoodEvent::CowMoved { from, to } => {
+        FoodEvent::AnimalMoved { from, to } => {
             m.get(from) == Some(Tile::Cow)
                 && !pinned(from)
                 && Dir::HORIZONTAL.iter().any(|&d| from.step(d) == to)
                 && free_grass(to)
         }
-        FoodEvent::CowBorn { at } => free_grass(at),
+        FoodEvent::AnimalBorn { at, .. } => free_grass(at),
         // A ripe crop asks again at every check: harmless, so not refused.
         FoodEvent::CropRipe { at } => matches!(m.get(at), Some(Tile::Field | Tile::Crop)),
     }
@@ -67,8 +67,8 @@ fn apply_checked(
             continue;
         }
         let changed: &[(TilePos, Tile)] = match *ev {
-            FoodEvent::CowMoved { from, to } => &[(from, Tile::Grass), (to, Tile::Cow)],
-            FoodEvent::CowBorn { at } => &[(at, Tile::Cow)],
+            FoodEvent::AnimalMoved { from, to } => &[(from, Tile::Grass), (to, Tile::Cow)],
+            FoodEvent::AnimalBorn { at, .. } => &[(at, Tile::Cow)],
             FoodEvent::CropRipe { at } if m.get(at) == Some(Tile::Field) => &[(at, Tile::Crop)],
             FoodEvent::CropRipe { .. } => &[],
         };
@@ -81,7 +81,7 @@ fn apply_checked(
 }
 
 /// Bus events are untrusted (a buggy container, a stale message): on top of `validate`, a
-/// birth needs a cow next to it and room under `COW_CAP`, and a ripe crop is refused where
+/// birth needs a cow next to it and room under `HERD_CAP`, and a ripe crop is refused where
 /// `stale_ripe` says the tile was harvested or sown after the proposal.
 pub fn apply_bus_events(
     m: &mut Mountain,
@@ -93,9 +93,9 @@ pub fn apply_bus_events(
     // Counted only when a birth is proposed: a full scan of the ground level.
     let mut herd = None;
     apply_checked(m, f, evs, tiles, |m, ev| match *ev {
-        FoodEvent::CowBorn { at } => {
+        FoodEvent::AnimalBorn { at, .. } => {
             let n = herd.get_or_insert_with(|| on_ground(m, Tile::Cow).len());
-            let ok = *n < COW_CAP
+            let ok = *n < HERD_CAP
                 && Dir::HORIZONTAL
                     .iter()
                     .any(|&d| m.get(at.step(d)) == Some(Tile::Cow));
@@ -103,7 +103,7 @@ pub fn apply_bus_events(
             ok
         }
         FoodEvent::CropRipe { at } => !stale_ripe(at),
-        FoodEvent::CowMoved { .. } => true,
+        FoodEvent::AnimalMoved { .. } => true,
     })
 }
 
@@ -172,6 +172,7 @@ pub fn step(
             let sim = sims.sims.entry(id).or_insert_with(|| {
                 let mut s = FoodSim::new(seed(w.seed, id));
                 s.adopt(&snapshot(m), tick);
+                s.pen_all();
                 s
             });
             for a in actions.get(&id).into_iter().flatten() {
@@ -179,6 +180,7 @@ pub fn step(
             }
             if tick.saturating_sub(sim.adopted_at()) >= RESYNC_EVERY {
                 sim.adopt(&snapshot(m), tick);
+                sim.pen_all();
             }
             // Same checks as the bus (cap, birth next to a cow); no stale ripe in process.
             let evs = sim.step(tick);
@@ -221,7 +223,7 @@ mod tests {
         TilePos::new(x, y, GROUND_Z)
     }
     fn moved(from: TilePos, to: TilePos) -> FoodEvent {
-        FoodEvent::CowMoved { from, to }
+        FoodEvent::AnimalMoved { from, to }
     }
 
     /// One tick of the server without bus: sim, then food, folded into the delta.
@@ -302,7 +304,10 @@ mod tests {
         m.set(b, Tile::Cow);
         m.set(t, Tile::Tree);
         f.dwarves[0].pos = d;
-        let born = |at| FoodEvent::CowBorn { at };
+        let born = |at| FoodEvent::AnimalBorn {
+            species: moria_core::food::Species::Cow,
+            at,
+        };
         let mut tiles = vec![];
         let rejected = apply_events(
             &mut m,
@@ -318,7 +323,10 @@ mod tests {
     #[test]
     fn bus_birth_needs_a_cow_next_to_it_and_room_under_the_cap() {
         let (mut m, f) = meadow();
-        let born = |at| FoodEvent::CowBorn { at };
+        let born = |at| FoodEvent::AnimalBorn {
+            species: moria_core::food::Species::Cow,
+            at,
+        };
         let mut tiles = vec![];
         let lonely = born(g(10, 10));
         assert_eq!(
@@ -335,7 +343,7 @@ mod tests {
         );
         assert_eq!(m.get(g(21, 20)), Some(Tile::Cow));
         // fill the herd up to the cap (a row of cows), then one more birth is refused
-        for x in 0..COW_CAP as i16 - 3 {
+        for x in 0..HERD_CAP as i16 - 3 {
             m.set(g(x, 30), Tile::Cow);
         }
         let last = born(g(0, 31));
@@ -346,7 +354,7 @@ mod tests {
             "the herd is full"
         );
         assert_eq!(m.get(g(1, 31)), Some(Tile::Grass));
-        assert_eq!(on_ground(&m, Tile::Cow).len(), COW_CAP);
+        assert_eq!(on_ground(&m, Tile::Cow).len(), HERD_CAP);
     }
 
     #[test]
@@ -477,7 +485,7 @@ mod tests {
         designate(&mut w, c, DesignationKind::Chop);
         assign(&mut w, 0, c);
         let seen = actions_until(&mut w, |w| tile(w, c) == Tile::Grass);
-        assert_eq!(seen, vec![FoodAction::CowRemoved(c)]);
+        assert_eq!(seen, vec![FoodAction::AnimalRemoved(c)]);
     }
 
     #[test]
@@ -535,7 +543,7 @@ mod tests {
             let evs = sim.step(WINTER + 20 * n);
             let rejected = apply_events(&mut m, &f, &evs, &mut vec![]);
             sim.reject(&rejected);
-            if let Some(FoodEvent::CowMoved { to, .. }) =
+            if let Some(FoodEvent::AnimalMoved { to, .. }) =
                 evs.first().filter(|e| !rejected.contains(e))
             {
                 c = *to;
@@ -617,11 +625,11 @@ mod tests {
         run(&mut w, &mut sims); // the sim adopts the grid: one cow
         // cows the sim does not know of yet (until its next resync): the herd is full
         let m = w.mountains.get_mut(&M).unwrap();
-        for i in 0..COW_CAP as i16 {
+        for i in 0..HERD_CAP as i16 {
             m.set(p(-6 - i, 8, 0), Tile::Cow);
         }
         let herd = cows(&w);
-        assert_eq!(herd, COW_CAP + 1);
+        assert_eq!(herd, HERD_CAP + 1);
         for _ in 0..2_000 {
             run(&mut w, &mut sims);
             assert!(cows(&w) <= herd, "a birth over the cap");
@@ -671,7 +679,7 @@ mod tests {
         }
         let (_, acts) = run(&mut w, &mut sims);
         assert_eq!(tile(&w, c), Tile::Grass);
-        assert_eq!(acts, vec![FoodAction::CowRemoved(c)]);
+        assert_eq!(acts, vec![FoodAction::AnimalRemoved(c)]);
         assert_eq!(w.fortresses[&M].resources.food, 4);
     }
 }
