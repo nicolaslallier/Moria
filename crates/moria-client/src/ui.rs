@@ -4,8 +4,8 @@ use crate::Client;
 use crate::art::Art;
 use crate::game::{
     ACTIONS, BUILDS, Game, ORDER_ROWS, PAUSE_ROWS, PauseRow, Screen, Session, ability_rows,
-    available_text, build_text, clock_label, level_label, mode_label, recipe_label, resource_bar,
-    stock_text, workshop_label,
+    available_text, build_text, clock_label, job_label, level_label, mode_label, recipe_label,
+    resource_bar, stock_text, workshop_label,
 };
 use crate::lang::{en, set_en, tr, word};
 use crate::light::{MemorySync, memory_files};
@@ -13,8 +13,10 @@ use crate::net::connect;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, EguiTextureHandle, egui};
-use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION};
+use moria_core::light::DAY_TICKS;
+use moria_core::protocol::{ClientMsg, InspectTarget, PROTOCOL_VERSION};
 use moria_core::srd::{Class, Race, roll_abilities};
+use moria_core::world::{FOOD_MAX, HEALTH_MAX};
 use std::path::PathBuf;
 
 const ATTRIBUTION: &str = include_str!("../../../ATTRIBUTION.md");
@@ -52,7 +54,8 @@ pub fn plugin(app: &mut App) {
                 login.run_if(in_state(Screen::Login)),
                 create_hero.run_if(in_state(Screen::CreateHero)),
                 (
-                    top_bar, hud, action_bar, build_menu, order_menu, status, pause_menu,
+                    top_bar, hud, action_bar, build_menu, order_menu, status, inspect, toast,
+                    pause_menu,
                 )
                     .chain()
                     .run_if(in_state(Screen::Playing)),
@@ -438,10 +441,14 @@ fn status(mut ctx: EguiContexts, art: Res<Art>, mut client: ResMut<Client>) -> R
 }
 
 /// No title bar: its collapse and close buttons could hold focus, and Space digs.
-fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
+fn status_window(
+    ctx: &egui::Context,
+    g: &mut Game,
+    portrait: egui::TextureId,
+) -> Option<egui::Rect> {
     let rows = g.dwarf_rows();
     let h = &g.hero;
-    egui::Window::new("Statut")
+    let rect = egui::Window::new("Statut")
         .title_bar(false)
         .anchor(egui::Align2::RIGHT_TOP, [-8.0, below_bar(ctx)])
         .resizable(false)
@@ -484,8 +491,149 @@ fn status_window(ctx: &egui::Context, g: &mut Game, portrait: egui::TextureId) {
                 "C ou Échap : fermer · manette : Select ou B/○",
                 "C or Esc: close · gamepad: Select or B/○",
             ));
-        });
+        })
+        .map(|r| r.response.rect);
+    if let Some(r) = rect {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(STATUS_BOTTOM), r.bottom()));
+    }
+    rect
 }
+
+/// Middle-click panel: what is known about the inspected creature.
+fn inspect(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game {
+        inspect_window(ctx.ctx_mut()?, g);
+    }
+    Ok(())
+}
+
+/// (label, value) rows of the inspect panel; empty for an unknown creature.
+pub fn inspect_lines(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let row = |k: &str, v: String| (k.to_string(), v);
+    match t {
+        InspectTarget::Hero => {
+            let h = &g.hero;
+            let mut v = vec![
+                row(tr("Nom", "Name"), h.name.clone()),
+                row(
+                    tr("Race", "Race"),
+                    format!("{} {}", word(h.race.label_fr()), word(h.class.label_fr())),
+                ),
+            ];
+            for (name, score, m) in ability_rows(h.abilities) {
+                v.push(row(word(name), format!("{score} {m}")));
+            }
+            v.extend(vitals(g, t));
+            v
+        }
+        InspectTarget::Dwarf(id) => g
+            .dwarves
+            .iter()
+            .find(|d| d.0 == id)
+            .map(|&(id, _, job)| {
+                let state = if g.hungry.contains(&id) {
+                    tr("Affamé", "Hungry")
+                } else {
+                    tr("Rassasié", "Fed")
+                };
+                let mut v = vec![
+                    row(tr("Nain", "Dwarf"), format!("n°{}", id.0)),
+                    row(tr("Activité", "Activity"), job_label(job)),
+                    row(tr("État", "State"), state.into()),
+                ];
+                v.extend(vitals(g, t));
+                v
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Food, health, age and jobs from the server's latest reply for `t`.
+fn vitals(g: &Game, t: InspectTarget) -> Vec<(String, String)> {
+    let Some(i) = g
+        .inspection
+        .filter(|i| i.target == t)
+        .and_then(|i| i.vitals)
+    else {
+        return vec![];
+    };
+    vec![
+        (
+            tr("Satiété", "Food").to_string(),
+            format!("{} %", u32::from(i.food) * 100 / u32::from(FOOD_MAX)),
+        ),
+        (
+            tr("Santé", "Health").to_string(),
+            format!("{} / {HEALTH_MAX}", i.health),
+        ),
+        (
+            tr("Âge", "Age").to_string(),
+            format!(
+                "{:.1} {}",
+                i.ticks_alive as f64 / DAY_TICKS as f64,
+                tr("j", "d")
+            ),
+        ),
+        (tr("Tâches", "Jobs").to_string(), i.jobs_done.to_string()),
+    ]
+}
+
+/// Transient one-line notice (a death, a vanished creature), top center.
+fn toast(mut ctx: EguiContexts, client: Res<Client>) -> Result {
+    if let Some(g) = &client.session.game
+        && let Some((text, at)) = &g.toast
+        && g.ticks.wrapping_sub(*at) < TOAST_TICKS
+    {
+        egui::Area::new("toast".into())
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                [0.0, below_bar(ctx.ctx_mut()?) + 8.0],
+            )
+            .show(ctx.ctx_mut()?, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(text.as_str()));
+            });
+    }
+    Ok(())
+}
+
+/// How long a notice stays, in server ticks (10 s at 100 ms/tick).
+const TOAST_TICKS: u64 = 100;
+
+/// No title bar (Space digs); sits under the status page when both are open.
+fn inspect_window(ctx: &egui::Context, g: &Game) -> Option<egui::Rect> {
+    let t = g.inspect?;
+    let lines = inspect_lines(g, t);
+    if lines.is_empty() {
+        return None;
+    }
+    // The status page is drawn first in the frame (`status` runs before `inspect`).
+    let status_bottom = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(STATUS_BOTTOM)));
+    let dy = match status_bottom {
+        Some(b) if g.status => b + 8.0,
+        _ => below_bar(ctx),
+    };
+    egui::Window::new("Inspection")
+        .title_bar(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, dy])
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("inspect").show(ui, |ui| {
+                for (k, v) in lines {
+                    ui.label(k);
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+            ui.small(tr(
+                "Clic du milieu ou Échap : fermer",
+                "Middle click or Esc: close",
+            ));
+        })
+        .map(|r| r.response.rect)
+}
+
+/// Where `status_window` leaves the status page's bottom edge, in egui's temp memory.
+const STATUS_BOTTOM: &str = "statut_bas";
 
 /// Where `bar_window` leaves the bar's bottom edge, in egui's temp memory.
 const BAR_BOTTOM: &str = "barre_bas";
@@ -821,13 +969,121 @@ mod tests {
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                status_window(ui.ctx(), &mut g, egui::TextureId::default())
+                status_window(ui.ctx(), &mut g, egui::TextureId::default());
             })
             .textures_delta
             .clear();
             assert_eq!(ctx.memory(|m| m.focused()), None);
         }
         assert!(g.status);
+    }
+
+    #[test]
+    fn inspect_lines_for_hero_has_abilities_and_no_hunger_state() {
+        let g = crate::game::tests::game();
+        let l = inspect_lines(&g, InspectTarget::Hero);
+        assert!(l.iter().any(|(k, _)| k == "Force"));
+        assert!(!l.iter().any(|(k, _)| k == "État"));
+    }
+
+    #[test]
+    fn inspect_lines_for_dwarf_shows_activity_and_hungry_state() {
+        use moria_core::DwarfId;
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let state = |g: &Game| {
+            let l = inspect_lines(g, InspectTarget::Dwarf(DwarfId(3)));
+            assert!(l.contains(&("Activité".into(), "Inactif".into())));
+            l.into_iter().find(|(k, _)| k == "État").unwrap().1
+        };
+        assert_eq!(state(&g), "Rassasié");
+        g.hungry = vec![DwarfId(3)];
+        assert_eq!(state(&g), "Affamé");
+        assert!(inspect_lines(&g, InspectTarget::Dwarf(DwarfId(9))).is_empty());
+    }
+
+    #[test]
+    fn inspect_lines_show_gauges_and_stats() {
+        use moria_core::DwarfId;
+        use moria_core::protocol::{Inspection, Vitals};
+        use moria_core::world::{FOOD_MAX, HEALTH_MAX};
+        let mut g = crate::game::tests::game();
+        let p = g.hero.pos;
+        g.dwarves = vec![(DwarfId(3), p, None)];
+        let t = InspectTarget::Dwarf(DwarfId(3));
+        let known = inspect_lines(&g, t).len();
+        g.inspection = Some(Inspection {
+            target: t,
+            vitals: Some(Vitals {
+                food: FOOD_MAX / 2,
+                health: HEALTH_MAX,
+                ticks_alive: moria_core::light::DAY_TICKS * 3 / 2,
+                jobs_done: 12,
+            }),
+        });
+        let l = inspect_lines(&g, t);
+        assert_eq!(l.len(), known + 4);
+        assert!(l.contains(&("Satiété".into(), "50 %".into())));
+        assert!(l.contains(&("Santé".into(), "100 / 100".into())));
+        assert!(l.contains(&("Âge".into(), "1.5 j".into())));
+        assert!(l.contains(&("Tâches".into(), "12".into())));
+        // Hero: no vitals at all (no hunger or health mechanics).
+        let hero = InspectTarget::Hero;
+        let known_hero = inspect_lines(&g, hero).len();
+        g.inspection = Some(Inspection {
+            target: hero,
+            vitals: None,
+        });
+        let l = inspect_lines(&g, hero);
+        assert_eq!(l.len(), known_hero);
+        assert!(!l.iter().any(|(k, _)| k == "Satiété" || k == "Santé"));
+        // A reply for another target adds nothing.
+        assert_eq!(inspect_lines(&g, t).len(), known);
+    }
+
+    #[test]
+    fn status_page_with_zero_dwarves_does_not_panic() {
+        let mut g = crate::game::tests::game();
+        g.status = true;
+        g.dwarves.clear();
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |ui| {
+            status_window(ui.ctx(), &mut g, egui::TextureId::default());
+            g.inspect = Some(InspectTarget::Dwarf(moria_core::DwarfId(1)));
+            inspect_window(ui.ctx(), &g);
+        })
+        .textures_delta
+        .clear();
+    }
+
+    #[test]
+    fn inspect_panel_sits_just_under_the_status_page() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 1500.0));
+        for status in [true, true, false, false] {
+            g.status = status;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let (mut page, mut panel) = (None, None);
+            ctx.run_ui(input, |ui| {
+                if g.status {
+                    page = status_window(ui.ctx(), &mut g, egui::TextureId::default());
+                }
+                panel = inspect_window(ui.ctx(), &g);
+            })
+            .textures_delta
+            .clear();
+            let top = panel.unwrap().top();
+            match page {
+                Some(page) => assert_eq!(top, page.bottom() + 8.0),
+                None => assert_eq!(top, below_bar(&ctx)),
+            }
+        }
     }
 
     /// A painted text: its string, screen rect and number of rows.

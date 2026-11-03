@@ -23,7 +23,7 @@ pub struct Drag {
 pub fn plugin(app: &mut App) {
     app.init_resource::<Drag>().add_systems(
         Update,
-        (play, mouse)
+        (play, mouse, inspect_poll)
             .in_set(InputSet)
             .run_if(in_state(Screen::Playing)),
     );
@@ -206,6 +206,18 @@ fn pause_frame(g: &mut Game, menu_dir: &mut Option<Dir>, walk: Option<Dir>, act:
     g.pause_pick |= act;
 }
 
+/// Asks the server for the open panel's vitals (see `inspect_due`).
+fn inspect_poll(time: Res<Time>, mut client: ResMut<Client>) {
+    let msg = client
+        .session
+        .game
+        .as_mut()
+        .and_then(|g| g.poll_inspect(time.elapsed_secs_f64()));
+    if let Some(m) = msg {
+        client.send(m);
+    }
+}
+
 fn play(
     keys: Res<ButtonInput<KeyCode>>,
     logical: Res<ButtonInput<Key>>,
@@ -303,6 +315,18 @@ fn play(
     }
 }
 
+/// Middle click: opens the first creature under the cursor (the hero first); clicking the
+/// same tile again moves to the next one there, and closes after the last.
+pub fn middle_click(g: &mut Game, cursor: Option<(i16, i16)>) {
+    let Some(c) = cursor else { return };
+    let all = g.targets_at(c, g.current_z());
+    let Some(&first) = all.first() else { return };
+    g.inspect = match all.iter().position(|&t| Some(t) == g.inspect) {
+        Some(i) => all.get(i + 1).copied(),
+        None => Some(first),
+    };
+}
+
 fn mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -316,7 +340,7 @@ fn mouse(
         .cursor_position()
         .and_then(|p| cam.viewport_to_world_2d(cam_t, p).ok())
         .map(to_tile);
-    let Some(g) = &client.session.game else {
+    let Some(g) = &mut client.session.game else {
         return;
     };
     if g.pause {
@@ -324,6 +348,9 @@ fn mouse(
         return;
     }
     let (mode, z) = (g.mode, g.current_z());
+    if buttons.just_pressed(MouseButton::Middle) && !egui.wants_pointer_input() {
+        middle_click(g, drag.cursor);
+    }
     if drag.start.is_none() && !egui.wants_pointer_input() {
         for b in [MouseButton::Left, MouseButton::Right] {
             if buttons.just_pressed(b) {
@@ -349,6 +376,8 @@ fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moria_core::protocol::InspectTarget;
+    use moria_core::{DwarfId, TilePos};
 
     #[test]
     fn pause_menu_steps_on_new_presses_and_picks_with_the_action_button() {
@@ -410,6 +439,61 @@ mod tests {
         );
         assert_eq!(g.order_menu, None);
         assert_eq!(menu_dir, Some(Dir::E));
+    }
+
+    #[test]
+    fn middle_click_opens_dwarf() {
+        let mut g = crate::game::tests::game();
+        g.dwarves = vec![(DwarfId(1), TilePos { x: 3, y: 1, z: 0 }, None)];
+        middle_click(&mut g, Some((3, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Dwarf(DwarfId(1))));
+    }
+
+    #[test]
+    fn middle_click_same_target_closes() {
+        let mut g = crate::game::tests::game();
+        middle_click(&mut g, Some((2, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Hero));
+        middle_click(&mut g, Some((2, 1)));
+        assert_eq!(g.inspect, None);
+    }
+
+    #[test]
+    fn middle_click_cycles_creatures_on_one_tile() {
+        let mut g = crate::game::tests::game();
+        let here = TilePos { x: 2, y: 1, z: 0 };
+        g.dwarves = vec![(DwarfId(1), here, None), (DwarfId(2), here, None)];
+        let mut seen = vec![];
+        for _ in 0..4 {
+            middle_click(&mut g, Some((2, 1)));
+            seen.push(g.inspect);
+        }
+        let dw = |n| Some(InspectTarget::Dwarf(DwarfId(n)));
+        assert_eq!(seen, [Some(InspectTarget::Hero), dw(1), dw(2), None]);
+    }
+
+    #[test]
+    fn middle_click_on_empty_tile_keeps_state() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        middle_click(&mut g, Some((4, 1)));
+        assert_eq!(g.inspect, Some(InspectTarget::Hero));
+    }
+
+    #[test]
+    fn middle_click_without_cursor_does_nothing() {
+        let mut g = crate::game::tests::game();
+        middle_click(&mut g, None);
+        assert_eq!(g.inspect, None);
+    }
+
+    #[test]
+    fn escape_closes_inspect() {
+        let mut g = crate::game::tests::game();
+        g.inspect = Some(InspectTarget::Hero);
+        g.escape();
+        assert_eq!(g.inspect, None);
+        assert!(!g.pause);
     }
 
     #[test]
