@@ -125,6 +125,16 @@ async fn flush(bus: &Bus, unsent: &mut VecDeque<Batch>) -> bool {
     true
 }
 
+/// Jette les questions au roi arrivées pendant la coupure : le serveur a déjà envoyé (ou
+/// enverra à 70 s) son repli, les publier maintenant ferait travailler le LLM pour rien.
+fn drop_asks(asks: &mut mpsc::Receiver<Ask>) -> usize {
+    let mut n = 0;
+    while asks.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
 /// Waits 2 s before a reconnect, still taking batches. `false` = the world task is gone.
 async fn pause(batches: &mut mpsc::Receiver<Batch>, unsent: &mut VecDeque<Batch>) -> bool {
     let t = tokio::time::sleep(Duration::from_secs(2));
@@ -160,8 +170,8 @@ async fn finish(bus: &Bus, unsent: &mut VecDeque<Batch>, batches: &mut mpsc::Rec
 /// confirm (up to 10 s), `batches` is not drained, so the real cap there is the 65_536-slot
 /// channel, where the world side drops the NEWEST batches (counter
 /// `moria_inventory_dropped_total`). `MAX_UNSENT` (oldest dropped) only applies once the
-/// bridge is running again. Questions au roi : perdues si le bus est coupé (le serveur répond
-/// par le repli au délai).
+/// bridge is running again. Questions au roi : jetées si le bus est coupé, y compris celles
+/// en attente pendant la reconnexion (le serveur répond par le repli au délai).
 pub async fn run(
     url: String,
     known: BTreeSet<MountainId>,
@@ -174,6 +184,10 @@ pub async fn run(
     let mut unsent: VecDeque<Batch> = VecDeque::new();
     loop {
         let bus = Bus::connect_forever(&url).await;
+        let n = drop_asks(&mut asks);
+        if n > 0 {
+            tracing::warn!("{n} questions au roi jetées pendant la coupure du bus");
+        }
         // A durable publish to an unbound key errors, so the queue must exist first.
         if let Err(e) = bus.declare(KEY_APPLY, Queue::Durable("inventory")).await {
             tracing::warn!(
@@ -395,6 +409,32 @@ mod tests {
         // trailing bytes would decode fine, so only the cap can reject this
         assert!(postcard::from_bytes::<Assignments>(&b).is_ok());
         assert!(decode_assignments(&b, &known).is_none());
+    }
+
+    #[test]
+    fn asks_waiting_during_a_reconnect_are_dropped() {
+        use moria_core::king::{KingState, Lang};
+        let (tx, mut rx) = mpsc::channel(8);
+        let a = Ask {
+            mountain: MountainId(0),
+            seq: 1,
+            lang: Lang::Fr,
+            text: "Bonjour".into(),
+            history: vec![],
+            state: KingState {
+                resources: Default::default(),
+                dwarves: 0,
+                depth: 0,
+            },
+            active: None,
+            offered: vec![],
+        };
+        for _ in 0..3 {
+            tx.try_send(a.clone()).unwrap();
+        }
+        assert_eq!(drop_asks(&mut rx), 3);
+        assert!(rx.try_recv().is_err(), "file vidée");
+        assert_eq!(drop_asks(&mut rx), 0);
     }
 
     fn reply(m: u16, text: &str) -> Vec<u8> {
