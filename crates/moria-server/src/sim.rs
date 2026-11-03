@@ -513,12 +513,10 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
         let meal = tick != 0 && tick.is_multiple_of(EAT_EVERY); // a new world starts fed
         for d in f.dwarves.iter_mut() {
             d.ticks_alive += 1;
-            d.food = d.food.saturating_sub(1);
             d.hungry |= meal;
             if d.hungry && f.resources.food > 0 {
                 f.resources.food -= 1;
                 d.hungry = false;
-                d.food = FOOD_MAX;
             } else if d.hungry
                 && !d
                     .task
@@ -534,6 +532,13 @@ pub fn step(w: &mut World) -> BTreeMap<MountainId, TickDelta> {
             } else if tick.is_multiple_of(REGEN_EVERY) {
                 d.health = (d.health + 1).min(HEALTH_MAX);
             }
+            // The gauge is the time left before the next meal, the same for every dwarf
+            // (full right after a meal), and empty while hungry. `hungry` drives the game.
+            d.food = if d.hungry {
+                0
+            } else {
+                (EAT_EVERY - tick % EAT_EVERY) as u16
+            };
         }
         // Death: the dwarf and its task go. Claims are read from tasks, so its designation is
         // free again; the AI drops unknown ids (`apply_assignments`); ids are never reused.
@@ -2405,10 +2410,26 @@ mod tests {
         res(&mut w).food = 5;
         step(&mut w);
         assert_eq!(dwarf0(&mut w).food, FOOD_MAX, "a meal refills the gauge");
-        dwarf0(&mut w).food = 0;
-        w.tick = 1;
+        res(&mut w).food = 0;
+        w.tick = EAT_EVERY * 2;
         step(&mut w);
-        assert_eq!(dwarf0(&mut w).food, 0, "floor at zero");
+        assert!(dwarf0(&mut w).hungry);
+        assert_eq!(
+            dwarf0(&mut w).food,
+            0,
+            "a hungry dwarf shows an empty gauge"
+        );
+    }
+
+    #[test]
+    fn vitals_food_gauge_follows_the_global_meal_clock() {
+        // A dwarf recruited (or migrated) with a full gauge 5 ticks before the meal shows
+        // those 5 ticks, not a full day: the meal comes at the same time for everyone.
+        let mut w = setup();
+        w.tick = EAT_EVERY * 3 - 5;
+        dwarf0(&mut w).food = FOOD_MAX;
+        step(&mut w);
+        assert_eq!(dwarf0(&mut w).food, 5);
     }
 
     #[test]
