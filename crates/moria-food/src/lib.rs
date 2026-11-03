@@ -308,14 +308,13 @@ mod tests {
     #[test]
     fn world_is_a_complete_snapshot() {
         let summer = moria_core::calendar::SEASON_TICKS;
-        let fields = vec![field(1, 1), field(4, 1)];
+        let fields = vec![field(1, 1), field(4, 1), cow(7, 7)];
         let mut s = FoodStore::default();
+        // etat cache : l'age de la vache date de sa premiere adoption
         handle_world(
             &mut s,
             &world(summer, vec![(A, fields.clone()), (B, vec![cow(9, 9)])]),
         );
-        // etat cache : une verification de croissance fait avancer les champs
-        handle_tick(&mut s, &Tick { tick: summer + 100 });
         let mut kept = s.mountains[&A].clone();
         kept.adopt(&fields, summer + 200);
         let mut fresh = FoodSim::new(seed(A));

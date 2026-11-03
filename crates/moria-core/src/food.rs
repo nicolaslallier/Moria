@@ -73,7 +73,6 @@ struct CowState {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 struct FieldState {
-    progress: u32,
     ripe: bool,
 }
 
@@ -117,7 +116,7 @@ impl FoodSim {
                     let mut st = old_fields
                         .get(&c.pos)
                         .copied()
-                        .unwrap_or(FieldState { progress: 0, ripe });
+                        .unwrap_or(FieldState { ripe });
                     st.ripe = ripe; // the server's grid wins (a lost harvest is cleared here)
                     self.fields.insert(c.pos, st);
                 }
@@ -133,13 +132,7 @@ impl FoodSim {
                 self.cows.remove(&p);
             }
             FoodAction::FieldSown(p) | FoodAction::FieldHarvested(p) => {
-                self.fields.insert(
-                    p,
-                    FieldState {
-                        progress: 0,
-                        ripe: false,
-                    },
-                );
+                self.fields.insert(p, FieldState { ripe: false });
             }
             FoodAction::FieldRemoved(p) => {
                 self.fields.remove(&p);
@@ -223,12 +216,9 @@ impl FoodSim {
             _ => SLOW_RIPEN_ODDS,
         };
         for (&q, f) in self.fields.iter_mut() {
-            if !f.ripe && odds != 0 {
-                if mix(q, (tick / GROW_EVERY) ^ self.seed).is_multiple_of(odds) {
-                    f.ripe = true;
-                } else {
-                    f.progress = f.progress.saturating_add(1);
-                }
+            if !f.ripe && odds != 0 && mix(q, (tick / GROW_EVERY) ^ self.seed).is_multiple_of(odds)
+            {
+                f.ripe = true;
             }
             if f.ripe {
                 out.push(FoodEvent::CropRipe { at: q });
@@ -250,10 +240,7 @@ impl FoodSim {
             }
             FoodEvent::CropRipe { at } => {
                 if let Some(f) = self.fields.get_mut(&at) {
-                    *f = FieldState {
-                        progress: 0,
-                        ripe: false,
-                    };
+                    f.ripe = false;
                 }
             }
         }
@@ -378,7 +365,6 @@ mod tests {
         // adult cow: born long before the snapshot, may breed at once
         let c = s.cows[&p(1, 1)];
         assert!(c.born < 50 && c.fertile_at <= 50);
-        assert_eq!(s.fields[&p(2, 2)].progress, 0);
     }
 
     #[test]
@@ -389,13 +375,11 @@ mod tests {
             10,
         );
         s.cows.get_mut(&p(1, 1)).unwrap().fertile_at = 999;
-        s.fields.get_mut(&p(2, 2)).unwrap().progress = 7;
         s.adopt(
             &[cell(p(1, 1), CellKind::Cow), cell(p(2, 2), CellKind::Field)],
             20,
         );
         assert_eq!(s.cows[&p(1, 1)].fertile_at, 999);
-        assert_eq!(s.fields[&p(2, 2)].progress, 7);
     }
 
     #[test]
@@ -459,11 +443,9 @@ mod tests {
     fn field_harvested_resets_to_growing() {
         let mut s = FoodSim::new(1);
         s.adopt(&[cell(p(3, 3), CellKind::Crop)], 10);
-        s.fields.get_mut(&p(3, 3)).unwrap().progress = 5;
         s.apply_action(&FoodAction::FieldHarvested(p(3, 3)));
         assert_eq!(s.field_count(), 1);
         assert!(!s.is_ripe(p(3, 3)));
-        assert_eq!(s.fields[&p(3, 3)].progress, 0);
     }
 
     #[test]
@@ -762,13 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_of_ripe_marks_the_field_growing_again_with_zero_progress() {
+    fn reject_of_ripe_marks_the_field_growing_again() {
         let mut s = FoodSim::new(1);
         s.adopt(&[cell(p(3, 3), CellKind::Crop)], 0);
-        s.fields.get_mut(&p(3, 3)).unwrap().progress = 4;
         s.reject(&FoodEvent::CropRipe { at: p(3, 3) });
         assert!(!s.is_ripe(p(3, 3)));
-        assert_eq!(s.fields[&p(3, 3)].progress, 0);
     }
 
     fn tmp(name: &str) -> PathBuf {
