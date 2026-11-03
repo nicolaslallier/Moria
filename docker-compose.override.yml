@@ -27,9 +27,14 @@ services:
     image: moria-king:local
     build: { <<: *build, args: { BIN: moria-king } }
     environment:
-      AMQP_URL: "amqp://guest:guest@rabbitmq:5672/%2f"
+      <<: *amqp
       # Ollama local sur l'hôte (Linux : ajouter extra_hosts host.docker.internal:host-gateway).
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    networks: [default]
+  food:
+    image: moria-food:local
+    build: { <<: *build, args: { BIN: moria-food } }
+    environment: *amqp
     networks: [default]
 
   # Pas d'Infra en local : broker jetable, compte guest sur le vhost par défaut.

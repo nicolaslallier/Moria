@@ -3,6 +3,8 @@
 //! or the network: it drains its inputs with `try_recv` and answers with `try_send`.
 
 pub mod bridge;
+mod food;
+pub mod food_bridge;
 mod inventory;
 pub mod king;
 pub mod metrics;
@@ -200,6 +202,14 @@ pub async fn run_with_listener(
         ))
     });
     drop(assign_tx);
+    // The food container gets its own connection: a slow inventory flush never holds it up.
+    let food_link = cfg.amqp_url.clone().map(|url| {
+        let (tx, out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
+        let link = food_bridge::Link::new(tx, rx);
+        tokio::spawn(food_bridge::run(url, out, inc, link.drop_flag()));
+        link
+    });
 
     // An empty (or blank) code means open registration, whatever the caller passed.
     let invite = cfg.invite.clone().filter(|s| !s.trim().is_empty());
@@ -278,6 +288,9 @@ pub async fn run_with_listener(
         last_view: None,
         saving: None,
         pending: HashMap::new(),
+        // With a bus the container runs the food; without, the server does.
+        food_sim: food_link.is_none().then(food::InProcess::default),
+        food_link,
         talks: king::Talks::new(cfg.king_timeout),
         ask_tx,
         reply_rx,
@@ -319,6 +332,10 @@ struct State {
     saving: Option<JoinHandle<()>>,
     /// Commands received but not yet applied (per-player cap), oldest first.
     pending: HashMap<PlayerId, VecDeque<Command>>,
+    /// The food simulation run here; `None` when it comes from the bus.
+    food_sim: Option<food::InProcess>,
+    /// The food container; `None` without a bus.
+    food_link: Option<food_bridge::Link>,
     talks: king::Talks,
     /// `None` sans pont : chaque parole au roi reçoit le repli aussitôt.
     ask_tx: Option<mpsc::Sender<Ask>>,
@@ -358,12 +375,23 @@ impl State {
         M.sessions.store(self.sessions.len() as i64, Relaxed);
         M.accounts.store(self.w.accounts.len() as i64, Relaxed);
         M.fortresses.store(self.w.fortresses.len() as i64, Relaxed);
-        let up = M.bus_up.load(Relaxed) == 1 && self.inv.inventory_up(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let up = M.bus_up.load(Relaxed) == 1 && self.inv.inventory_up(now);
         M.nats_connected.store(up as i64, Relaxed);
+        let food_up = self.food_link.as_ref().is_some_and(|l| l.up(now));
+        M.food_up.store(food_up as i64, Relaxed);
     }
 
     fn step(&mut self) {
+        self.step_at(std::time::Instant::now());
+    }
+
+    fn step_at(&mut self, now: std::time::Instant) {
         self.sessions.retain(|_, tx| !tx.is_closed());
+        if let Some(l) = &mut self.food_link {
+            l.poll(now);
+        }
+        self.w.food_paused = food_bridge::paused(self.food_link.as_ref(), now);
         for _ in 0..MAX_STATES_PER_TICK {
             let Ok(st) = self.states_rx.try_recv() else {
                 break;
@@ -387,11 +415,17 @@ impl State {
         let mut changes = self.commands();
         // Une validation par la sim est signalée au joueur.
         let mut done = Vec::new();
-        let deltas = sim::step_quests(&mut self.w, &mut done);
+        let (deltas, acts) = sim::step_with_food(&mut self.w, &mut done);
+        let mut fed = food::step(&mut self.w, self.food_sim.as_mut(), &acts);
+        if let Some(l) = &mut self.food_link {
+            for (m, ch) in l.step(&mut self.w, &acts, now) {
+                fed.entry(m).or_default().then(ch);
+            }
+        }
         for m in done {
             let f = &self.w.fortresses[&m];
-            let (owner, now) = (f.owner, f.quest);
-            self.send(owner, ServerMsg::Quest(now));
+            let (owner, quest) = (f.owner, f.quest);
+            self.send(owner, ServerMsg::Quest(quest));
         }
         self.king();
         for b in self.inv.end_tick(&self.w) {
@@ -403,6 +437,11 @@ impl State {
             }
         }
         for (m, mut d) in deltas {
+            // Food first: it happened after the step, and what a delta already says wins
+            // over the commands' changes.
+            if let Some(ch) = fed.remove(&m) {
+                food::fold(ch, &mut d);
+            }
             if let Some(ch) = changes.remove(&m) {
                 ch.merge_into(&mut d);
             }
@@ -776,6 +815,8 @@ mod tests {
             last_view: None,
             saving: None,
             pending: HashMap::new(),
+            food_sim: Some(food::InProcess::default()),
+            food_link: None,
             talks: king::Talks::new(king::KING_TIMEOUT),
             ask_tx: None,
             reply_rx: mpsc::channel(1).1,
@@ -812,6 +853,109 @@ mod tests {
         // The flood's surplus is applied on later ticks, still capped.
         let ch = s.commands();
         assert_eq!(ch[&MountainId(0)].designations.len(), MAX_CMDS_PER_PLAYER);
+    }
+
+    #[test]
+    fn in_process_mode_moves_cows_like_before() {
+        use moria_core::Tile;
+        let (mut s, _cmd) = state();
+        let (tx, mut rx) = mpsc::channel(64);
+        s.sessions.insert(PlayerId(0), tx);
+        for _ in 0..10 {
+            s.step();
+        }
+        let mut last = BTreeMap::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ServerMsg::Tick(d) = m {
+                last.extend(d.tiles);
+            }
+        }
+        assert!(
+            last.values().any(|&t| t == Tile::Cow),
+            "no cow moved in 10 ticks"
+        );
+        let (m, f) = (
+            &s.w.mountains[&MountainId(0)],
+            &s.w.fortresses[&MountainId(0)],
+        );
+        for (q, t) in last {
+            assert_eq!(m.get(q), Some(t), "the owner sees the grid at {q:?}");
+        }
+        for q in sim::occupied(&s.w, MountainId(0)) {
+            assert_ne!(m.get(q), Some(Tile::Cow), "a cow under someone");
+        }
+        assert!(f.hero.is_some());
+    }
+
+    #[test]
+    fn food_paused_follows_staleness_when_a_bus_is_configured() {
+        use moria_core::food_msg::Status;
+        let (mut s, _cmd) = state();
+        let t0 = std::time::Instant::now();
+        s.step_at(t0);
+        assert!(!s.w.food_paused, "no bus: never paused");
+        let (tx, mut out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
+        s.food_link = Some(food_bridge::Link::new(tx, rx));
+        s.food_sim = None;
+        s.step_at(t0);
+        assert!(s.w.food_paused, "container never heard of");
+        inc.try_send(food_bridge::Incoming::Status(Status { tick: 0 }))
+            .unwrap();
+        s.step_at(t0 + Duration::from_secs(1));
+        assert!(!s.w.food_paused, "heartbeat seen this tick");
+        s.step_at(t0 + Duration::from_secs(6));
+        assert!(s.w.food_paused, "silent for 5 s");
+        let ticks = std::iter::from_fn(|| out.try_recv().ok())
+            .filter(|o| matches!(o, food_bridge::Outgoing::Tick(_)))
+            .count();
+        assert_eq!(ticks, 3, "one food.tick per server tick");
+    }
+
+    #[test]
+    fn a_client_arriving_later_sees_food_changes_made_without_a_hero() {
+        use moria_core::food::FoodEvent;
+        use moria_core::food_msg::{Events, Status};
+        use moria_core::{GROUND_Z, Tile};
+        let (mut s, _cmd) = state();
+        let m0 = MountainId(0);
+        // nobody on the mountain: no delta carries its food changes
+        s.w.fortresses.get_mut(&m0).unwrap().hero = None;
+        let q = TilePos::new(world::ENTRANCE_X.start - 6, 47, GROUND_Z);
+        s.w.mountains.get_mut(&m0).unwrap().set(q, Tile::Field);
+        let (tx, _out) = mpsc::channel(food_bridge::OUT_CHANNEL);
+        let (inc, rx) = mpsc::channel(food_bridge::IN_CHANNEL);
+        s.food_link = Some(food_bridge::Link::new(tx, rx));
+        s.food_sim = None;
+        inc.try_send(food_bridge::Incoming::Status(Status { tick: 1 }))
+            .unwrap();
+        inc.try_send(food_bridge::Incoming::Events(Events {
+            tick: s.w.tick,
+            mountain: m0,
+            list: vec![FoodEvent::CropRipe { at: q }],
+        }))
+        .unwrap();
+        s.step_at(std::time::Instant::now());
+        // the player comes back and makes a hero: the snapshot carries the crop and its harvest
+        let (ctx, mut crx) = mpsc::channel(64);
+        s.sessions.insert(PlayerId(0), ctx);
+        s.request(Request::CreateHero {
+            player: PlayerId(0),
+            name: "h".into(),
+            race: Race::Dwarf,
+            class: Class::Fighter,
+        });
+        let snap = std::iter::from_fn(|| crx.try_recv().ok())
+            .find_map(|m| match m {
+                ServerMsg::Snapshot(v) => Some(v),
+                _ => None,
+            })
+            .expect("no snapshot");
+        assert_eq!(snap.mountain.get(q), Some(Tile::Crop));
+        assert_eq!(
+            snap.mountain.designations.get(&q),
+            Some(&DesignationKind::Chop)
+        );
     }
 
     #[test]

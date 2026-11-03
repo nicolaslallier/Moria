@@ -28,6 +28,9 @@ pub struct Metrics {
     pub assignments_rejected: AtomicU64,
     pub save_failures: AtomicU64,
     pub inventory_dropped: AtomicU64,
+    pub food_up: AtomicI64,
+    pub food_world_dropped: AtomicU64,
+    pub food_events_dropped: AtomicU64,
 }
 
 pub static M: Metrics = Metrics {
@@ -46,6 +49,9 @@ pub static M: Metrics = Metrics {
     assignments_rejected: AtomicU64::new(0),
     save_failures: AtomicU64::new(0),
     inventory_dropped: AtomicU64::new(0),
+    food_up: AtomicI64::new(0),
+    food_world_dropped: AtomicU64::new(0),
+    food_events_dropped: AtomicU64::new(0),
 };
 
 pub fn inc(c: &AtomicU64) {
@@ -139,6 +145,24 @@ pub fn render(m: &Metrics) -> String {
         "Lots d'inventaire perdus (file du pont pleine).",
         c(&m.inventory_dropped),
     );
+    put(
+        "moria_food_up",
+        "gauge",
+        "1 si le conteneur nourriture a publie un etat il y a moins de 5 s.",
+        g(&m.food_up),
+    );
+    put(
+        "moria_food_world_dropped_total",
+        "counter",
+        "Instantanes food.world trop gros, jamais envoyes.",
+        c(&m.food_world_dropped),
+    );
+    put(
+        "moria_food_events_dropped_total",
+        "counter",
+        "Messages food.events perdus (file du monde pleine), World renvoye.",
+        c(&m.food_events_dropped),
+    );
     s
 }
 
@@ -185,7 +209,8 @@ mod tests {
         assert!(out.contains("moria_sessions 3\n"));
         assert!(out.contains("moria_ticks_total 1\n"));
         assert!(out.contains("moria_tick_seconds_total 0.25\n"));
-        assert_eq!(out.matches("# TYPE ").count(), 14);
+        assert_eq!(out.matches("# TYPE ").count(), 17);
+        assert!(out.contains("# TYPE moria_food_up gauge\nmoria_food_up 0\n"));
     }
 
     #[tokio::test]

@@ -2,15 +2,20 @@
 //! Run: AMQP_TEST_URL=amqp://guest:guest@127.0.0.1:5672 cargo test -p moria-server --test e2e -- --ignored
 use futures::StreamExt;
 use moria_bus::{Bus, Queue};
+use moria_core::calendar::SEASON_TICKS;
+use moria_core::food::{Cell, CellKind, FoodEvent, FoodSim, GROW_EVERY};
+use moria_core::food_msg::{KEY_ACTION, KEY_REJECT, KEY_TICK, KEY_WORLD};
 use moria_core::inventory::{Batch, KEY_APPLY, KEY_STATE, State};
+use moria_core::light::DAY_TICKS;
 use moria_core::protocol::{
     ClientMsg, FortressView, PROTOCOL_VERSION, ServerMsg, encode, read_frame_async,
 };
 use moria_core::srd::{Class, Race};
 use moria_core::tile::{DesignationKind, Tile};
-use moria_core::world::{generate, save};
-use moria_core::{Dir, Resources, TilePos};
+use moria_core::world::{ENTRANCE_X, ENTRANCE_Y, World, generate, load, save};
+use moria_core::{Dir, GROUND_Z, Mountain, MountainId, Resources, TilePos};
 use moria_server::{Config, run_with_listener};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -143,9 +148,15 @@ impl Client {
             self.view.hero.pos = d.hero_pos;
             self.view.dwarves = d.dwarves;
             self.view.resources = d.resources;
+            self.view.hungry = d.hungry;
             for (p, t) in d.tiles {
                 self.view.mountain.set(p, t);
             }
+            let des = &mut self.view.mountain.designations;
+            for p in d.designations_removed {
+                des.remove(&p);
+            }
+            des.extend(d.designations_added);
         }
     }
 
@@ -647,6 +658,99 @@ async fn durable_confirm_latency_report() {
     rm(&data);
 }
 
+// ---- Food container: grazing, outage, restarts ---------------------------------------------
+
+/// The mountain the first login claims.
+const M0: MountainId = MountainId(0);
+/// Where the first hero stands (`entrance_tiles().next()`), and the grass just west of it.
+const HERO: TilePos = TilePos {
+    x: ENTRANCE_X.start,
+    y: ENTRANCE_Y.start,
+    z: GROUND_Z,
+};
+const WEST: TilePos = TilePos {
+    x: ENTRANCE_X.start - 1,
+    ..HERO
+};
+/// Cows step, nobody breeds: the herd's size is fixed.
+const AUTUMN: u64 = 2 * SEASON_TICKS;
+/// Each dwarf eats every `EAT_EVERY` ticks (`DAY_TICKS / 4`, private to the sim).
+const EAT_EVERY: u64 = DAY_TICKS / 4;
+
+fn start_food(file: &Path) -> Task {
+    let (stop, rx) = oneshot::channel();
+    let done = tokio::spawn(moria_food::run(amqp_url(), file.to_path_buf(), async {
+        let _ = rx.await;
+    }));
+    Task { stop, done }
+}
+
+fn food_file(data: &Path) -> PathBuf {
+    data.parent().unwrap().join("food.bin")
+}
+
+/// The container's shared queues, declared and emptied (leftovers of other tests).
+async fn food_queues() {
+    let bus = Bus::connect(&amqp_url()).await.unwrap();
+    for (key, name, latest_only) in [
+        (KEY_TICK, "food-tick", true),
+        (KEY_WORLD, "food-world", true),
+        (KEY_ACTION, "food-action", false),
+        (KEY_REJECT, "food-reject", false),
+    ] {
+        bus.declare(key, Queue::Shared { name, latest_only })
+            .await
+            .unwrap();
+        bus.purge(name).await.unwrap();
+    }
+}
+
+/// Rewrites the saved world (server stopped).
+fn prepare(data: &Path, f: impl FnOnce(&mut World)) {
+    let mut w = load(data).unwrap();
+    f(&mut w);
+    save(&w, data).unwrap();
+}
+
+fn ground(m: &Mountain, t: Tile) -> BTreeSet<TilePos> {
+    m.rect(
+        TilePos::new(0, 0, GROUND_Z),
+        TilePos::new(i16::MAX, i16::MAX, GROUND_Z),
+    )
+    .into_iter()
+    .filter(|&q| m.get(q) == Some(t))
+    .collect()
+}
+
+/// A cow at `q` that cannot step anywhere: trees around it, the entrance floor east.
+fn penned_cow(m: &mut Mountain, q: TilePos) {
+    m.set(q, Tile::Cow);
+    for d in [Dir::N, Dir::S, Dir::W] {
+        m.set(q.step(d), Tile::Tree);
+    }
+}
+
+impl Client {
+    fn cows(&self) -> BTreeSet<TilePos> {
+        ground(&self.view.mountain, Tile::Cow)
+    }
+
+    /// Pumps until some cow has stepped (bounded): the container is up and has the herd.
+    async fn until_cows_move(&mut self) {
+        let start = self.cows();
+        self.until(300, |c| c.cows() != start).await;
+    }
+
+    /// Pumps `n` ticks and asserts no cow moved meanwhile.
+    async fn cows_still(&mut self, n: u64) {
+        let start = self.cows();
+        for _ in 0..n {
+            self.pump().await;
+            assert_eq!(self.cows(), start, "a cow moved at tick {}", self.tick);
+        }
+    }
+}
+
 // ---- Le roi nain : question sur le bus, réponse ou repli ----------------------------------
 
 use moria_core::king::{Ask, KEY_ASK, KEY_REPLY, Lang, Reply};
@@ -725,6 +829,26 @@ impl Client {
 
 #[tokio::test]
 #[ignore]
+async fn cows_graze_through_the_container() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-graze");
+    prepare(&data, |w| w.tick = AUTUMN);
+    food_queues().await;
+    let food = start_food(&food_file(&data));
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let start = c.cows();
+    assert!(start.len() >= 5, "the generated mountain has a herd");
+    c.until_cows_move().await;
+    c.ticks(100).await;
+    assert_eq!(c.cows().len(), start.len(), "no cow lost or duplicated");
+    srv.stop().await;
+    food.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
 async fn king_answers_through_the_bus() {
     let _g = SERIAL.lock().await;
     let data = world_file("king-answers");
@@ -738,6 +862,281 @@ async fn king_answers_through_the_bus() {
     srv.stop().await;
     king.abort();
     bus.close().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn butchered_cow_does_not_come_back() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-butcher");
+    prepare(&data, |w| {
+        w.tick = AUTUMN;
+        penned_cow(w.mountains.get_mut(&M0).unwrap(), WEST);
+    });
+    food_queues().await;
+    let food = start_food(&food_file(&data));
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    assert_eq!(c.view.hero.pos, HERO);
+    assert_eq!(c.view.mountain.get(WEST), Some(Tile::Cow));
+    c.until_cows_move().await; // the container knows the herd, the penned cow included
+    let herd = c.cows().len();
+    let food0 = c.view.resources.food;
+    c.s.write_all(&encode(&ClientMsg::Dig(Dir::W)))
+        .await
+        .unwrap();
+    c.until(300, |c| c.view.mountain.get(WEST) != Some(Tile::Cow))
+        .await;
+    assert_eq!(c.view.resources.food, food0 + Tile::Cow.yield_().food);
+    assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
+    assert_eq!(c.cows().len(), herd - 1);
+
+    // Open the pen: the hero steps onto the old tile and chops the trees north and west, so
+    // a ghost of the cow there would have free grass on two sides out of four.
+    c.s.write_all(&encode(&ClientMsg::Move(Dir::W)))
+        .await
+        .unwrap();
+    c.until(50, |c| c.view.hero.pos == WEST).await;
+    for d in [Dir::N, Dir::W] {
+        let t = WEST.step(d);
+        c.s.write_all(&encode(&ClientMsg::Dig(d))).await.unwrap();
+        c.until(300, |c| c.view.mountain.get(t) == Some(Tile::Grass))
+            .await;
+    }
+    // Twenty container steps: a ghost proposing from WEST would get through at once.
+    for _ in 0..200 {
+        c.pump().await;
+        assert_eq!(c.cows().len(), herd - 1, "a cow came back at {}", c.tick);
+    }
+    assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
+    drop(c);
+    let c = Client::login(addr, "alice").await; // a fresh snapshot says the same
+    assert_eq!(c.view.mountain.get(WEST), Some(Tile::Grass));
+    assert_eq!(c.cows().len(), herd - 1);
+    srv.stop().await;
+    food.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn food_outage_freezes_food_and_pauses_hunger() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-outage");
+    let file = food_file(&data);
+    let meal = 2 * EAT_EVERY;
+    prepare(&data, |w| {
+        w.tick = meal - 400; // 40 s before a meal
+        w.mountains.get_mut(&M0).unwrap().set(WEST, Tile::Crop);
+    });
+    food_queues().await;
+    let food = start_food(&file);
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    assert_eq!(c.view.hero.pos, HERO);
+    c.until_cows_move().await;
+
+    food.stop().await;
+    assert!(c.tick + 170 < meal, "too slow to stop before the meal");
+    // Past STOPPED_AFTER: the food is paused. `stop` returns once the container has exited,
+    // so its last heartbeat is older than these 60 ticks, and ticks never run ahead of the
+    // wall clock (100 ms interval, missed ticks skipped): at least 6 s > 5 s.
+    c.ticks(60).await;
+    c.cows_still(100).await;
+    let food0 = c.view.resources.food;
+    assert!(food0 > 0);
+    c.until(400, |c| c.tick > meal + 1).await;
+    assert!(c.view.hungry.is_empty(), "no meal while the food is down");
+    assert_eq!(c.view.resources.food, food0, "nobody ate");
+
+    // The hero still digs and harvests.
+    let stone = c.view.resources.stone;
+    c.dig(1).await;
+    assert_eq!(c.view.resources.stone, stone + 1);
+    c.s.write_all(&encode(&ClientMsg::Dig(Dir::W)))
+        .await
+        .unwrap();
+    c.until(300, |c| c.view.mountain.get(WEST) == Some(Tile::Field))
+        .await;
+    assert_eq!(c.view.resources.food, food0 + Tile::Crop.yield_().food);
+
+    // Back up: cows step again...
+    let food = start_food(&file);
+    c.until_cows_move().await;
+    drop(c);
+    srv.stop().await;
+    // ... and meals come again (the next one is 15 min away: jump to it, with an empty larder).
+    let meal = 3 * EAT_EVERY;
+    prepare(&data, |w| {
+        w.tick = meal - 100;
+        w.fortresses.get_mut(&M0).unwrap().resources.food = 0;
+    });
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    c.until_cows_move().await;
+    assert!(c.tick < meal, "the container came back too late");
+    c.until(200, |c| c.tick > meal + 1).await;
+    assert_eq!(
+        c.view.hungry.len(),
+        c.view.dwarves.len(),
+        "every dwarf missed the meal"
+    );
+    assert!(!c.view.hungry.is_empty());
+    srv.stop().await;
+    food.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn food_started_empty_deletes_nothing() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-empty");
+    let file = food_file(&data);
+    let _ = std::fs::remove_file(&file);
+    prepare(&data, |w| {
+        w.tick = AUTUMN;
+        let m = w.mountains.get_mut(&M0).unwrap();
+        for y in 40..44 {
+            m.set(TilePos::new(110, y, GROUND_Z), Tile::Field);
+            m.set(TilePos::new(112, y, GROUND_Z), Tile::Crop);
+        }
+    });
+    food_queues().await;
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    let count = |c: &Client| {
+        let m = &c.view.mountain;
+        (
+            ground(m, Tile::Cow).len(),
+            ground(m, Tile::Field).len() + ground(m, Tile::Crop).len(),
+        )
+    };
+    let before = count(&c);
+    assert_eq!(before.1, 8);
+    c.cows_still(30).await; // no container yet: nothing moves
+
+    let food = start_food(&file); // a fresh food.bin: knows nothing
+    c.until_cows_move().await;
+    c.ticks(100).await;
+    assert_eq!(count(&c), before);
+    drop(c);
+    let c = Client::login(addr, "alice").await;
+    assert_eq!(count(&c), before);
+    srv.stop().await;
+    food.stop().await;
+    rm(&data);
+}
+
+#[tokio::test]
+#[ignore]
+async fn server_restart_keeps_the_herd() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-srv-restart");
+    prepare(&data, |w| w.tick = AUTUMN);
+    food_queues().await;
+    let food = start_food(&food_file(&data));
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    c.until_cows_move().await;
+    let herd = c.cows().len();
+    drop(c);
+    srv.stop().await; // final save
+    let saved = load(&data).unwrap().mountains[&M0].clone();
+    assert_eq!(ground(&saved, Tile::Cow).len(), herd);
+
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    // Cows may already have stepped since the restart: compare the grid without them.
+    let no_cows = |m: &Mountain| {
+        let mut m = m.clone();
+        for q in ground(&m, Tile::Cow) {
+            m.set(q, Tile::Grass);
+        }
+        m
+    };
+    assert_eq!(no_cows(&c.view.mountain), no_cows(&saved));
+    assert_eq!(c.cows().len(), herd);
+    c.until_cows_move().await; // the container still drives the herd...
+    c.ticks(100).await;
+    assert_eq!(c.cows().len(), herd, "... without duplicating it");
+    srv.stop().await;
+    food.stop().await;
+    rm(&data);
+}
+
+/// A grass tile near the entrance whose field ripens at the first summer growth check and
+/// not at the spring check before it.
+fn field_ripe_at_summer(m: &Mountain) -> TilePos {
+    let ripe_at = |q: TilePos, tick: u64| {
+        let mut s = FoodSim::new(moria_food::seed(M0));
+        let field = Cell {
+            pos: q,
+            kind: CellKind::Field,
+        };
+        s.adopt(&[field], tick);
+        s.step(tick).contains(&FoodEvent::CropRipe { at: q })
+    };
+    (100..120)
+        .flat_map(|x| (36..44).map(move |y| TilePos::new(x, y, GROUND_Z)))
+        .find(|&q| {
+            m.get(q) == Some(Tile::Grass)
+                && !ripe_at(q, SEASON_TICKS - GROW_EVERY)
+                && ripe_at(q, SEASON_TICKS)
+        })
+        .expect("a field that ripens on the first day of summer")
+}
+
+#[tokio::test]
+#[ignore]
+async fn crop_ripens_and_stays_designated() {
+    let _g = SERIAL.lock().await;
+    let data = world_file("food-ripe");
+    let mut q = None;
+    prepare(&data, |w| {
+        w.tick = SEASON_TICKS - 150; // 15 s before summer
+        let m = w.mountains.get_mut(&M0).unwrap();
+        let f = field_ripe_at_summer(m);
+        m.set(f, Tile::Field);
+        q = Some(f);
+    });
+    let q = q.unwrap();
+    food_queues().await;
+    let food = start_food(&food_file(&data));
+    let (srv, addr) = start_server(&data).await;
+    let mut c = Client::login(addr, "alice").await;
+    assert_eq!(c.view.mountain.get(q), Some(Tile::Field));
+    c.until(400, |c| c.view.mountain.get(q) == Some(Tile::Crop))
+        .await;
+    assert!(c.tick > SEASON_TICKS, "ripe in summer, at tick {}", c.tick);
+    let chop = Some(&DesignationKind::Chop);
+    c.until(150, |c| c.view.mountain.designations.get(&q) == chop)
+        .await;
+
+    food.stop().await;
+    c.ticks(60).await; // past STOPPED_AFTER: the food is paused (see the outage test)
+    c.cows_still(30).await; // the herd is frozen: no container is driving it
+    // A cancelled harvest is asked for again, container or not (famine deadlock).
+    c.s.write_all(&encode(&ClientMsg::CancelDesignation { a: q, b: q }))
+        .await
+        .unwrap();
+    c.until(50, |c| !c.view.mountain.designations.contains_key(&q))
+        .await;
+    c.until(150, |c| c.view.mountain.designations.get(&q) == chop)
+        .await;
+    c.ticks(110).await; // past another growth check
+    assert_eq!(c.view.mountain.get(q), Some(Tile::Crop));
+    assert_eq!(c.view.mountain.designations.get(&q), chop);
+    drop(c);
+    let c = Client::login(addr, "alice").await;
+    assert_eq!(c.view.mountain.get(q), Some(Tile::Crop));
+    assert_eq!(
+        c.view.mountain.designations.get(&q),
+        chop,
+        "harvest still asked for in a fresh snapshot"
+    );
+    srv.stop().await;
     rm(&data);
 }
 
