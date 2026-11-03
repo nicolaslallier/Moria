@@ -393,8 +393,7 @@ impl Game {
         let open =
             self.build_menu || self.status || self.order_menu.is_some() || self.inspect.is_some();
         self.build_menu = false;
-        self.inspect = None;
-        self.inspection = None;
+        self.close_inspect();
         self.status = false;
         self.order_menu = None;
         open
@@ -530,13 +529,14 @@ impl Game {
         match i {
             Some(i) => self.inspection = Some(i),
             None => {
-                self.close_menus_inspect();
+                self.close_inspect();
                 self.say(tr("Disparu", "Gone"));
             }
         }
     }
 
-    fn close_menus_inspect(&mut self) {
+    /// Closes the inspect panel and forgets its vitals.
+    fn close_inspect(&mut self) {
         self.inspect = None;
         self.inspection = None;
     }
@@ -600,7 +600,7 @@ impl Game {
         self.hungry.clone_from(&d.hungry);
         for id in &d.died {
             if self.inspect == Some(InspectTarget::Dwarf(*id)) {
-                self.close_menus_inspect();
+                self.close_inspect();
             }
             self.say(tr("Un nain est mort de faim", "A dwarf starved to death"));
         }
