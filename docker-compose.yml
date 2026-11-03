@@ -13,13 +13,13 @@
 services:
   # Génère le monde au premier démarrage (sans effet si /data/world.bin existe), puis s'arrête.
   worldgen:
-    image: ghcr.io/nicolaslallier/moria-worldgen:sha-0f476daf09036174601757c74f4c2d6913b2f2ef
+    image: ghcr.io/nicolaslallier/moria-worldgen:sha-8b19a07a5825727235e7e92183c1a26dcdedf0e5
     volumes: ["moria-data:/data"]
     command: ["--out", "/data/world.bin"]
     restart: "no"
 
   server:
-    image: ghcr.io/nicolaslallier/moria-server:sha-0f476daf09036174601757c74f4c2d6913b2f2ef
+    image: ghcr.io/nicolaslallier/moria-server:sha-8b19a07a5825727235e7e92183c1a26dcdedf0e5
     # Sauvegarde finale de world.bin sur SIGTERM : marge au-delà des 10 s par défaut.
     stop_grace_period: 30s
     # 7777 n'est plus publié ici : le nginx de l'infra (stream.d/moria.conf) l'expose et
@@ -42,7 +42,7 @@ services:
       worldgen: { condition: service_completed_successfully }
 
   dwarf-ai:
-    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-0f476daf09036174601757c74f4c2d6913b2f2ef
+    image: ghcr.io/nicolaslallier/moria-dwarf-ai:sha-8b19a07a5825727235e7e92183c1a26dcdedf0e5
     environment:
       AMQP_URL: *amqp
     networks: [infra-net]
@@ -54,7 +54,7 @@ services:
   # épinglage provisoire : le commit du bot CI le remplace au premier build sur main (d'ici là,
   # le pull peut échouer et être réessayé).
   inventory:
-    image: ghcr.io/nicolaslallier/moria-inventory:sha-0f476daf09036174601757c74f4c2d6913b2f2ef
+    image: ghcr.io/nicolaslallier/moria-inventory:sha-8b19a07a5825727235e7e92183c1a26dcdedf0e5
     # Sauvegarde finale sur SIGTERM.
     stop_grace_period: 30s
     volumes: ["moria-inventory:/data"]
@@ -66,7 +66,7 @@ services:
   # Le roi des nains : répond aux questions des joueurs via Ollama (LAN). Sans état, aucun volume.
   # Optionnel : s'il ou Ollama est arrêté, le jeu continue. Même épinglage provisoire que inventory.
   king:
-    image: ghcr.io/nicolaslallier/moria-king:sha-1d205a97793f926267747744f55cb1cfd45939bc
+    image: ghcr.io/nicolaslallier/moria-king:sha-8b19a07a5825727235e7e92183c1a26dcdedf0e5
     environment:
       AMQP_URL: *amqp
       OLLAMA_URL: ${OLLAMA_URL:-http://192.168.2.35:11434}
