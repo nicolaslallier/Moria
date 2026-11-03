@@ -9,8 +9,12 @@ pub const KEY_ACTION: &str = "food.action";
 pub const KEY_REJECT: &str = "food.reject";
 pub const KEY_EVENTS: &str = "food.events";
 pub const KEY_STATE: &str = "food.state";
-pub const MAX_FOOD_WORLD_BYTES: usize = 262_144;
+/// Every ground tile of all 16 mountains fits (6 bytes a cell at worst); far under the
+/// broker's message size limit (RabbitMQ default: 16 MiB in 4.x, 128 MiB before).
+pub const MAX_FOOD_WORLD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_FOOD_MSG_BYTES: usize = 16_384;
+/// The server refuses whole the events proposed more than this many ticks (5 s) ago.
+pub const MAX_EVENT_AGE: u64 = 50;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Tick {
@@ -54,8 +58,9 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::food::{CellKind, HERD_CAP, Species};
-    use crate::{MOUNTAIN_D, MOUNTAIN_H, MOUNTAIN_W, TilePos};
+    use crate::food::CellKind;
+    use crate::food::Species;
+    use crate::{GROUND_Z, MOUNTAIN_H, MOUNTAIN_W, TilePos};
 
     fn p(x: i16, y: i16) -> TilePos {
         TilePos { x, y, z: 0 }
@@ -125,33 +130,31 @@ mod tests {
 
     #[test]
     fn max_world_fits_in_the_limit() {
-        let cells = |n: usize| {
-            (0..n)
-                .map(|i| {
-                    let kind = if i < HERD_CAP {
-                        CellKind::Cow
-                    } else {
-                        CellKind::Field
-                    };
-                    let (x, y) = (i as i16 % MOUNTAIN_W, i as i16 % MOUNTAIN_H);
-                    Cell {
-                        pos: TilePos {
-                            x,
-                            y,
-                            z: MOUNTAIN_D - 1,
-                        },
-                        kind,
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+        // The server lists only the ground level (`snapshot`): at most every one of its
+        // MOUNTAIN_W x MOUNTAIN_H tiles per mountain, all 16 mountains of the world, at the
+        // farthest coordinates (longest varints).
+        let ground = (MOUNTAIN_W as usize) * (MOUNTAIN_H as usize);
+        let cells: Vec<Cell> = (0..MOUNTAIN_H)
+            .rev()
+            .flat_map(|y| (0..MOUNTAIN_W).rev().map(move |x| (x, y)))
+            .map(|(x, y)| Cell {
+                pos: TilePos::new(x, y, GROUND_Z),
+                kind: CellKind::Crop,
+            })
+            .collect();
+        assert_eq!(cells.len(), ground);
         let w = World {
             tick: u64::MAX,
-            mountains: (0..10)
-                .map(|i| (MountainId(i), cells(HERD_CAP + 4096)))
-                .collect(),
+            mountains: (0..16).map(|i| (MountainId(i), cells.clone())).collect(),
         };
+        // Upper bound: 6 bytes a cell, plus tick, ids and lengths.
+        assert!(16 * (ground * 6 + 8) + 16 <= MAX_FOOD_WORLD_BYTES);
         let b = enc(&w);
+        assert!(
+            b.len() > 16 * ground * 4,
+            "worst case too gentle: {}",
+            b.len()
+        );
         assert!(b.len() <= MAX_FOOD_WORLD_BYTES, "{}", b.len());
         assert!(decode::<World>(&b, MAX_FOOD_WORLD_BYTES).is_some());
     }

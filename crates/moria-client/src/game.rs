@@ -6,15 +6,20 @@ use crate::light::{Explored, SEEN_AT};
 use crate::net::{NetEvent, Notice};
 use bevy::prelude::States;
 use moria_core::GROUND_Z;
+use moria_core::king::{
+    Lang, MAX_REPLY_CHARS, MAX_TALK_CHARS, Quest, QuestId, king_in_reach, quest_def,
+};
 use moria_core::light::{Area, BODY_LIGHT, DayPhase, LightMap, hour, phase};
 use moria_core::protocol::{
-    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, Reject, ServerMsg, TickDelta,
+    ClientMsg, DwarfJob, DwarfState, FortressView, HeroView, InspectTarget, Inspection, Reject,
+    ServerMsg, TickDelta,
 };
 use moria_core::srd::{Abilities, modifier};
 use moria_core::{DesignationKind, Dir, Mountain, Resources, Tile, TilePos};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Two server ticks of 100 ms, plus a little slack for network jitter.
 // ponytail: fixed margin; measure real RTT jitter if moves still get dropped server-side.
@@ -246,6 +251,84 @@ pub fn ability_rows(a: Abilities) -> [(&'static str, u8, String); 6] {
     .map(|(n, s)| (n, s, format!("{:+}", modifier(s))))
 }
 
+/// Délai client au-delà duquel « le roi réfléchit… » disparaît (le serveur se replie à 70 s).
+pub const KING_TIMEOUT: Duration = Duration::from_secs(75);
+/// Échanges gardés dans le journal du dialogue.
+const LOG_LEN: usize = 50;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who {
+    Player,
+    King,
+}
+
+/// Fenêtre de dialogue avec le roi (touche E à côté de lui).
+#[derive(Default)]
+pub struct Dialog {
+    /// Fenêtre affichée ; la fermer ne touche ni au journal ni à l'attente.
+    pub open: bool,
+    pub input: String,
+    pub log: Vec<(Who, String)>,
+    /// Question envoyée, réponse attendue depuis cet instant.
+    pub waiting_since: Option<Instant>,
+    /// Quête proposée par la dernière réplique du roi.
+    pub offer: Option<QuestId>,
+}
+
+/// Titre et description d'une quête : le seul endroit des textes du catalogue.
+pub fn quest_text(id: QuestId, lang: Lang) -> (&'static str, &'static str) {
+    let ((fr_t, fr_d), (en_t, en_d)) = match id {
+        QuestId::ForgeIngots => (
+            ("Forger des lingots", "Fondre du fer à la forge."),
+            ("Forge ingots", "Smelt iron at the forge."),
+        ),
+        QuestId::ForgeDoors => (
+            ("Forger des portes", "Forger des portes en fer à l'enclume."),
+            ("Forge doors", "Forge iron doors at the anvil."),
+        ),
+        QuestId::Food => (
+            (
+                "Rapporter de la nourriture",
+                "Réunir des vivres et les remettre au roi.",
+            ),
+            ("Bring food", "Gather food and hand it to the king."),
+        ),
+        QuestId::Depth => (
+            (
+                "Creuser en profondeur",
+                "Descendre sous le sol de la montagne.",
+            ),
+            ("Dig deep", "Go down below the mountain's ground level."),
+        ),
+    };
+    match lang {
+        Lang::Fr => (fr_t, fr_d),
+        Lang::En => (en_t, en_d),
+    }
+}
+
+/// Avancement visible par le client : la production des forges n'est connue que du serveur.
+pub fn quest_progress(g: &Game, q: Quest) -> String {
+    let target = quest_def(q.id).target;
+    match q.id {
+        QuestId::Food => format!("{} / {target}", g.resources.food.min(target)),
+        QuestId::Depth => {
+            let depth = u32::from(g.hero.pos.z.saturating_sub(GROUND_Z));
+            format!("{} / {target}", depth.min(target))
+        }
+        QuestId::ForgeIngots | QuestId::ForgeDoors => {
+            format!("{}{target}", tr("Objectif : ", "Goal: "))
+        }
+    }
+}
+
+fn push_log(log: &mut Vec<(Who, String)>, who: Who, text: String) {
+    log.push((who, text));
+    if log.len() > LOG_LEN {
+        log.remove(0);
+    }
+}
+
 pub struct Game {
     pub mountain: Mountain,
     pub hero: HeroView,
@@ -263,6 +346,14 @@ pub struct Game {
     pub map_rev: u32,
     /// Status page (key C) open.
     pub status: bool,
+    /// Creature shown in the status panel (middle click).
+    pub inspect: Option<InspectTarget>,
+    /// Latest vitals the server sent for `inspect`.
+    pub inspection: Option<Inspection>,
+    /// Last `Inspect` request: target (`None` once the panel closed) and time (s).
+    pub inspect_asked: (Option<InspectTarget>, f64),
+    /// One-line notice and the `ticks` value it was raised at.
+    pub toast: Option<(String, u64)>,
     /// Escape menu open: main menu, save, language, quit. The world keeps running.
     pub pause: bool,
     /// Highlighted row of the pause menu, for keyboard and gamepad.
@@ -287,7 +378,14 @@ pub struct Game {
     pub confirmed: TilePos,
     /// Predicted positions not yet seen in a tick, with the local tick count at send.
     pub pending: VecDeque<(TilePos, u64)>,
-    ticks: u64,
+    pub ticks: u64,
+    /// Case du roi.
+    pub king: TilePos,
+    /// Quête active, tenue à jour par le snapshot et `ServerMsg::Quest`.
+    pub quest: Option<Quest>,
+    /// Quêtes terminées : chacune ne se fait qu'une fois.
+    pub done: Vec<QuestId>,
+    pub dialog: Dialog,
 }
 
 /// Everything the player can build: mode and label; the cost is `kind.cost()`.
@@ -379,12 +477,20 @@ impl Game {
         }
     }
 
-    /// Closes the build, order and status menus; true if one was open.
+    /// Closes the build, order, status and inspect menus and the king's dialogue; true if one
+    /// was open.
     pub fn close_menus(&mut self) -> bool {
-        let open = self.build_menu || self.status || self.order_menu.is_some();
+        let open = self.build_menu
+            || self.status
+            || self.order_menu.is_some()
+            || self.inspect.is_some()
+            || self.dialog.open;
         self.build_menu = false;
+        self.close_inspect();
         self.status = false;
         self.order_menu = None;
+        // Ferme seulement la fenêtre : une question en vol le reste (une seule à la fois).
+        self.dialog.open = false;
         open
     }
 
@@ -426,6 +532,10 @@ impl Game {
             memory: None,
             map_rev: 0,
             status: false,
+            inspect: None,
+            inspection: None,
+            inspect_asked: (None, f64::NEG_INFINITY),
+            toast: None,
             pause: false,
             pause_sel: 0,
             pause_pick: false,
@@ -439,6 +549,10 @@ impl Game {
             last_move: f64::NEG_INFINITY,
             pending: VecDeque::new(),
             ticks: 0,
+            king: v.king,
+            quest: v.quest,
+            done: v.done,
+            dialog: Dialog::default(),
         }
     }
 
@@ -490,6 +604,57 @@ impl Game {
         }
     }
 
+    /// The `Inspect` request to send now, if the panel needs one.
+    pub fn poll_inspect(&mut self, now: f64) -> Option<ClientMsg> {
+        if self.inspect.is_none() {
+            // Closed: reopening the same target asks soon. Relies on this running every
+            // frame (the `inspect_poll` system), so a close is always seen here.
+            self.inspect_asked.0 = None;
+        }
+        if !inspect_due(self.inspect, self.inspect_asked, now) {
+            return None;
+        }
+        let t = self.inspect?;
+        self.inspect_asked = (Some(t), now);
+        Some(ClientMsg::Inspect(t))
+    }
+
+    /// Server reply about `t`: kept if `t` is the open panel's target (a late reply for a
+    /// closed or previous panel is dropped); `None` means it is gone.
+    pub fn on_inspected(&mut self, t: InspectTarget, i: Option<Inspection>) {
+        if self.inspect != Some(t) {
+            return;
+        }
+        match i {
+            Some(i) => self.inspection = Some(i),
+            None => {
+                self.close_inspect();
+                self.say(tr("Disparu", "Gone"));
+            }
+        }
+    }
+
+    /// Closes the inspect panel and forgets its vitals.
+    fn close_inspect(&mut self) {
+        self.inspect = None;
+        self.inspection = None;
+    }
+
+    /// Shows a one-line notice for a few seconds.
+    pub fn say(&mut self, text: &str) {
+        self.toast = Some((text.to_string(), self.ticks));
+    }
+
+    /// Creatures on this tile of level `z`: the hero first, then the dwarves.
+    pub fn targets_at(&self, tile: (i16, i16), z: u8) -> Vec<InspectTarget> {
+        let at = |p: TilePos| (p.x, p.y, p.z) == (tile.0, tile.1, z);
+        let hero = at(self.hero.pos).then_some(InspectTarget::Hero);
+        let dwarves = self.dwarves.iter().filter(|d| at(d.1));
+        hero.into_iter()
+            .chain(dwarves.map(|d| InspectTarget::Dwarf(d.0)))
+            .collect()
+    }
+
     pub fn current_z(&self) -> u8 {
         self.browse_z.unwrap_or(self.hero.pos.z)
     }
@@ -530,6 +695,12 @@ impl Game {
             .extend(d.dwarves.iter().filter(|(_, p, _)| m.in_bounds(*p)));
         self.resources = d.resources;
         self.hungry.clone_from(&d.hungry);
+        for id in &d.died {
+            if self.inspect == Some(InspectTarget::Dwarf(*id)) {
+                self.close_inspect();
+            }
+            self.say(tr("Un nain est mort de faim", "A dwarf starved to death"));
+        }
         self.tick = d.tick;
         self.ticks += 1;
         let s = d.hero_pos;
@@ -628,7 +799,90 @@ impl Game {
                 .then_some(ClientMsg::Dig(self.last_dir))
         }
     }
+
+    /// Le héros est à portée de voix du roi.
+    pub fn near_king(&self) -> bool {
+        king_in_reach(self.king, self.hero.pos)
+    }
+
+    /// Envoie la saisie au roi (`Enter`) : ni vide, ni pendant l'attente d'une réponse.
+    pub fn send_talk(&mut self, now: Instant, lang: Lang) -> Option<ClientMsg> {
+        if self.dialog_waiting(now) {
+            return None;
+        }
+        let d = &mut self.dialog;
+        let text: String = d.input.trim().chars().take(MAX_TALK_CHARS).collect();
+        if text.is_empty() {
+            return None;
+        }
+        d.input.clear();
+        d.waiting_since = Some(now);
+        push_log(&mut d.log, Who::Player, text.clone());
+        Some(ClientMsg::Talk { text, lang })
+    }
+
+    /// Une réponse est attendue ; l'attente cesse d'elle-même après `KING_TIMEOUT`.
+    pub fn dialog_waiting(&mut self, now: Instant) -> bool {
+        let d = &mut self.dialog;
+        if d.waiting_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= KING_TIMEOUT)
+        {
+            d.waiting_since = None;
+        }
+        d.waiting_since.is_some()
+    }
+
+    /// Réplique du roi : notée au journal sans rouvrir la fenêtre (E la rouvre à côté du roi).
+    pub fn king_say(&mut self, text: String, offer: Option<QuestId>) {
+        let d = &mut self.dialog;
+        // Texte venu du réseau : borné comme côté serveur.
+        push_log(
+            &mut d.log,
+            Who::King,
+            text.chars().take(MAX_REPLY_CHARS).collect(),
+        );
+        d.waiting_since = None;
+        d.offer = offer;
+    }
+
+    /// La quête que le bouton Accepter enverrait.
+    pub fn can_accept(&self) -> Option<QuestId> {
+        let id = self.dialog.offer?;
+        (self.quest.is_none() && !self.done.contains(&id)).then_some(id)
+    }
+
+    /// Nouvelle quête active ; passer de `Some` à `None` veut dire qu'elle est terminée.
+    pub fn set_quest(&mut self, q: Option<Quest>) {
+        if let (Some(old), None) = (self.quest, q)
+            && !self.done.contains(&old.id)
+        {
+            self.done.push(old.id);
+        }
+        self.quest = q;
+    }
+
+    /// Le bouton « Remettre la nourriture » : quête Food, roi à portée, stock suffisant.
+    pub fn can_turn_in(&self) -> bool {
+        self.quest.is_some_and(|q| q.id == QuestId::Food)
+            && self.near_king()
+            && self.resources.food >= quest_def(QuestId::Food).target
+    }
 }
+
+/// Whether to send `Inspect` for `open` now, given the last request `asked`: once a second
+/// for the same target, soon after opening or changing target, never two within
+/// `INSPECT_GAP` (the server drops an Inspect under 100 ms after the previous one).
+pub fn inspect_due(
+    open: Option<InspectTarget>,
+    asked: (Option<InspectTarget>, f64),
+    now: f64,
+) -> bool {
+    let (last, at) = asked;
+    open.is_some_and(|t| now - at >= if last == Some(t) { 1.0 } else { INSPECT_GAP })
+}
+
+/// Shortest gap between two `Inspect`, in seconds: above the server's 100 ms limit.
+const INSPECT_GAP: f64 = 0.15;
 
 /// Designations to outline on level `z`, lit or not: the player plans tunnels through unseen rock.
 pub fn outlined(
@@ -701,6 +955,24 @@ impl Session {
                 }
                 false
             }
+            NetEvent::Msg(ServerMsg::KingSay { text, offer }) => {
+                if let Some(g) = &mut self.game {
+                    g.king_say(text, offer);
+                }
+                false
+            }
+            NetEvent::Msg(ServerMsg::Quest(q)) => {
+                if let Some(g) = &mut self.game {
+                    g.set_quest(q);
+                }
+                false
+            }
+            NetEvent::Msg(ServerMsg::Inspected(t, i)) => {
+                if let Some(g) = &mut self.game {
+                    g.on_inspected(t, i);
+                }
+                false
+            }
             NetEvent::Disconnected(reason) => {
                 // Before login, the reason shows on the login screen itself.
                 let to = match self.screen {
@@ -770,6 +1042,29 @@ pub(crate) mod tests {
 
     fn p(x: i16, y: i16, z: u8) -> TilePos {
         TilePos::new(x, y, z)
+    }
+
+    #[test]
+    fn targets_at_lists_hero_then_dwarves() {
+        let mut g = game();
+        g.dwarves = vec![
+            (DwarfId(1), p(2, 1, 0), None),
+            (DwarfId(2), p(3, 1, 0), None),
+            (DwarfId(3), p(2, 1, 0), None),
+        ];
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        assert_eq!(g.targets_at((2, 1), 0), [InspectTarget::Hero, dw(1), dw(3)]);
+        assert_eq!(g.targets_at((3, 1), 0), [dw(2)]);
+    }
+
+    #[test]
+    fn targets_at_ignores_other_levels_and_empty_tiles() {
+        let mut g = game();
+        g.dwarves = vec![(DwarfId(1), p(3, 1, 0), None)];
+        assert!(g.targets_at((3, 1), 1).is_empty());
+        assert!(g.targets_at((4, 1), 0).is_empty());
+        // Browsing another level: the hero is not under the cursor there.
+        assert!(g.targets_at((2, 1), 1).is_empty());
     }
 
     /// 6×6×3 rock; floor at (1..=3, 1, 0); stairs at (1,1,0)-(1,1,1).
@@ -883,12 +1178,16 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 100,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         })
     }
 
     fn tick(hero_pos: TilePos) -> TickDelta {
         TickDelta {
             hungry: vec![],
+            died: vec![],
             tick: 1,
             hero_pos,
             dwarves: vec![],
@@ -898,6 +1197,130 @@ pub(crate) mod tests {
             resources: Resources::default(),
             orders: vec![],
         }
+    }
+
+    fn inspection(target: InspectTarget) -> Inspection {
+        Inspection {
+            target,
+            vitals: None,
+        }
+    }
+
+    fn playing(g: Game) -> Session {
+        Session {
+            game: Some(g),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inspected_none_closes_panel_with_message() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut s = playing(g);
+        let dw = |n| InspectTarget::Dwarf(DwarfId(n));
+        // A late "not found" for a previously inspected dwarf leaves this panel alone.
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(2), None)));
+        let g = s.game.as_ref().unwrap();
+        assert_eq!(g.inspect, Some(dw(1)));
+        assert_eq!(g.toast, None);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw(1), None)));
+        let g = s.game.unwrap();
+        assert_eq!(g.inspect, None);
+        assert_eq!(g.inspection, None);
+        assert_eq!(g.toast.unwrap().0, "Disparu");
+    }
+
+    #[test]
+    fn stale_inspected_for_another_target_is_ignored() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        let mut s = playing(g);
+        let dw = InspectTarget::Dwarf(DwarfId(1));
+        let other = inspection(dw);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(dw, Some(other))));
+        assert_eq!(s.game.as_ref().unwrap().inspection, None);
+        let mine = inspection(InspectTarget::Hero);
+        s.handle(NetEvent::Msg(ServerMsg::Inspected(
+            InspectTarget::Hero,
+            Some(mine),
+        )));
+        assert_eq!(s.game.unwrap().inspection, Some(mine));
+    }
+
+    #[test]
+    fn inspect_requested_on_open_then_at_most_once_per_second() {
+        let hero = Some(InspectTarget::Hero);
+        let dw = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let never = (None, f64::NEG_INFINITY);
+        assert!(!inspect_due(None, never, 0.0));
+        assert!(inspect_due(hero, never, 0.0));
+        assert!(!inspect_due(hero, (hero, 0.0), 0.9));
+        assert!(inspect_due(hero, (hero, 0.0), 1.0));
+        // Another target asks within the second, but never within 150 ms of the last
+        // request: the server drops an Inspect under 100 ms after the previous one.
+        assert!(inspect_due(dw, (hero, 0.0), 0.5));
+        assert!(!inspect_due(dw, (hero, 0.0), 0.05));
+        assert!(inspect_due(dw, (hero, 0.0), 0.15));
+        assert!(
+            !inspect_due(hero, (None, 0.0), 0.05),
+            "closed then reopened"
+        );
+        let mut g = game();
+        g.inspect = hero;
+        assert_eq!(
+            g.poll_inspect(5.0),
+            Some(ClientMsg::Inspect(InspectTarget::Hero))
+        );
+        assert_eq!(g.poll_inspect(5.5), None);
+        assert!(g.poll_inspect(6.0).is_some());
+    }
+
+    #[test]
+    fn inspected_none_with_no_open_panel_shows_no_toast() {
+        let mut g = game();
+        g.on_inspected(InspectTarget::Hero, None);
+        assert_eq!(g.toast, None);
+    }
+
+    #[test]
+    fn reopening_same_target_asks_at_once() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.0).is_some());
+        g.inspect = None;
+        assert_eq!(g.poll_inspect(5.2), None);
+        g.inspect = Some(InspectTarget::Hero);
+        assert!(g.poll_inspect(5.3).is_some());
+        // Switching target at once is delayed, not lost.
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        assert_eq!(g.poll_inspect(5.35), None);
+        assert!(g.poll_inspect(5.45).is_some());
+    }
+
+    #[test]
+    fn died_in_delta_reports_message() {
+        let mut g = game();
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+    }
+
+    #[test]
+    fn died_inspected_dwarf_closes_panel() {
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(1)));
+        let mut d = tick(p(2, 1, 0));
+        d.died = vec![DwarfId(1)];
+        g.apply_tick(&d);
+        assert_eq!((g.inspect, g.inspection), (None, None));
+        assert_eq!(g.toast.unwrap().0, "Un nain est mort de faim");
+        // Another dwarf's death leaves the panel open.
+        let mut g = game();
+        g.inspect = Some(InspectTarget::Dwarf(DwarfId(2)));
+        g.apply_tick(&d);
+        assert!(g.inspect.is_some());
     }
 
     #[test]
@@ -1047,6 +1470,9 @@ pub(crate) mod tests {
                 dwarves: vec![],
                 resources: Resources::default(),
                 tick: 0,
+                king: TilePos::new(0, 0, 0),
+                quest: None,
+                done: vec![],
             })))
         };
         // Tile vec not matching the dimensions (only possible via deserialization).
@@ -1103,6 +1529,9 @@ pub(crate) mod tests {
                 dwarves: vec![],
                 resources: Resources::default(),
                 tick: 0,
+                king: TilePos::new(0, 0, 0),
+                quest: None,
+                done: vec![],
             })))
         };
         let mut s = Session::default();
@@ -1371,6 +1800,9 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view))));
         assert_eq!(s.screen, Screen::Playing);
@@ -1558,6 +1990,9 @@ pub(crate) mod tests {
                 .collect(),
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let mut s = Session::default();
         assert!(!s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view)))));
@@ -1574,6 +2009,9 @@ pub(crate) mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let mut s = Session::default();
         s.handle(NetEvent::Msg(ServerMsg::Snapshot(Box::new(view.clone()))));
@@ -1647,5 +2085,182 @@ pub(crate) mod tests {
             build_text(DesignationKind::Anvil, "Enclume"),
             "Enclume (3 lingots)"
         );
+    }
+
+    #[test]
+    fn dialog_closes_on_escape() {
+        let mut g = game();
+        g.dialog.open = true;
+        g.escape();
+        assert!(!g.dialog.open && !g.pause);
+    }
+
+    #[test]
+    fn waiting_indicator_clears_after_75s() {
+        let mut g = game();
+        g.dialog = Dialog {
+            open: true,
+            input: "Salut".into(),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        assert!(g.send_talk(t0, Lang::Fr).is_some());
+        assert!(g.dialog_waiting(t0 + Duration::from_secs(74)));
+        // Pas de seconde question tant que le roi réfléchit.
+        g.dialog.input = "Encore".into();
+        assert_eq!(g.send_talk(t0 + Duration::from_secs(74), Lang::Fr), None);
+        assert!(!g.dialog_waiting(t0 + KING_TIMEOUT));
+        assert!(g.send_talk(t0 + KING_TIMEOUT, Lang::Fr).is_some());
+    }
+
+    #[test]
+    fn talk_sends_the_trimmed_input_in_the_chosen_language_never_empty() {
+        let mut g = game();
+        g.dialog = Dialog {
+            open: true,
+            input: "   ".into(),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        assert_eq!(g.send_talk(t0, Lang::En), None);
+        g.dialog.input = format!(" {} ", "é".repeat(300));
+        let Some(ClientMsg::Talk { text, lang }) = g.send_talk(t0, Lang::En) else {
+            panic!("no Talk")
+        };
+        assert_eq!((text.chars().count(), lang), (MAX_TALK_CHARS, Lang::En));
+        let d = &g.dialog;
+        assert!(d.input.is_empty());
+        assert_eq!(d.log, vec![(Who::Player, text)]);
+        assert!(d.waiting_since.is_some());
+    }
+
+    #[test]
+    fn near_king_is_one_tile_on_the_same_level() {
+        let mut g = game(); // héros en (2, 1, 0)
+        g.king = p(1, 0, 0);
+        assert!(g.near_king());
+        g.king = p(0, 0, 0);
+        assert!(!g.near_king());
+        g.king = p(2, 1, 1);
+        assert!(!g.near_king());
+    }
+
+    #[test]
+    fn kingsay_with_offer_enables_accept_and_a_refused_accept_resync() {
+        let mut s = Session {
+            screen: Screen::Playing,
+            game: Some(game()),
+            ..Default::default()
+        };
+        s.game.as_mut().unwrap().dialog = Dialog {
+            open: true,
+            input: "Une tâche ?".into(),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        s.game.as_mut().unwrap().send_talk(t0, Lang::Fr).unwrap();
+        s.handle(NetEvent::Msg(ServerMsg::KingSay {
+            text: "Rapporte-moi des vivres.".into(),
+            offer: Some(QuestId::Food),
+        }));
+        let g = s.game.as_mut().unwrap();
+        assert!(!g.dialog_waiting(t0));
+        assert_eq!(g.can_accept(), Some(QuestId::Food));
+        assert_eq!(
+            g.dialog.log.last(),
+            Some(&(Who::King, "Rapporte-moi des vivres.".to_string()))
+        );
+        // Refus : le serveur renvoie l'état réel, ici une autre quête déjà active.
+        let other = Quest {
+            id: QuestId::Depth,
+            baseline: 0,
+        };
+        s.handle(NetEvent::Msg(ServerMsg::Quest(Some(other))));
+        let g = s.game.as_mut().unwrap();
+        assert_eq!(g.quest, Some(other));
+        assert_eq!(g.can_accept(), None);
+        // Terminée : la quête passe dans `done` et ne peut plus être acceptée.
+        s.handle(NetEvent::Msg(ServerMsg::Quest(None)));
+        let g = s.game.as_mut().unwrap();
+        assert_eq!((g.quest, g.done.clone()), (None, vec![QuestId::Depth]));
+        assert_eq!(g.can_accept(), Some(QuestId::Food));
+        g.dialog.offer = Some(QuestId::Depth);
+        assert_eq!(g.can_accept(), None);
+    }
+
+    /// Une question en vol, puis Échap.
+    fn asked_then_closed(t0: Instant) -> Game {
+        let mut g = game();
+        g.dialog = Dialog {
+            open: true,
+            input: "Une tâche ?".into(),
+            ..Default::default()
+        };
+        g.send_talk(t0, Lang::Fr).unwrap();
+        g.escape();
+        assert!(!g.dialog.open);
+        g
+    }
+
+    #[test]
+    fn escape_keeps_the_wait_state_so_a_second_talk_is_refused() {
+        let t0 = Instant::now();
+        let mut g = asked_then_closed(t0);
+        g.dialog.open = true;
+        g.dialog.input = "Alors ?".into();
+        let later = t0 + Duration::from_secs(5);
+        assert!(g.dialog_waiting(later));
+        assert_eq!(g.send_talk(later, Lang::Fr), None);
+        // Le texte tapé reste là pour plus tard.
+        assert_eq!(g.dialog.input, "Alors ?");
+        assert_eq!(g.dialog.log.len(), 1);
+    }
+
+    #[test]
+    fn late_kingsay_after_escape_does_not_reopen_the_window() {
+        let t0 = Instant::now();
+        let mut s = Session {
+            screen: Screen::Playing,
+            game: Some(asked_then_closed(t0)),
+            ..Default::default()
+        };
+        s.handle(NetEvent::Msg(ServerMsg::KingSay {
+            text: "Hm.".into(),
+            offer: Some(QuestId::Food),
+        }));
+        let g = s.game.as_mut().unwrap();
+        assert!(!g.dialog.open);
+        assert!(!g.dialog_waiting(t0));
+        assert_eq!(g.dialog.log.last(), Some(&(Who::King, "Hm.".to_string())));
+        assert_eq!(g.dialog.offer, Some(QuestId::Food));
+    }
+
+    #[test]
+    fn a_new_game_starts_with_a_closed_empty_dialog() {
+        let d = game().dialog;
+        assert!(!d.open && d.log.is_empty() && d.waiting_since.is_none() && d.offer.is_none());
+    }
+
+    #[test]
+    fn turn_in_only_for_the_food_quest_in_reach_with_enough_food() {
+        let mut g = game();
+        g.king = p(1, 0, 0);
+        g.resources.food = quest_def(QuestId::Food).target;
+        assert!(!g.can_turn_in()); // pas de quête
+        g.quest = Some(Quest {
+            id: QuestId::Depth,
+            baseline: 0,
+        });
+        assert!(!g.can_turn_in());
+        g.quest = Some(Quest {
+            id: QuestId::Food,
+            baseline: 0,
+        });
+        assert!(g.can_turn_in());
+        g.resources.food -= 1;
+        assert!(!g.can_turn_in());
+        g.resources.food += 1;
+        g.king = p(0, 0, 0);
+        assert!(!g.can_turn_in());
     }
 }

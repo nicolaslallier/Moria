@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_OWNED: usize = 10;
 /// Little-endian u32 at the start of world.bin; bump it when `World` changes shape.
-pub const SAVE_VERSION: u32 = 5;
+pub const SAVE_VERSION: u32 = 7;
+/// A full food gauge: one meal interval (`DAY_TICKS / 4`), as the server's `EAT_EVERY`.
+pub const FOOD_MAX: u16 = (crate::light::DAY_TICKS / 4) as u16;
+pub const HEALTH_MAX: u16 = 100;
 const GRID: i32 = 4;
 /// The entrance room, on `GROUND_Z`; it opens west onto the grass at x = 127.
 pub const ENTRANCE_X: std::ops::Range<i16> = 128..134;
@@ -57,6 +60,8 @@ pub struct Hero {
     /// Not saved.
     #[serde(skip)]
     pub pending_dig: Option<(Dir, DesignationKind)>,
+    pub food: u16,
+    pub health: u16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -74,6 +79,26 @@ pub struct Dwarf {
     pub task: Option<DwarfTask>,
     /// Missed a meal: only goes after food until it has eaten.
     pub hungry: bool,
+    pub food: u16,
+    pub health: u16,
+    pub ticks_alive: u64,
+    pub jobs_done: u32,
+}
+
+impl Dwarf {
+    /// A newborn dwarf: fed, healthy, no history.
+    pub fn new(id: DwarfId, pos: TilePos) -> Self {
+        Dwarf {
+            id,
+            pos,
+            task: None,
+            hungry: false,
+            food: FOOD_MAX,
+            health: HEALTH_MAX,
+            ticks_alive: 0,
+            jobs_done: 0,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -82,6 +107,21 @@ pub struct Fortress {
     pub hero: Option<Hero>,
     pub dwarves: Vec<Dwarf>,
     pub resources: Resources,
+    /// Le roi nain, immobile sur son trône ; il n'est pas dans `dwarves`.
+    pub king: TilePos,
+    pub quest: Option<crate::king::Quest>,
+    pub done: Vec<crate::king::QuestId>,
+    /// Production brute de la forteresse, jamais décrémentée (contrairement aux ressources).
+    pub made: Production,
+    /// Plus grande profondeur atteinte (niveaux sous le sol) ; contexte du roi seulement,
+    /// la quête `Depth` mesure la profondeur actuelle du héros.
+    pub max_depth: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Production {
+    pub ingots: u32,
+    pub doors: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -93,6 +133,9 @@ pub struct World {
     pub accounts: BTreeMap<String, Account>,
     pub next_dwarf: u32,
     pub tick: u64,
+    /// The food container is down: food freezes and meals are skipped. Not saved.
+    #[serde(skip)]
+    pub food_paused: bool,
 }
 
 /// One fortress map. Outdoors (x < 128): grass with trees on `GROUND_Z`, 2 levels of soil,
@@ -274,6 +317,7 @@ fn generate_base(seed: u64) -> World {
         accounts: BTreeMap::new(),
         next_dwarf: 0,
         tick: 0,
+        food_paused: false,
     };
     for i in 0..(GRID * GRID) {
         let id = MountainId(i as u16);
@@ -291,7 +335,37 @@ fn generate_base(seed: u64) -> World {
 pub fn generate(seed: u64) -> World {
     let mut w = generate_base(seed);
     add_iron_and_coal(&mut w);
+    add_throne_room(&mut w);
     w
+}
+
+/// Salle du trône : 9×7 dans la roche, sur le niveau de l'entrée ; le roi trône au fond.
+const ROOM_X: std::ops::RangeInclusive<i16> = 140..=148;
+const ROOM_Y: std::ops::RangeInclusive<i16> = 45..=51;
+
+pub fn throne_pos() -> TilePos {
+    TilePos::new(146, 48, GROUND_Z)
+}
+
+/// Salle du trône et couloir vers l'entrée. Disposition fixe (donc identique dans chaque
+/// montagne) : elle n'utilise pas de hasard, le monde existant reste intact.
+fn add_throne_room(w: &mut World) {
+    for m in w.mountains.values_mut() {
+        let at = |x, y| TilePos::new(x, y, GROUND_Z);
+        for x in ENTRANCE_X.end..=*ROOM_X.start() {
+            m.set(at(x, 49), Tile::Floor);
+        }
+        for x in ROOM_X {
+            for y in ROOM_Y {
+                m.set(at(x, y), Tile::Floor);
+            }
+        }
+        m.set(throne_pos(), Tile::Throne);
+        for (x, y) in [(144, 45), (148, 45), (144, 51), (148, 51)] {
+            m.set(at(x, y), Tile::Torch);
+        }
+        m.set(at(143, 48), Tile::Table);
+    }
 }
 
 /// Iron and coal veins, from their own RNG so the base generation stays untouched.
@@ -340,7 +414,7 @@ pub fn save_version(path: &Path) -> io::Result<Option<u32>> {
 pub fn reset_if_outdated(path: &Path, fallback_seed: u64) -> io::Result<Option<PathBuf>> {
     match save_version(path)? {
         None => Ok(None),
-        Some(v) if v == SAVE_VERSION => Ok(None),
+        Some(v) if v == SAVE_VERSION || v == v5::VERSION => Ok(None),
         Some(v) if v > SAVE_VERSION => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -373,12 +447,7 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
     let dwarves = entrance_tiles()
         .take(3)
         .zip(w.next_dwarf..)
-        .map(|(pos, i)| Dwarf {
-            id: DwarfId(i),
-            pos,
-            task: None,
-            hungry: false,
-        })
+        .map(|(pos, i)| Dwarf::new(DwarfId(i), pos))
         .collect();
     w.next_dwarf += 3;
     w.fortresses.insert(
@@ -391,6 +460,11 @@ pub fn claim_mountain(w: &mut World, player: PlayerId) -> Option<MountainId> {
                 food: 12,
                 ..Default::default()
             },
+            king: throne_pos(),
+            quest: None,
+            done: vec![],
+            made: Production::default(),
+            max_depth: 0,
         },
     );
     Some(id)
@@ -416,7 +490,118 @@ pub fn load(path: &Path) -> io::Result<World> {
     };
     match u32::from_le_bytes(*v) {
         SAVE_VERSION => postcard::from_bytes(body).map_err(io::Error::other),
+        v5::VERSION => postcard::from_bytes::<v5::World>(body)
+            .map(World::from)
+            .map_err(io::Error::other),
         n => Err(bad(format!("format de sauvegarde v{n} non supporté"))),
+    }
+}
+
+/// The v5 save layout (`Dwarf` and `Hero` without vitals), loaded with full vitals.
+/// postcard is not self-describing: an old layout needs its own structs.
+/// It reuses the live `Region`/`Mountain`/`Account`/`DigJob`/`DwarfTask` types: a future
+/// change to their serialized shape must freeze copies of them here.
+mod v5 {
+    use super::{Account, DigJob, DwarfTask, FOOD_MAX, HEALTH_MAX, Region};
+    use crate::srd::{Abilities, Class, Race};
+    use crate::*;
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    pub const VERSION: u32 = 5;
+
+    #[derive(Deserialize)]
+    pub struct Hero {
+        name: String,
+        race: Race,
+        class: Class,
+        abilities: Abilities,
+        pos: TilePos,
+        dig: Option<DigJob>,
+        move_cooldown: u8,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Dwarf {
+        id: DwarfId,
+        pos: TilePos,
+        task: Option<DwarfTask>,
+        hungry: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Fortress {
+        owner: PlayerId,
+        hero: Option<Hero>,
+        dwarves: Vec<Dwarf>,
+        resources: Resources,
+    }
+
+    #[derive(Deserialize)]
+    pub struct World {
+        seed: u64,
+        regions: Vec<Region>,
+        mountains: BTreeMap<MountainId, Mountain>,
+        fortresses: BTreeMap<MountainId, Fortress>,
+        accounts: BTreeMap<String, Account>,
+        next_dwarf: u32,
+        tick: u64,
+    }
+
+    impl From<World> for super::World {
+        fn from(w: World) -> Self {
+            let fortresses = w.fortresses.into_iter().map(|(id, f)| {
+                let hero = f.hero.map(|h| super::Hero {
+                    name: h.name,
+                    race: h.race,
+                    class: h.class,
+                    abilities: h.abilities,
+                    pos: h.pos,
+                    dig: h.dig,
+                    move_cooldown: h.move_cooldown,
+                    pending_move: None,
+                    pending_dig: None,
+                    food: FOOD_MAX,
+                    health: HEALTH_MAX,
+                });
+                let dwarves = f
+                    .dwarves
+                    .into_iter()
+                    .map(|d| super::Dwarf {
+                        task: d.task,
+                        hungry: d.hungry,
+                        // A hungry dwarf shows an empty gauge; `ticks_alive` restarts at 0.
+                        food: if d.hungry { 0 } else { FOOD_MAX },
+                        ..super::Dwarf::new(d.id, d.pos)
+                    })
+                    .collect();
+                let f = super::Fortress {
+                    owner: f.owner,
+                    hero,
+                    dwarves,
+                    resources: f.resources,
+                    king: super::throne_pos(),
+                    quest: None,
+                    done: vec![],
+                    made: super::Production::default(),
+                    max_depth: 0,
+                };
+                (id, f)
+            });
+            let mut world = super::World {
+                seed: w.seed,
+                regions: w.regions,
+                mountains: w.mountains,
+                fortresses: fortresses.collect(),
+                accounts: w.accounts,
+                next_dwarf: w.next_dwarf,
+                tick: w.tick,
+                food_paused: false,
+            };
+            // A v5 mountain predates the throne room: carve it (fixed layout).
+            super::add_throne_room(&mut world);
+            world
+        }
     }
 }
 
@@ -458,6 +643,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&view).len();
         assert!(n < MAX_FRAME, "{n} >= {MAX_FRAME}");
@@ -475,6 +663,9 @@ mod tests {
         for (id, m) in &w.mountains {
             let mut n = (0, 0);
             for ((p, t), (_, b)) in tiles(m).zip(tiles(&base.mountains[id])) {
+                if room_area(p) {
+                    continue;
+                }
                 match t {
                     Tile::IronOre => n.0 += 1,
                     Tile::Coal => n.1 += 1,
@@ -538,6 +729,81 @@ mod tests {
         let w = load(&p).unwrap();
         assert_eq!(w.seed, 42);
         assert_eq!(encode(&w), encode(&generate(42)));
+    }
+
+    fn room_area(p: TilePos) -> bool {
+        p.z == GROUND_Z
+            && (ENTRANCE_X.end..=*ROOM_X.end()).contains(&p.x)
+            && (ROOM_Y.start() - 1..=ROOM_Y.end() + 1).contains(&p.y)
+    }
+
+    #[test]
+    fn throne_room_is_walkable_from_the_entrance() {
+        for seed in 1..=8 {
+            let w = generate(seed);
+            let k = throne_pos();
+            for m in w.mountains.values() {
+                let start = entrance_tiles().next().unwrap();
+                let near_king = |p: TilePos| {
+                    p != k && p.z == k.z && (p.x - k.x).abs() <= 1 && (p.y - k.y).abs() <= 1
+                };
+                let path = crate::path::find_path(m, start, near_king, &Default::default());
+                assert!(path.is_some(), "seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn throne_room_leaves_the_rest_of_the_world_untouched() {
+        let mut base = generate_base(1);
+        add_iron_and_coal(&mut base);
+        let w = generate(1);
+        for (id, m) in &w.mountains {
+            let (bw, bh, bd) = m.size();
+            for z in 0..bd {
+                for y in 0..bh {
+                    for x in 0..bw {
+                        let p = TilePos::new(x, y, z);
+                        if !room_area(p) {
+                            assert_eq!(m.get(p), base.mountains[id].get(p), "{p:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn king_stands_on_the_throne_tile() {
+        let mut w = generate(1);
+        let me = PlayerId(1);
+        let id = claim_mountain(&mut w, me).unwrap();
+        let f = &w.fortresses[&id];
+        assert_eq!(w.mountains[&id].get(f.king), Some(Tile::Throne));
+        assert!(f.quest.is_none() && f.done.is_empty() && f.max_depth == 0);
+        assert!(!f.dwarves.iter().any(|d| d.pos == f.king));
+    }
+
+    #[test]
+    fn fortress_with_quest_state_survives_save_and_load() {
+        use crate::king::{Quest, QuestId};
+        let mut w = generate(1);
+        let id = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        let f = w.fortresses.get_mut(&id).unwrap();
+        f.quest = Some(Quest {
+            id: QuestId::Food,
+            baseline: 7,
+        });
+        f.done = vec![QuestId::Depth];
+        f.made = Production {
+            ingots: 3,
+            doors: 2,
+        };
+        f.max_depth = 5;
+        let d = tmpdir("quest-save");
+        let p = d.join("w.bin");
+        save(&w, &p).unwrap();
+        assert_eq!(load(&p).unwrap(), w);
     }
 
     #[test]
@@ -724,6 +990,9 @@ mod tests {
             resources: Resources::default(),
             hungry: vec![],
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         let n = encode(&v).len();
         assert!(n < MAX_FRAME / 2, "{n}");
@@ -787,6 +1056,126 @@ mod tests {
         assert_eq!(e.to_string(), "format de sauvegarde v2 non supporté");
         std::fs::write(&p, [1u8, 0]).unwrap(); // too short for a version
         assert!(load(&p).is_err());
+    }
+
+    #[test]
+    fn new_dwarf_starts_fed_and_healthy() {
+        let mut w = generate(1);
+        let m = claim_mountain(&mut w, PlayerId(1)).unwrap();
+        for d in &w.fortresses[&m].dwarves {
+            assert_eq!((d.food, d.health), (FOOD_MAX, HEALTH_MAX));
+            assert_eq!((d.ticks_alive, d.jobs_done), (0, 0));
+        }
+    }
+
+    #[test]
+    fn food_max_is_a_meal_interval() {
+        assert_eq!(u64::from(FOOD_MAX), crate::light::DAY_TICKS / 4);
+    }
+
+    /// The v5 layout, frozen here: `Dwarf` and `Hero` without vitals.
+    mod old {
+        use crate::srd::{Abilities, Class, Race};
+        use crate::world::{Account, DigJob, DwarfTask, Region};
+        use crate::*;
+        use serde::Serialize;
+        use std::collections::BTreeMap;
+        #[derive(Serialize)]
+        pub struct Hero {
+            pub name: String,
+            pub race: Race,
+            pub class: Class,
+            pub abilities: Abilities,
+            pub pos: TilePos,
+            pub dig: Option<DigJob>,
+            pub move_cooldown: u8,
+        }
+        #[derive(Serialize)]
+        pub struct Dwarf {
+            pub id: DwarfId,
+            pub pos: TilePos,
+            pub task: Option<DwarfTask>,
+            pub hungry: bool,
+        }
+        #[derive(Serialize)]
+        pub struct Fortress {
+            pub owner: PlayerId,
+            pub hero: Option<Hero>,
+            pub dwarves: Vec<Dwarf>,
+            pub resources: Resources,
+        }
+        #[derive(Serialize)]
+        pub struct World {
+            pub seed: u64,
+            pub regions: Vec<Region>,
+            pub mountains: BTreeMap<MountainId, Mountain>,
+            pub fortresses: BTreeMap<MountainId, Fortress>,
+            pub accounts: BTreeMap<String, Account>,
+            pub next_dwarf: u32,
+            pub tick: u64,
+        }
+    }
+
+    #[test]
+    fn old_save_loads_with_full_vitals() {
+        let w = generate(3);
+        let pos = entrance_tiles().next().unwrap();
+        let fortress = old::Fortress {
+            owner: PlayerId(1),
+            hero: Some(old::Hero {
+                name: "Gimli".into(),
+                race: Race::Dwarf,
+                class: Class::Barbarian,
+                abilities: crate::srd::roll_abilities(Race::Dwarf, Class::Barbarian),
+                pos,
+                dig: None,
+                move_cooldown: 1,
+            }),
+            dwarves: vec![
+                old::Dwarf {
+                    id: DwarfId(7),
+                    pos,
+                    task: None,
+                    hungry: true,
+                },
+                old::Dwarf {
+                    id: DwarfId(8),
+                    pos,
+                    task: None,
+                    hungry: false,
+                },
+            ],
+            resources: Resources::default(),
+        };
+        let old = old::World {
+            seed: w.seed,
+            regions: w.regions,
+            mountains: w.mountains,
+            fortresses: BTreeMap::from([(MountainId(0), fortress)]),
+            accounts: w.accounts,
+            next_dwarf: 8,
+            tick: 1234,
+        };
+        let p = tmpdir("v5").join("w.bin");
+        let mut bytes = 5u32.to_le_bytes().to_vec();
+        bytes.extend(postcard::to_allocvec(&old).unwrap());
+        std::fs::write(&p, &bytes).unwrap();
+
+        // Startup must not set a v5 world aside: it migrates on load.
+        assert!(reset_if_outdated(&p, 0).unwrap().is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        let w = load(&p).unwrap();
+        assert_eq!((w.tick, w.next_dwarf), (1234, 8));
+        let f = &w.fortresses[&MountainId(0)];
+        let d = &f.dwarves[0];
+        assert_eq!((d.id, d.pos, d.hungry), (DwarfId(7), pos, true));
+        // A hungry dwarf loads with an empty gauge, a fed one with a full gauge.
+        assert_eq!((d.food, d.health), (0, HEALTH_MAX));
+        assert_eq!((d.ticks_alive, d.jobs_done), (0, 0));
+        assert_eq!(f.dwarves[1].food, FOOD_MAX);
+        let h = f.hero.as_ref().unwrap();
+        assert_eq!((h.name.as_str(), h.move_cooldown), ("Gimli", 1));
+        assert_eq!((h.food, h.health), (FOOD_MAX, HEALTH_MAX));
     }
 
     #[test]

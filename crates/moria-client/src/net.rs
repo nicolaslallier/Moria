@@ -184,6 +184,9 @@ mod tests {
             dwarves: vec![],
             resources: Resources::default(),
             tick: 0,
+            king: TilePos::new(0, 0, 0),
+            quest: None,
+            done: vec![],
         };
         s.write_all(&encode(&ServerMsg::Snapshot(Box::new(v))))
             .unwrap();
@@ -262,6 +265,7 @@ mod smoke {
             amqp_url: None,
             invite: Some("secret".into()),
             max_per_ip: 4,
+            king_timeout: moria_server::king::KING_TIMEOUT,
         };
         let _server = rt.spawn(moria_server::run_with_listener(
             cfg,

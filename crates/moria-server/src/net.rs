@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 pub const SESSION_QUEUE: usize = 64;
 /// Shortest password accepted at account creation, in characters.
@@ -26,6 +26,8 @@ const MIN_PASSWORD: usize = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// A client that does not drain its socket for this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Minimum gap between two Inspect a session forwards to the world.
+const INSPECT_EVERY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct Handles {
@@ -118,8 +120,19 @@ pub async fn session(stream: TcpStream, h: Handles) -> anyhow::Result<()> {
         // One CreateHero per session reaches the shared request queue; repeats are dropped
         // so they cannot crowd out everyone's Lookup/Login.
         let mut hero_requested = false;
+        // Same reason: about one Inspect per tick (the client asks ~1/s), the rest dropped.
+        let mut last_inspect: Option<Instant> = None;
         loop {
             match read_frame_async::<ClientMsg>(&mut rd).await? {
+                ClientMsg::Inspect(_)
+                    if last_inspect.is_some_and(|t| t.elapsed() < INSPECT_EVERY) => {}
+                ClientMsg::Inspect(target) => {
+                    last_inspect = Some(Instant::now());
+                    h.req
+                        .send(Request::Inspect { player, target })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("serveur arrete"))?;
+                }
                 ClientMsg::CreateHero { .. } if hero_requested => {}
                 ClientMsg::CreateHero { race, class } => {
                     hero_requested = true;
@@ -271,17 +284,18 @@ mod tests {
     }
 
     /// Deterministic: the reader is sequential, so once the trailing Move reaches `cmd`,
-    /// every CreateHero before it has been handled.
+    /// every CreateHero and Inspect before it has been handled. A burst of Inspect is
+    /// throttled to about one per tick.
     #[tokio::test]
     async fn repeated_create_hero_is_ignored() {
         use super::{Handles, session};
         use crate::{Lookup, Request};
-        use moria_core::protocol::{ClientMsg, PROTOCOL_VERSION, encode};
+        use moria_core::protocol::{ClientMsg, InspectTarget, PROTOCOL_VERSION, encode};
         use moria_core::srd::{Class, Race};
         use moria_core::{Dir, PlayerId};
         use std::time::Duration;
         use tokio::io::AsyncWriteExt;
-        use tokio::sync::mpsc::{self, error::TryRecvError};
+        use tokio::sync::mpsc;
         use tokio::time::timeout;
 
         let (req_tx, mut req_rx) = mpsc::channel(8);
@@ -324,6 +338,7 @@ mod tests {
             class: Class::Fighter,
         });
         let mut frames: Vec<u8> = hero.repeat(500);
+        frames.extend(encode(&ClientMsg::Inspect(InspectTarget::Hero)).repeat(500));
         frames.extend(encode(&ClientMsg::Move(Dir::S)));
         c.write_all(&frames).await.unwrap();
         let (p, cmd) = timeout(wait, cmd_rx.recv())
@@ -333,7 +348,18 @@ mod tests {
         assert_eq!(p, PlayerId(0));
         assert_eq!(cmd, crate::sim::Command::Move(Dir::S));
         assert!(matches!(req_rx.try_recv(), Ok(Request::CreateHero { .. })));
-        assert!(matches!(req_rx.try_recv(), Err(TryRecvError::Empty)));
+        let mut inspects = 0;
+        while let Ok(r) = req_rx.try_recv() {
+            assert!(matches!(
+                r,
+                Request::Inspect {
+                    player: PlayerId(0),
+                    ..
+                }
+            ));
+            inspects += 1;
+        }
+        assert!((1..10).contains(&inspects), "{inspects} of 500 Inspect");
         drop(tx);
     }
 

@@ -147,3 +147,25 @@ async fn queue_len_counts_ready_messages_and_purge_empties() {
     assert_eq!(bus.queue_len(&key).await.unwrap(), 0);
     assert!(bus.queue_len(&uniq("test.absent")).await.is_err());
 }
+
+#[tokio::test]
+#[ignore]
+async fn expiring_message_is_dropped_by_the_broker() {
+    let bus = Bus::connect(&url()).await.unwrap();
+    let key = uniq("test.expire");
+    let q = || Queue::Shared {
+        name: &key,
+        latest_only: false,
+    };
+    bus.declare(&key, q()).await.unwrap();
+    bus.publish_expiring(&key, b"vite".to_vec(), Duration::from_millis(100))
+        .await
+        .unwrap();
+    bus.publish_expiring(&key, b"lent".to_vec(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut s = bus.subscribe(&key, q()).await.unwrap();
+    assert_eq!(timeout(S2, s.next()).await.unwrap().unwrap(), b"lent");
+    assert!(timeout(Duration::from_millis(500), s.next()).await.is_err());
+}
