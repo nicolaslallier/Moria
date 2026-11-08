@@ -30,11 +30,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Each arch builds natively (no QEMU: emulated Rust builds take ages), then `manifest`
+  # joins the two into one multi-arch tag, so the Mac mini (arm64) and the homelab
+  # (amd64) pull the same tag.
   image:
     strategy:
       matrix:
         bin: [moria-server, moria-dwarf-ai, moria-worldgen, moria-inventory, moria-king, moria-food]
-    runs-on: ubuntu-latest
+        platform:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
       packages: write
@@ -53,14 +59,35 @@ jobs:
           context: .
           file: docker/Dockerfile
           build-args: BIN=${{ matrix.bin }}
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.platform.arch }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/nicolaslallier/${{ matrix.bin }}:sha-${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.bin }}
-          cache-to: type=gha,scope=${{ matrix.bin }},mode=max
+          tags: ghcr.io/nicolaslallier/${{ matrix.bin }}:sha-${{ github.sha }}-${{ matrix.platform.arch }}
+          cache-from: type=gha,scope=${{ matrix.bin }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,scope=${{ matrix.bin }}-${{ matrix.platform.arch }},mode=max
+
+  manifest:
+    needs: image
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        bin: [moria-server, moria-dwarf-ai, moria-worldgen, moria-inventory, moria-king, moria-food]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          img=ghcr.io/nicolaslallier/${{ matrix.bin }}:sha-${GITHUB_SHA}
+          docker buildx imagetools create -t "$img" "$img-amd64" "$img-arm64"
+          docker buildx imagetools inspect "$img"
 
   pin:
-    needs: image
+    needs: manifest
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
